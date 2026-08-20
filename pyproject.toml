@@ -1,0 +1,18 @@
+[tool.poetry]
+name = "napstertec-ai-gateway"
+version = "2.0.0"
+description = "Enterprise OpenAI-compatible Multi-Provider AI Gateway for NapsterTec AI."
+authors = ["Napster <contact@napstertec.com>"]
+readme = "README.md"
+keywords = ["ai", "gateway", "llm", "proxy", "openai-compatible", "failover"]
+
+[tool.poetry.dependencies]
+python = "^3.9"
+fastapi = "^0.100.0"
+uvicorn = "^0.23.0"
+pydantic-settings = "^2.0.0"
+pydantic = "^2.0.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

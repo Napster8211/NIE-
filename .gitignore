@@ -1,0 +1,89 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+.napstertec_objectives.json
+.objectives-*.tmp
+.napstertec_executive_decisions.json
+.executive-decisions-*.tmp
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+d.sh
+exp.py
+ollamafreeapi/tools.py
+trash
+
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# NIE runtime registries / temporary persistence
+.napstertec_missions.json
+.missions-*.tmp
+.napstertec_approvals.json
+.approvals-*.tmp
+.napstertec_objectives.json
+.objectives-*.tmp
+.napstertec_executive_decisions.json
+.executive-decisions-*.tmp
+
+# Runtime logs
+logs/
+*.log
+
+# Local databases / runtime state
+*.db
+*.sqlite
+*.sqlite3
+
+# Temporary / backup files
+*.bak
+*.tmp
+*.temp
+
+# Runtime uploads and generated user content
+storage/uploads/
+storage/images/
+
+# OS junk
+.DS_Store
+Thumbs.db
+desktop.ini
