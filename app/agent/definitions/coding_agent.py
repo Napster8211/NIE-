@@ -18,9 +18,17 @@ class CodingIntelligenceAgent(BaseAgent):
             description="Transforms technical architectures into structured, production-quality software implementations.",
             version="1.0.0",
             category="software_engineering",
+            department_id="engineering_delivery",    # CANONICAL TAXONOMY
+            department_name="Engineering & Delivery",# CANONICAL TAXONOMY
             capabilities={AgentCapability.RESEARCH},
             supported_task_types=["implement system", "generate project", "write code", "implement architecture"],
             allowed_tools={"coding_context_builder", "coding_evaluator", "coding_artifact_saver"},
+            allowed_providers={"openrouter"},
+            cost_preference="balanced",
+            reasoning_level="high",
+            model_profile="coding",
+            max_model_cost_per_request_usd=0.04,
+            allow_free_model_first=False,
             required_permissions={AgentPermission.READ, AgentPermission.WRITE} 
         )
         super().__init__(metadata=metadata, **kwargs)

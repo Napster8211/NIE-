@@ -1,7 +1,3 @@
-"""
-NapsterTec AI - Finance Intelligence Agent
-Module: app/agent/definitions/finance_agent.py
-"""
 import logging
 from typing import Dict, Any
 
@@ -15,13 +11,16 @@ class FinanceIntelligenceAgent(BaseAgent):
         metadata = AgentMetadata(
             name="finance_intelligence",
             display_name="Finance Intelligence Director (AI CFO)",
-            description="Evaluates the financial health of NapsterTec, monitors cash flow, estimates runway, and evaluates ROI.",
+            description="Evaluates the financial health of NapsterTec, monitors cash flow, estimates runway, and evaluates ROI. Advisory only.",
             version="1.0.0",
             category="finance",
+            department_id="finance",      # CANONICAL TAXONOMY
+            department_name="Finance",    # CANONICAL TAXONOMY
             capabilities={AgentCapability.RESEARCH},
             supported_task_types=["analyze financial health", "calculate runway", "budget management", "roi analysis", "cfo report"],
             allowed_tools={"finance_context_builder", "finance_evaluator", "finance_artifact_saver"},
-            required_permissions={AgentPermission.READ, AgentPermission.WRITE} 
+            # SPRINT 4B SECURITY: CFO is Advisory Only. It only needs READ. It cannot execute FINANCIAL_COMMITMENT.
+            required_permissions={AgentPermission.READ} 
         )
         super().__init__(metadata=metadata, **kwargs)
 
@@ -51,6 +50,7 @@ class FinanceIntelligenceAgent(BaseAgent):
                 return result
             artifact = e_data["artifact"]
 
+            # Save the read-only reporting artifact for downstream consumption
             s_res = await self.invoke_tool("finance_artifact_saver", {"artifact": artifact}, context)
             s_data = getattr(s_res["output"], "data", s_res["output"])
             if hasattr(s_data, "model_dump"): s_data = s_data.model_dump()
@@ -76,22 +76,14 @@ class FinanceIntelligenceAgent(BaseAgent):
             top_roi = roi[0].get('investment_area') if roi else "None"
 
             summary = (
-                f"**Finance Intelligence Execution Report**\n\n"
+                f"**Finance Intelligence Governance Report**\n\n"
                 f"Financial Health Score: {health.get('score')}/100 ({health.get('trend')})\n"
-                f"Revenue Forecast: {rev.get('total_expected_revenue')}\n"
-                f"Expense Forecast: {exp.get('total_expenses')}\n"
-                f"Cash Runway: {runway.get('cash_runway')} (Safe Window: {runway.get('safe_operating_window')})\n"
-                f"Burn Rate: {runway.get('monthly_burn')}\n"
-                f"Budget Health: {len(budgets)} Departments Evaluated\n"
+                f"Cash Position: {health.get('cash_position')}\n"
+                f"Expense Recorded: {exp.get('total_expenses')}\n"
                 f"Top Financial Risk: {top_risk}\n"
-                f"Highest ROI Investment: {top_roi}\n"
                 f"Executive Recommendations: {recs[0] if recs else 'None'}\n\n"
                 f"**Artifact Generation:**\n"
-                f"Artifact Created: FinanceArtifact\n"
                 f"Artifact ID: {s_data.get('artifact_id', 'Unknown')}\n"
-                f"Repository Saved: {'Yes' if s_data.get('success') else 'No'} (v{s_data.get('version', 0)})\n"
-                f"Registry Registered: {'Yes' if s_data.get('registered') else 'No'}\n"
-                f"Validation: {s_data.get('validation', 'Failed')}\n\n"
                 f"Status: {status_msg}"
             )
             

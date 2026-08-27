@@ -278,8 +278,37 @@ agent_registry.register(DirectorIntelligenceAgent())
 
 # --- 1. Router LLM Adapter for Task Planner & Autonomous Loop ---
 class RouterLLMProvider:
-    def __init__(self, router: CapabilityRouter):
+    """
+    Adapter between NIE planning/autonomous loops and CapabilityRouter.
+
+    OpenRouter is the primary inference gateway. Other registered providers remain
+    operational fallbacks if OpenRouter is unavailable or unhealthy.
+
+    The adapter accepts NIE-only inference governance hints and forwards them to
+    CapabilityRouter, which forwards them only to OpenRouterProvider.
+    """
+
+    DEFAULT_PROVIDER_PREFERENCES = [
+        "openrouter",
+        "gemini",
+        "groq",
+        "cerebras",
+        "kimi",
+        "auto",
+    ]
+
+    def __init__(
+        self,
+        router: CapabilityRouter,
+        *,
+        default_cost_preference: str = "balanced",
+        default_reasoning_level: str = "medium",
+        default_max_cost_per_request_usd: float = 0.03,
+    ):
         self.router = router
+        self.default_cost_preference = default_cost_preference
+        self.default_reasoning_level = default_reasoning_level
+        self.default_max_cost_per_request_usd = default_max_cost_per_request_usd
 
     def _extract_json(self, text: str) -> str:
         clean_text = (text or "").strip()
@@ -327,46 +356,94 @@ class RouterLLMProvider:
         elif "```" in clean_text:
             clean_text = clean_text.split("```", 1)[1].split("```", 1)[0].strip()
 
-        match = re.search(r'\{.*\}', clean_text, re.DOTALL)
+        match = re.search(r"\{.*\}", clean_text, re.DOTALL)
         if not match:
             raise ValueError("Provider response did not contain a JSON object.")
 
         return match.group(0).strip()
 
-    async def generate_structured(self, system_prompt: str, user_prompt: str, schema_class: Any) -> Any:
+    def _routing_kwargs(
+        self,
+        *,
+        cost_preference: Optional[str] = None,
+        reasoning_level: Optional[str] = None,
+        model_override: Optional[str] = None,
+        max_model_cost_per_request_usd: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        routing = {
+            "cost_preference": (
+                cost_preference or self.default_cost_preference
+            ),
+            "reasoning_level": (
+                reasoning_level or self.default_reasoning_level
+            ),
+            "max_model_cost_per_request_usd": (
+                self.default_max_cost_per_request_usd
+                if max_model_cost_per_request_usd is None
+                else max_model_cost_per_request_usd
+            ),
+        }
+        if model_override:
+            routing["model_override"] = model_override
+        return routing
+
+    async def generate_structured(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        schema_class: Any,
+        *,
+        cost_preference: Optional[str] = None,
+        reasoning_level: Optional[str] = None,
+        model_override: Optional[str] = None,
+        max_model_cost_per_request_usd: Optional[float] = None,
+    ) -> Any:
         schema_json = json.dumps(schema_class.model_json_schema(), indent=2)
 
         full_prompt = (
             f"{system_prompt}\n\n"
             f"USER REQUEST: {user_prompt}\n\n"
-            f"OUTPUT REQUIREMENT:\n"
-            f"You are a strict JSON data generator. You MUST output a valid JSON instance matching the schema below.\n"
-            f"CRITICAL JSON RULES:\n"
-            f"1. You MUST properly escape all newlines (using \\n) and double quotes (using \\\") inside any string values.\n"
-            f"2. Do NOT use raw multiline strings inside the JSON payload.\n"
-            f"3. DO NOT output the JSON schema itself. DO NOT wrap your output in '$defs' or 'properties'.\n"
-            f"Schema Requirements:\n"
-            f"{schema_json}\n\n"
-            f"Return ONLY valid JSON starting with {{ and ending with }}."
+            "OUTPUT REQUIREMENT:\n"
+            "You are a strict JSON data generator. You MUST output a valid JSON "
+            "instance matching the schema below.\n"
+            "CRITICAL JSON RULES:\n"
+            "1. Properly escape newlines and double quotes inside string values.\n"
+            "2. Do NOT use raw multiline strings inside the JSON payload.\n"
+            "3. DO NOT output the JSON schema itself. DO NOT wrap your output in "
+            "'$defs' or 'properties'.\n"
+            f"Schema Requirements:\n{schema_json}\n\n"
+            "Return ONLY valid JSON starting with { and ending with }."
         )
-        
-        logger.info("[RouterLLMProvider] Development provider preference order: groq -> cerebras -> gemini -> openrouter -> kimi")
-        prefs = ["groq", "Groq", "cerebras", "Cerebras", "gemini", "Gemini", "openrouter", "Openrouter", "kimi", "Kimi", "Auto"]
-        
+
+        routing = self._routing_kwargs(
+            cost_preference=cost_preference,
+            reasoning_level=reasoning_level,
+            model_override=model_override,
+            max_model_cost_per_request_usd=max_model_cost_per_request_usd,
+        )
+
+        logger.info(
+            "[RouterLLMProvider] Provider preference order: %s | "
+            "cost=%s reasoning=%s",
+            " -> ".join(self.DEFAULT_PROVIDER_PREFERENCES),
+            routing["cost_preference"],
+            routing["reasoning_level"],
+        )
+
         response_text = ""
         async for chunk in self.router.route_skill_execution(
             prompt=full_prompt,
             required_capabilities=["chat"],
-            preferences=prefs,
+            preferences=self.DEFAULT_PROVIDER_PREFERENCES,
             is_structured=True,
-            retry_attempt=0
+            retry_attempt=0,
+            **routing,
         ):
             response_text += chunk
-            
+
         try:
             clean_text = self._extract_json(response_text)
-            clean_text = clean_text.replace('"""', '"') 
-            
+            clean_text = clean_text.replace('"""', '"')
             parsed_data = json.loads(clean_text, strict=False)
 
             if isinstance(parsed_data, dict):
@@ -374,10 +451,11 @@ class RouterLLMProvider:
                     if isinstance(d, dict):
                         if ("goal" in d or "title" in d) and "steps" in d:
                             return d
-                        for k, v in d.items():
-                            if isinstance(v, dict):
-                                res = find_actual_payload(v)
-                                if res: return res
+                        for _, value in d.items():
+                            if isinstance(value, dict):
+                                nested = find_actual_payload(value)
+                                if nested:
+                                    return nested
                     return d
 
                 parsed_data = find_actual_payload(parsed_data)
@@ -391,28 +469,47 @@ class RouterLLMProvider:
                             if "name" in step and "tool" not in step:
                                 step["tool"] = step.pop("name")
                             if "reason" not in step:
-                                step["reason"] = f"Execution step for {step.get('tool', 'action')}"
+                                step["reason"] = (
+                                    f"Execution step for {step.get('tool', 'action')}"
+                                )
                             if isinstance(step.get("parameters"), list):
                                 param_dict = {}
                                 for item in step["parameters"]:
-                                    if isinstance(item, dict) and "name" in item and "value" in item:
+                                    if (
+                                        isinstance(item, dict)
+                                        and "name" in item
+                                        and "value" in item
+                                    ):
                                         param_dict[item["name"]] = item["value"]
                                 step["parameters"] = param_dict if param_dict else None
 
             return schema_class.model_validate(parsed_data)
-        except Exception as e:
-            logger.error(f"[RouterLLMProvider] Validation Error: {e}\nRaw Output: {response_text}")
-            raise ValueError(f"Failed to parse structured JSON: {str(e)}")
+        except Exception as exc:
+            logger.error(
+                "[RouterLLMProvider] Validation Error: %s | Raw Output: %s",
+                exc,
+                response_text[:2000],
+            )
+            raise ValueError(
+                f"Failed to parse structured JSON: {str(exc)}"
+            ) from exc
 
     async def generate_json(
         self,
         prompt: str,
         system_prompt: str,
+        *,
+        cost_preference: Optional[str] = None,
+        reasoning_level: Optional[str] = None,
+        model_override: Optional[str] = None,
+        max_model_cost_per_request_usd: Optional[float] = None,
+        **_ignored: Any,
     ) -> Dict[str, Any]:
         """
-        Generate a real structured JSON response.
-        Empty or malformed responses are retried internally. If all attempts fail,
-        raise an error so AutonomousAgentLoop can perform controlled failover.
+        Generate structured JSON for AutonomousAgentLoop.
+
+        The additional keyword-only arguments are intentionally compatible with
+        execution_loop.py's model_routing propagation.
         """
         full_prompt = (
             f"{system_prompt}\n\n"
@@ -422,10 +519,21 @@ class RouterLLMProvider:
             "or safety metadata."
         )
 
-        logger.info("[RouterLLMProvider] Development provider preference order: groq -> cerebras -> gemini -> openrouter -> kimi")
-        prefs = ["groq", "Groq", "cerebras", "Cerebras", "gemini", "Gemini", "openrouter", "Openrouter", "kimi", "Kimi", "Auto"]
-        
-        max_attempts = 3
+        routing = self._routing_kwargs(
+            cost_preference=cost_preference,
+            reasoning_level=reasoning_level,
+            model_override=model_override,
+            max_model_cost_per_request_usd=max_model_cost_per_request_usd,
+        )
+
+        logger.info(
+            "[RouterLLMProvider] JSON routing: OpenRouter-first | "
+            "cost=%s reasoning=%s",
+            routing["cost_preference"],
+            routing["reasoning_level"],
+        )
+
+        max_attempts = 2
         last_error = None
         last_response_text = ""
 
@@ -435,9 +543,10 @@ class RouterLLMProvider:
                 async for chunk in self.router.route_skill_execution(
                     prompt=full_prompt,
                     required_capabilities=["chat"],
-                    preferences=prefs,
+                    preferences=self.DEFAULT_PROVIDER_PREFERENCES,
                     is_structured=True,
-                    retry_attempt=attempt - 1
+                    retry_attempt=attempt - 1,
+                    **routing,
                 ):
                     if chunk:
                         response_text += str(chunk)
@@ -447,10 +556,13 @@ class RouterLLMProvider:
                 parsed = json.loads(clean_text)
 
                 if not isinstance(parsed, dict):
-                    raise ValueError("Structured response must be a JSON object.")
-
+                    raise ValueError(
+                        "Structured response must be a JSON object."
+                    )
                 if not parsed:
-                    raise ValueError("Structured response was an empty JSON object.")
+                    raise ValueError(
+                        "Structured response was an empty JSON object."
+                    )
 
                 return parsed
 
@@ -466,15 +578,17 @@ class RouterLLMProvider:
                     await asyncio.sleep(0.25 * attempt)
 
         logger.error(
-            "[RouterLLMProvider] JSON generation failed after %s attempts. Last error: %s | Raw Output: %s",
+            "[RouterLLMProvider] JSON generation failed after %s attempts. "
+            "Last error: %s | Raw Output: %s",
             max_attempts,
             str(last_error),
             last_response_text[:2000],
         )
-
         raise ValueError(
-            f"Failed to obtain a valid structured JSON response after {max_attempts} attempts: {last_error}"
+            "Failed to obtain a valid structured JSON response after "
+            f"{max_attempts} attempts: {last_error}"
         )
+
 
 # --- 2. Planner Registry Setup ---
 planner_registry = PlannerRegistry()
@@ -715,10 +829,9 @@ async def chat_endpoint(request: ChatRequest, db: AsyncSession = Depends(get_db_
         think_instruction = ""
         if request.think:
             think_instruction = (
-                "\n\n[SYSTEM OVERRIDE: EXTENDED CHAIN-OF-THOUGHT THINKING ENABLED]\n"
-                "Analyze the user request thoroughly step-by-step before producing your final answer.\n"
-                "First, write out your detailed internal reasoning inside <think>...</think> tags.\n"
-                "After closing the </think> tag, provide your final polished response.\n\n"
+                "\n\n[SYSTEM INSTRUCTION: DEEP REASONING MODE]\n"
+                "Use deeper internal reasoning and verification before answering. "
+                "Return only the useful final answer; do not expose private chain-of-thought.\n\n"
             )
 
         profiler.start("Intent Detection")
@@ -808,11 +921,30 @@ async def chat_endpoint(request: ChatRequest, db: AsyncSession = Depends(get_db_
             profiler.start("Waiting For First Token")
             first_chunk = True
 
-            prefs = ["groq", "Groq", "cerebras", "Cerebras", "gemini", "Gemini", "openrouter", "Openrouter", "kimi", "Kimi", "Auto"]
+            prefs = [
+                "openrouter",
+                "gemini",
+                "groq",
+                "cerebras",
+                "kimi",
+                "auto",
+            ]
+
+            # Normal chat stays on the cheap reliable tier. Explicit "think"
+            # requests increase reasoning depth without blindly selecting the
+            # most expensive model. Vision/document work is handled by the
+            # OpenRouter capability/model router.
+            cost_preference = "balanced"
+            reasoning_level = "high" if request.think else "medium"
+            per_request_cost_limit = 0.03 if request.think else 0.015
+
             route_kwargs = {
                 "prompt": branded_prompt,
                 "required_capabilities": skill.required_capabilities,
                 "preferences": prefs,
+                "cost_preference": cost_preference,
+                "reasoning_level": reasoning_level,
+                "max_model_cost_per_request_usd": per_request_cost_limit,
             }
             if request.attachments:
                 route_kwargs["attachments"] = request.attachments
@@ -1192,6 +1324,14 @@ async def stream_agent_execution(request: AgentExecutionRequest):
                 fallback_llm=llm_provider,
                 tool_manager=scoped_tool_manager,
                 command_context=command_context,
+                model_routing={
+                    # Autonomous loops can multiply model calls rapidly, so use
+                    # the cheap reliable tier by default and escalate reasoning
+                    # only when the loop explicitly needs it.
+                    "cost_preference": "balanced",
+                    "reasoning_level": "medium",
+                    "max_model_cost_per_request_usd": 0.02,
+                },
             )
 
             async for telemetry_event in agent_loop.execute_goal(

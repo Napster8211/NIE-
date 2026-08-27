@@ -18,6 +18,8 @@ class PublishingIntelligenceAgent(BaseAgent):
             description="Safely executes approved publishing operations across all supported marketing channels.",
             version="1.0.0",
             category="marketing_execution",
+            department_id="growth_marketing",        # CANONICAL TAXONOMY
+            department_name="Growth & Marketing",    # CANONICAL TAXONOMY
             capabilities={AgentCapability.RESEARCH},
             supported_task_types=["publish campaign", "distribute content", "execute marketing"],
             allowed_tools={"publishing_context_builder", "publishing_evaluator", "publishing_artifact_saver", "marketing_analytics_evaluator"},

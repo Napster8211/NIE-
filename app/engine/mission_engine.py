@@ -331,6 +331,9 @@ def derive_mission_specification(raw_query: str, objective: str) -> Dict[str, An
 class PersistentMission(BaseModel):
     mission_id: str
     objective_id: Optional[str] = None
+    portfolio_id: Optional[str] = None
+    mission_definition_id: Optional[str] = None
+    strategic_plan_id: Optional[str] = None
     original_request: str
     title: str
     objective: str
@@ -2197,7 +2200,7 @@ class MissionEngine:
             delegation_history=mission.delegation_history, artifact_lineage=mission.artifact_lineage, success_evidence=mission.success_evidence,
             replan_count=mission.replan_count, retry_count=mission.retry_count, repeated_strategy_count=mission.repeated_strategy_count, outreach_batch_count=mission.outreach_batch_count, zero_progress_count=mission.zero_progress_count,
             last_completed_delegation=mission.last_completed_delegation, next_eligible_action=mission.next_eligible_action, auto_continue_status=mission.auto_continue_status,
-            governance_status="Active", budget_status="Within Thresholds", deadline_status="On Track", dependencies=[], blockers=[f["code"] for f in findings if f["severity"] in {"CRITICAL", "HIGH"}], risks=[], pending_approvals=[m["materialization_id"] for m in mission.progression_materializations if m.get("status") == "APPROVAL_REQUIRED"], recent_mission_events=mission.events[-5:],
+            governance_status="Active", budget_status=mission.metadata.get("budget_status", "NOT_CONFIGURED") if hasattr(mission, "metadata") else "NOT_CONFIGURED", deadline_status="On Track", dependencies=[], blockers=[f["code"] for f in findings if f["severity"] in {"CRITICAL", "HIGH"}], risks=[], pending_approvals=[m["materialization_id"] for m in mission.progression_materializations if m.get("status") == "APPROVAL_REQUIRED"], recent_mission_events=mission.events[-5:],
             action_history=mission.action_history, progression_decisions=mission.progression_decisions, progression_materializations=mission.progression_materializations,
             completion_guard_status=guard_status, mission_completion_integrity="FAILED" if any(f["code"] == "UNVERIFIED_MISSION_COMPLETION" for f in findings) else "PASSED", progression_materialization_integrity="FAILED" if any("MATERIALIZATION" in f["code"] for f in findings) else "PASSED", mission_stall_integrity="PASSED" if mission.stall_detector_status == "Clear" else "FAILED", execution_state_integrity=truth["execution_state_integrity"],
             delegation_execution_integrity=truth["delegation_execution_integrity"], worker_claim_integrity=truth["worker_claim_integrity"], mission_dispatch_integrity="FAILED" if high_or_critical else "PASSED", next_evaluation="Event Triggered", recommended_next_action=recs,

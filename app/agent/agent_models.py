@@ -80,6 +80,10 @@ class AgentMetadata(BaseModel):
     version: str = Field(default="1.0.0", description="SemVer version of the agent specification.")
     category: str = Field(default="general", description="Operational category (e.g., 'engineering', 'sales').")
     
+    # --- NEW SPRINT 6B.2B CANONICAL DEPARTMENT FIELDS ---
+    department_id: Optional[str] = Field(default=None, description="Canonical executive department machine identifier.")
+    department_name: Optional[str] = Field(default=None, description="Human-readable executive department name.")
+    
     capabilities: Set[AgentCapability] = Field(default_factory=set, description="Capabilities provided by this agent.")
     supported_task_types: List[str] = Field(default_factory=list, description="Task intent strings this agent can satisfy.")
     allowed_tools: Set[str] = Field(default_factory=set, description="Set of tool names this agent is authorized to use.")
@@ -91,8 +95,30 @@ class AgentMetadata(BaseModel):
     max_tool_calls: int = Field(default=25, description="Maximum allowed tool invocations per session.")
     max_runtime_seconds: float = Field(default=300.0, description="Maximum execution timeout in seconds.")
     
-    cost_preference: str = Field(default="balanced", description="Inference cost profile: 'low', 'balanced', 'performance'.")
-    reasoning_level: str = Field(default="medium", description="Reasoning depth required: 'low', 'medium', 'high', 'deep'.")
+    cost_preference: str = Field(
+        default="balanced",
+        description="Inference cost profile: 'low', 'balanced', 'performance'.",
+    )
+    reasoning_level: str = Field(
+        default="medium",
+        description="Reasoning depth required: 'low', 'medium', 'high', 'deep'.",
+    )
+
+    # OpenRouter model-governance hints. These are preferences only; they never
+    # create tool/financial/owner authority.
+    model_profile: str = Field(
+        default="auto",
+        description="Model routing profile. 'auto' delegates selection to the capability router.",
+    )
+    max_model_cost_per_request_usd: float = Field(
+        default=0.03,
+        ge=0.0,
+        description="Soft inference-spend ceiling for a single model request.",
+    )
+    allow_free_model_first: bool = Field(
+        default=True,
+        description="Whether low-cost routing may try OpenRouter's free router before paid fallbacks.",
+    )
     tags: List[str] = Field(default_factory=list, description="Search and taxonomy tags.")
 
     model_config = ConfigDict(use_enum_values=True)

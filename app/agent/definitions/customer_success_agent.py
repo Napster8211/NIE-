@@ -18,6 +18,8 @@ class CustomerSuccessIntelligenceAgent(BaseAgent):
             description="Manages customer lifecycle, onboarding, health scoring, and expansion opportunities post-sale.",
             version="1.0.0",
             category="customer_success",
+            department_id="operations_success",      # CANONICAL TAXONOMY
+            department_name="Operations & Success",  # CANONICAL TAXONOMY
             capabilities={AgentCapability.RESEARCH},
             supported_task_types=["evaluate customer success", "check onboarding", "predict churn", "health score"],
             allowed_tools={"customer_success_context_builder", "customer_success_evaluator", "customer_success_artifact_saver"},

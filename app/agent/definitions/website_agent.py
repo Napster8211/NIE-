@@ -19,6 +19,8 @@ class WebsiteIntelligenceAgent(BaseAgent):
             description="Analyzes digital presence, generating structured evidence-backed Artifacts.",
             version="1.2.0",
             category="business_intelligence",
+            department_id="growth_marketing",        # CANONICAL TAXONOMY
+            department_name="Growth & Marketing",    # CANONICAL TAXONOMY
             capabilities={AgentCapability.RESEARCH},
             supported_task_types=["analyze website", "audit website"],
             allowed_tools={"website_context_builder", "website_inspector", "website_artifact_saver"},

@@ -18,6 +18,8 @@ class RevenueIntelligenceAgent(BaseAgent):
             description="Evaluates the entire revenue pipeline, forecasts future income, and provides executive financial intelligence.",
             version="1.0.0",
             category="revenue_operations",
+            department_id="sales_revenue",           # CANONICAL TAXONOMY
+            department_name="Sales & Revenue",       # CANONICAL TAXONOMY
             capabilities={AgentCapability.RESEARCH},
             supported_task_types=["analyze revenue pipeline", "forecast revenue", "revops intelligence", "executive kpis"],
             allowed_tools={"revenue_context_builder", "revenue_evaluator", "revenue_artifact_saver"},

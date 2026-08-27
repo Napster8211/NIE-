@@ -18,6 +18,8 @@ class SalesIntelligenceAgent(BaseAgent):
             description="Continuously evaluates sales opportunities, determines buying intent, and prepares deal closing packages.",
             version="1.0.0",
             category="sales_operations",
+            department_id="sales_revenue",           # CANONICAL TAXONOMY
+            department_name="Sales & Revenue",       # CANONICAL TAXONOMY
             capabilities={AgentCapability.RESEARCH},
             supported_task_types=["evaluate sales opportunity", "prioritize deals", "prepare meeting", "sales analysis"],
             allowed_tools={"sales_context_builder", "sales_evaluator", "sales_artifact_saver"},

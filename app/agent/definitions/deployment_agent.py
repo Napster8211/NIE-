@@ -18,6 +18,8 @@ class DeploymentIntelligenceAgent(BaseAgent):
             description="Autonomously deploys approved software implementations and performs health verification.",
             version="1.0.0",
             category="software_delivery",
+            department_id="engineering_delivery",      # CANONICAL TAXONOMY
+            department_name="Engineering & Delivery",  # CANONICAL TAXONOMY
             capabilities={AgentCapability.RESEARCH},
             supported_task_types=["deploy system", "host project", "generate preview", "launch software"],
             allowed_tools={"deployment_context_builder", "deployment_evaluator", "deployment_artifact_saver"},

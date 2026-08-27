@@ -12,6 +12,7 @@ logger = logging.getLogger(__name__)
 # Router-only metadata understood by Groq's workload selector. These hints must
 # never reach OpenAI-compatible or other provider SDK request payloads.
 _GROQ_ROUTING_HINTS = {"is_structured", "retry_attempt"}
+_OPENROUTER_ROUTING_HINTS = {"cost_preference", "reasoning_level", "model_override", "max_model_cost_per_request_usd"}
 
 
 def _cap_value(cap: Any) -> str:
@@ -206,7 +207,12 @@ class CapabilityRouter:
                         and k in _GROQ_ROUTING_HINTS
                         and accepts_var_kwargs
                     )
-                    if k in sig.parameters or is_groq_hint:
+                    is_openrouter_hint = (
+                        provider.name.lower() == "openrouter"
+                        and k in _OPENROUTER_ROUTING_HINTS
+                        and accepts_var_kwargs
+                    )
+                    if k in sig.parameters or is_groq_hint or is_openrouter_hint:
                         call_kwargs[k] = v
 
                 logger.info(

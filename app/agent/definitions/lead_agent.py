@@ -22,6 +22,8 @@ class LeadIntelligenceAgent(BaseAgent):
             description="Autonomously discovers, normalizes, and qualifies business leads.",
             version="1.1.0",
             category="business_intelligence",
+            department_id="growth_marketing",      # CANONICAL TAXONOMY
+            department_name="Growth & Marketing",  # CANONICAL TAXONOMY
             capabilities={AgentCapability.LEAD_GENERATION, AgentCapability.RESEARCH},
             supported_task_types=["find leads", "discover businesses", "prospecting"],
             # STRICT HARDENING: Explicitly expose lead_upsert and block workspace tools.

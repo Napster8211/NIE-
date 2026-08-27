@@ -28,6 +28,7 @@ from app.api.routers.documents import router as documents_router
 from app.api.routers.images import router as images_router
 from app.api.routers.analytics import router as analytics_router
 from app.api.routers.system import system_router
+from app.api.director_desktop import router as director_desktop_router
 
 # --- SPRINT 25.5: AUTONOMOUS MISSION WORKER IMPORT ---
 from app.engine.autonomous_worker import autonomous_worker
@@ -69,6 +70,7 @@ app.add_middleware(
 # Register routers
 app.include_router(api_router, prefix="/api/v1")
 app.include_router(memory_router)
+app.include_router(director_desktop_router, prefix="/api/v1")
 
 app.include_router(documents_router)
 app.include_router(images_router)

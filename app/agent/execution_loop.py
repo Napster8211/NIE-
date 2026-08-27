@@ -4,6 +4,7 @@ Module: app/agent/execution_loop.py
 """
 import asyncio
 import hashlib
+import inspect
 import json
 import logging
 import time
@@ -63,6 +64,7 @@ class AutonomousAgentLoop:
         fallback_llm,
         tool_manager: ToolManager,
         command_context: Optional[Dict[str, Any]] = None,
+        model_routing: Optional[Dict[str, Any]] = None,
     ):
         self.primary_llm = primary_llm
         self.fallback_llm = fallback_llm
@@ -78,6 +80,7 @@ class AutonomousAgentLoop:
             "read_only": True,
             "mutation_allowed": False,
         }
+        self.model_routing: Dict[str, Any] = dict(model_routing or {})
 
         self._successful_action_fingerprints: Set[str] = set()
         self._successful_observations: Dict[str, str] = {}
@@ -482,10 +485,28 @@ CRITICAL: Even if the user requested "Return only: [Text]", you must output the 
             # Limited to 2 attempts to prevent cascading multiplication loops.
             for attempt in range(2):
                 try:
-                    result = await provider.generate_json(
-                        prompt=prompt,
-                        system_prompt=system,
+                    generate_json = provider.generate_json
+                    sig = inspect.signature(generate_json)
+                    accepts_var_kwargs = any(
+                        p.kind == inspect.Parameter.VAR_KEYWORD
+                        for p in sig.parameters.values()
                     )
+                    call_kwargs = {
+                        "prompt": prompt,
+                        "system_prompt": system,
+                    }
+                    for key in (
+                        "cost_preference",
+                        "reasoning_level",
+                        "model_override",
+                        "max_model_cost_per_request_usd",
+                    ):
+                        if key in self.model_routing and (
+                            key in sig.parameters or accepts_var_kwargs
+                        ):
+                            call_kwargs[key] = self.model_routing[key]
+
+                    result = await generate_json(**call_kwargs)
                     
                     if not isinstance(result, dict):
                         raise TypeError(f"{label} returned non-dict JSON payload.")

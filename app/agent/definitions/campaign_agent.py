@@ -18,6 +18,8 @@ class CampaignIntelligenceAgent(BaseAgent):
             description="Autonomously orchestrates multi-channel marketing campaigns from approved strategies.",
             version="1.0.0",
             category="marketing_campaigns",
+            department_id="growth_marketing",        # CANONICAL TAXONOMY
+            department_name="Growth & Marketing",    # CANONICAL TAXONOMY
             capabilities={AgentCapability.RESEARCH},
             supported_task_types=["create campaign", "plan marketing campaign", "orchestrate assets"],
             allowed_tools={"campaign_context_builder", "campaign_evaluator", "campaign_artifact_saver"},

@@ -15,6 +15,21 @@ class Capability(str, Enum):
     ANALYTICS = "analytics"
 
 
+class ModelCostProfile(str, Enum):
+    LOW = "low"
+    BALANCED = "balanced"
+    PERFORMANCE = "performance"
+
+
+class TaskComplexity(str, Enum):
+    TRIVIAL = "trivial"
+    STANDARD = "standard"
+    COMPLEX = "complex"
+    SPECIALIST = "specialist"
+    CRITICAL = "critical"
+
+
+
 class ProviderHealth(str, Enum):
     HEALTHY = "healthy"
     UNHEALTHY = "unhealthy"

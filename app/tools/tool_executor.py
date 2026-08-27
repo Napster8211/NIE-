@@ -6,6 +6,7 @@ from app.tools.base_tool import BaseTool
 from app.tools.tool_models import ToolResult, ToolResultStatus
 from app.services.authorization import AuthorizationGate
 from app.agent.agent_models import AgentContext
+from app.repositories.finance_repository import finance_repository
 
 logger = logging.getLogger(__name__)
 
@@ -21,12 +22,15 @@ class ToolExecutor:
         agent_context = None
         
         # SPRINT 3V SECURITY: Never instantiate AgentContext from raw dictionary parameters.
-        # Direct dictionary injection is an authority forgery attack vector.
         if isinstance(raw_context, AgentContext):
             agent_context = raw_context
             
-        # Identify protected tool status centrally
         is_protected = getattr(tool, "approval_required", False)
+        
+        is_financial = (
+            getattr(tool, "operation_type", "") == "FINANCIAL_COMMITMENT"
+            or any(str(p).lower() == "financial_commitment" for p in getattr(tool, "permissions", []))
+        )
         
         # 1. ENFORCE TRUSTED CONTEXT FOR PROTECTED OPERATIONS
         if is_protected and not agent_context:
@@ -41,10 +45,8 @@ class ToolExecutor:
                 # 2. Enforce strict input boundary
                 validated_input = tool.input_schema(**parameters)
                 
-                # SPRINT 3E: PROTECTED EXECUTION GATE
+                # SPRINT 3E / 4C: PROTECTED EXECUTION GATE (FOUR-KEY RULE)
                 if is_protected and agent_context:
-                    # Extract the exact string permissions required by the tool directly.
-                    # Do NOT intersect them with granted permissions here, otherwise the gate is bypassed!
                     raw_required_perms = getattr(tool, "permissions", [])
                                 
                     auth_result = AuthorizationGate.evaluate_execution(
@@ -66,7 +68,6 @@ class ToolExecutor:
 
                 # 3. Execute with bounded timeout
                 execute_args = validated_input.model_dump()
-                # Ensure context bypasses Pydantic stripping and reaches the tool execute method
                 if "context" in parameters:
                     execute_args["context"] = parameters["context"]
                 
@@ -78,7 +79,40 @@ class ToolExecutor:
                 # 4. Enforce strict output boundary
                 validated_output = tool.output_schema.model_validate(raw_result)
                 
-                # SPRINT 3E: APPROVAL CONSUMPTION
+                # SPRINT 4C: RECORD FINANCIAL COMMITMENT AND SPEND UPON SUCCESSFUL EXECUTION
+                if is_financial and agent_context:
+                    try:
+                        params = validated_input.model_dump()
+                        planner_out = agent_context.planner_output or {}
+                        objective_id = params.get("objective_id") or planner_out.get("objective_id") or getattr(agent_context, "objective_id", None)
+                        mission_id = params.get("mission_id") or planner_out.get("mission_id")
+                        amount = params.get("amount") or params.get("estimated_cost")
+                        currency = params.get("currency", "GHS")
+                        purpose = params.get("purpose", f"Execution of {tool.name}")
+
+                        if objective_id and mission_id and amount:
+                            commitment = finance_repository.record_direct_commitment(
+                                objective_id=objective_id,
+                                mission_id=mission_id,
+                                amount=float(amount),
+                                purpose=purpose,
+                                currency=currency
+                            )
+                            finance_repository.record_spend(
+                                commitment_id=commitment.commitment_id,
+                                actual_amount=float(amount),
+                                description=f"Confirmed successful execution of {tool.name}"
+                            )
+                            logger.info(f"[ToolExecutor] Financial commitment and spend successfully recorded for {tool.name}")
+                    except Exception as fe:
+                        logger.error(f"[ToolExecutor] CRITICAL_FINANCIAL_UNCERTAINTY: {tool.name} succeeded but ledger persistence failed: {fe}")
+                        return ToolResult(
+                            status=ToolResultStatus.FAILURE,
+                            error=f"CRITICAL_UNCERTAINTY: Financial operation succeeded but local ledger update failed: {fe}",
+                            execution_time_ms=(time.time() - start_time) * 1000
+                        )
+
+                # 5. SPRINT 3E: APPROVAL CONSUMPTION
                 if is_protected and agent_context:
                     try:
                         AuthorizationGate.consume_approval(agent_context)
@@ -120,7 +154,7 @@ class ToolExecutor:
                         execution_time_ms=(time.time() - start_time) * 1000
                     )
             
-            # 5. Trigger Backoff
+            # 6. Trigger Backoff
             retries += 1
             backoff_time = policy.backoff_factor ** retries
             logger.info(f"[ToolExecutor] Retrying {tool.name} in {backoff_time}s...")

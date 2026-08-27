@@ -133,6 +133,20 @@ class BaseAgent(ABC):
     async def initialize(self, context: AgentContext) -> None:
         """Lifecycle Step 1: Prepares runtime metadata and checks security permissions."""
         logger.info(f"[{self.metadata.name}] Initializing session {context.session_id}")
+
+        # Provider-agnostic inference governance for downstream evaluators.
+        context.runtime_metadata["model_routing"] = {
+            "cost_preference": self.metadata.cost_preference,
+            "reasoning_level": self.metadata.reasoning_level,
+            "model_profile": getattr(self.metadata, "model_profile", "auto"),
+            "max_model_cost_per_request_usd": getattr(
+                self.metadata, "max_model_cost_per_request_usd", 0.03
+            ),
+            "allow_free_model_first": getattr(
+                self.metadata, "allow_free_model_first", True
+            ),
+            "allowed_providers": sorted(self.metadata.allowed_providers),
+        }
         
         # Verify required permissions against granted context permissions
         for req_perm in self.metadata.required_permissions:

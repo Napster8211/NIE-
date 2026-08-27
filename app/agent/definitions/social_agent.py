@@ -18,6 +18,8 @@ class SocialIntelligenceAgent(BaseAgent):
             description="Transforms content strategies into platform-specific, ready-to-publish social media assets.",
             version="1.0.0",
             category="social_media_operations",
+            department_id="growth_marketing",        # CANONICAL TAXONOMY
+            department_name="Growth & Marketing",    # CANONICAL TAXONOMY
             capabilities={AgentCapability.RESEARCH},
             supported_task_types=["prepare social assets", "adapt content", "generate social media"],
             allowed_tools={"social_context_builder", "social_evaluator", "social_artifact_saver"},

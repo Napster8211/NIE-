@@ -1,98 +1,174 @@
-"""
-NapsterTec AI - Finance Intelligence Engine
-Module: app/services/finance_engine.py
-"""
 import uuid
-from typing import Dict, Any
-from app.schemas.shared_artifacts import (
-    FinanceAgentContext, FinanceArtifact,
-    FinancialHealth, RevenueSummary, ExpenseSummary,
-    Runway, BudgetStatus, ROIAnalysis, FinancialRisk
+from typing import Dict, Any, List, Optional
+from datetime import datetime, timezone
+from decimal import Decimal
+
+from app.schemas.shared_artifacts import FinanceAgentContext, FinanceArtifact
+from app.schemas.finance import (
+    FinancialGovernanceSnapshot, CFOFinancialAssessment, BudgetStatus
 )
+from app.repositories.finance_repository import finance_repository
 
 class FinanceEngine:
+    def _determine_health_status(self, available: Decimal, utilization: float, threshold: float, total: Decimal) -> str:
+        if total == 0:
+            return "NOT_CONFIGURED"
+        if available < 0:
+            return "OVER_BUDGET"
+        if available == 0:
+            return "EXHAUSTED"
+        if utilization >= threshold:
+            return "WARNING"
+        return "HEALTHY"
+
+    def _determine_risk_level(self, status: str) -> str:
+        mapping = {
+            "HEALTHY": "LOW",
+            "WARNING": "MEDIUM",
+            "CONSTRAINED": "HIGH",
+            "EXHAUSTED": "CRITICAL",
+            "OVER_BUDGET": "CRITICAL",
+            "NOT_CONFIGURED": "UNKNOWN",
+            "DATA_UNAVAILABLE": "UNKNOWN",
+            "INCONSISTENT": "CRITICAL"
+        }
+        return mapping.get(status, "UNKNOWN")
+
+    def generate_snapshot(self, objective_id: str) -> FinancialGovernanceSnapshot:
+        try:
+            budget = finance_repository.get_objective_budget(objective_id)
+            if not budget:
+                return FinancialGovernanceSnapshot(
+                    snapshot_id=f"snap_{uuid.uuid4().hex[:8]}",
+                    objective_id=objective_id,
+                    currency="UNKNOWN",
+                    budget_status=BudgetStatus.UNSET,
+                    data_quality="NOT_CONFIGURED"
+                )
+            
+            # Re-verify invariants for INCONSISTENT detection
+            derived_available = budget.total_budget - budget.allocated_amount - budget.reserved_amount - budget.committed_amount - budget.spent_amount
+            data_quality = "VERIFIED"
+            if derived_available != budget.available_amount:
+                data_quality = "INCONSISTENT"
+                
+            utilization = 0.0
+            if budget.total_budget > 0:
+                utilization = float((budget.allocated_amount + budget.reserved_amount + budget.committed_amount + budget.spent_amount) / budget.total_budget) * 100
+
+            return FinancialGovernanceSnapshot(
+                snapshot_id=f"snap_{uuid.uuid4().hex[:8]}",
+                objective_id=budget.objective_id,
+                currency=budget.currency,
+                total_budget=budget.total_budget,
+                allocated_amount=budget.allocated_amount,
+                reserved_amount=budget.reserved_amount,
+                committed_amount=budget.committed_amount,
+                spent_amount=budget.spent_amount,
+                available_amount=budget.available_amount,
+                utilization_percent=utilization,
+                budget_status=budget.status,
+                ledger_version=budget.version,
+                data_quality=data_quality
+            )
+        except Exception:
+            return FinancialGovernanceSnapshot(
+                snapshot_id=f"snap_{uuid.uuid4().hex[:8]}",
+                objective_id=objective_id,
+                currency="UNKNOWN",
+                budget_status=BudgetStatus.UNSET,
+                data_quality="DATA_UNAVAILABLE"
+            )
+
+    def assess_finances(self, snapshot: FinancialGovernanceSnapshot) -> CFOFinancialAssessment:
+        if snapshot.data_quality in {"NOT_CONFIGURED", "DATA_UNAVAILABLE", "INCONSISTENT"}:
+            status = snapshot.data_quality
+        else:
+            status = self._determine_health_status(snapshot.available_amount, snapshot.utilization_percent, snapshot.warning_threshold_percent, snapshot.total_budget)
+            
+        risk = self._determine_risk_level(status)
+        
+        findings = []
+        recs = []
+        requires_attention = False
+        
+        if status == "NOT_CONFIGURED":
+            findings.append("No authoritative financial budget is configured for this objective.")
+            recs.append("REQUEST_FINANCIAL_CONFIGURATION")
+        elif status == "DATA_UNAVAILABLE":
+            findings.append("Financial repository could not be read safely.")
+            recs.append("RETRY_ANALYSIS")
+        elif status == "INCONSISTENT":
+            findings.append("CRITICAL: Ledger double-entry invariants failed validation.")
+            recs.append("ESCALATE_TO_HUMAN")
+            requires_attention = True
+        else:
+            findings.append(f"Total Budget: {snapshot.total_budget} {snapshot.currency}")
+            findings.append(f"Available: {snapshot.available_amount} {snapshot.currency} ({100 - snapshot.utilization_percent:.1f}%)")
+            
+            if status == "HEALTHY":
+                recs.append("CONTINUE")
+            elif status == "WARNING":
+                findings.append(f"Budget utilization ({snapshot.utilization_percent:.1f}%) exceeds warning threshold.")
+                recs.append("CONTINUE_WITH_CAUTION")
+                requires_attention = True
+            elif status == "EXHAUSTED":
+                findings.append("Available budget is completely exhausted.")
+                recs.append("PAUSE_COST_BEARING_WORK")
+                recs.append("REQUEST_BUDGET")
+                requires_attention = True
+            elif status == "OVER_BUDGET":
+                findings.append("Budget is overdrawn.")
+                recs.append("PAUSE_COST_BEARING_WORK")
+                recs.append("ESCALATE_TO_HUMAN")
+                requires_attention = True
+
+        return CFOFinancialAssessment(
+            assessment_id=f"cfo_{uuid.uuid4().hex[:8]}",
+            objective_id=snapshot.objective_id,
+            snapshot_id=snapshot.snapshot_id,
+            financial_status=status,
+            risk_level=risk,
+            utilization_percent=snapshot.utilization_percent,
+            available_amount=f"{snapshot.available_amount} {snapshot.currency}",
+            currency=snapshot.currency,
+            findings=findings,
+            recommendations=recs,
+            requires_director_attention=requires_attention
+        )
+
     def evaluate_finances(self, context: FinanceAgentContext, session_id: str) -> FinanceArtifact:
+        snapshot = self.generate_snapshot(context.company_id)
+        assessment = self.assess_finances(snapshot)
         
-        # 1. Financial Health
-        health = FinancialHealth(
-            score=94,
-            trend="Improving",
-            confidence="98% (Based on verified pipeline and historical burn)",
-            operating_margin="68%",
-            gross_margin="85%",
-            net_margin="45%",
-            revenue_growth="+12% MoM",
-            expense_growth="+4% MoM",
-            cash_position="$215,000 Verified",
-            liquidity="High",
-            reasoning="Revenue growth significantly outpaces expense growth. High gross margin driven by scalable AI infrastructure."
-        )
-
-        # 2. Revenue & Expense Summaries
-        revenue = RevenueSummary(
-            total_expected_revenue="$45,000 (Monthly Forecast)",
-            recurring_revenue="$8,500 MRR",
-            implementation_revenue="$36,500",
-            annual_forecast="$540,000"
-        )
-        
-        expenses = ExpenseSummary(
-            total_expenses="$14,200 (Monthly Estimated)",
-            infrastructure_costs="$1,200",
-            marketing_costs="$2,500",
-            development_costs="$3,000",
-            ai_provider_costs="$800",
-            future_payroll_allocations="$6,700"
-        )
-
-        # 3. Runway Engine
-        runway = Runway(
-            monthly_burn="$5,700 (Net Burn)",
-            cash_runway="37 Months",
-            safe_operating_window="24 Months (Conservative estimate)",
-            expansion_capacity="$85,000 Available for immediate strategic deployment",
-            hiring_capacity="Sufficient for 2 additional Senior Engineers",
-            infrastructure_capacity="Sufficient for 10x current volume",
-            investment_capacity="$50,000",
-            confidence_score="High"
-        )
-
-        # 4. Budget Tracking
-        budgets = [
-            BudgetStatus(department="Engineering", allocated="$5,000", spent="$3,000", remaining="$2,000", forecast="$4,200", variance="-$800", budget_health="Healthy"),
-            BudgetStatus(department="Marketing", allocated="$3,000", spent="$2,500", remaining="$500", forecast="$3,500", variance="+$500", budget_health="Warning"),
-            BudgetStatus(department="AI Infrastructure", allocated="$1,500", spent="$800", remaining="$700", forecast="$1,200", variance="-$300", budget_health="Healthy")
-        ]
-
-        # 5. ROI & Investment Engine
-        roi = [
-            ROIAnalysis(investment_area="LinkedIn Marketing Campaigns", cost="$1,500", generated_revenue="$12,000 Pipeline", roi_percentage="700%", recommendation="Increase budget allocation by 50%."),
-            ROIAnalysis(investment_area="AI Model Infrastructure (Groq/OpenRouter)", cost="$800", generated_revenue="Powers 100% of workflows", roi_percentage=">10,000%", recommendation="Maintain or scale. Essential infrastructure.")
-        ]
-
-        # 6. Financial Risks
-        risks = [
-            FinancialRisk(risk_type="Marketing Budget Overrun", level="Medium", description="Marketing spend trending 16% over allocated monthly budget.", reasoning="Accelerated ad spend on successful campaigns."),
-            FinancialRisk(risk_type="Cash Flow Timing", level="Low", description="Implementation milestones heavily weighted to end-of-month.", reasoning="Standard SaaS implementation payment schedules.")
-        ]
-
         artifact_id = f"fin_{uuid.uuid4().hex[:8]}"
-
+        
         return FinanceArtifact(
             artifact_id=artifact_id,
             agent_run_id=session_id,
             lead_id=context.company_id,
-            executive_summary="NapsterTec AI demonstrates robust financial health with 37 months of runway and highly profitable software deployment operations.",
-            financial_health=health,
-            revenue_summary=revenue,
-            expense_summary=expenses,
-            runway=runway,
-            budgets=budgets,
-            roi_analysis=roi,
-            financial_risks=risks,
-            financial_recommendations=[
-                "Reallocate $1,000 from Idle Engineering budget to Marketing to sustain high ROI campaigns.",
-                "Safe to initiate hiring for additional Director Intelligence UI engineer."
-            ],
-            execution_metadata={"evaluation_method": "Deterministic Cash Flow & Pipeline Aggregation"}
+            executive_summary=f"CFO Assessment: {assessment.financial_status}. Risk: {assessment.risk_level}.",
+            financial_health={
+                "score": int(100 - snapshot.utilization_percent) if snapshot.data_quality == "VERIFIED" else 0,
+                "trend": "Stable",
+                "confidence": "100%" if snapshot.data_quality == "VERIFIED" else "0%",
+                "operating_margin": "N/A", "gross_margin": "N/A", "net_margin": "N/A",
+                "revenue_growth": "N/A", "expense_growth": "N/A",
+                "cash_position": f"{snapshot.total_budget} {snapshot.currency}" if snapshot.data_quality == "VERIFIED" else "UNKNOWN",
+                "liquidity": "N/A",
+                "reasoning": " | ".join(assessment.findings)
+            },
+            revenue_summary={"total_expected_revenue": "N/A", "recurring_revenue": "N/A", "implementation_revenue": "N/A", "annual_forecast": "N/A"},
+            expense_summary={"total_expenses": f"{snapshot.spent_amount} {snapshot.currency}", "infrastructure_costs": "N/A", "marketing_costs": "N/A", "development_costs": "N/A", "ai_provider_costs": "N/A", "future_payroll_allocations": "N/A"},
+            runway={"monthly_burn": "N/A", "cash_runway": "N/A", "safe_operating_window": "N/A", "expansion_capacity": "N/A", "hiring_capacity": "N/A", "infrastructure_capacity": "N/A", "investment_capacity": "N/A", "confidence_score": "N/A"},
+            budgets=[], roi_analysis=[],
+            financial_risks=[{"risk_type": assessment.risk_level, "level": assessment.risk_level, "description": assessment.financial_status, "reasoning": "Ledger derived"}],
+            financial_recommendations=assessment.recommendations,
+            execution_metadata={
+                "evaluation_method": "Deterministic Ledger Assessment",
+                "snapshot_id": snapshot.snapshot_id,
+                "assessment_id": assessment.assessment_id,
+                "ledger_version": snapshot.ledger_version,
+                "data_quality": snapshot.data_quality
+            }
         )

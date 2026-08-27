@@ -18,6 +18,8 @@ class ClientAcquisitionIntelligenceAgent(BaseAgent):
             description="Autonomously prepares personalized business outreach while awaiting human approval.",
             version="1.0.0",
             category="business_development",
+            department_id="sales_revenue",           # CANONICAL TAXONOMY
+            department_name="Sales & Revenue",       # CANONICAL TAXONOMY
             capabilities={AgentCapability.RESEARCH},
             supported_task_types=["prepare outreach", "acquisition package", "crm update"],
             allowed_tools={"acquisition_context_builder", "acquisition_evaluator", "acquisition_artifact_saver"},

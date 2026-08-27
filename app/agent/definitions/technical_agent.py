@@ -18,6 +18,8 @@ class TechnicalSolutionArchitectAgent(BaseAgent):
             description="Transforms business/UX architecture into an enterprise engineering blueprint.",
             version="1.0.0",
             category="technical_architecture",
+            department_id="engineering_delivery",    # CANONICAL TAXONOMY
+            department_name="Engineering & Delivery",# CANONICAL TAXONOMY
             capabilities={AgentCapability.RESEARCH},
             supported_task_types=["design technical architecture", "system architecture", "engineering blueprint"],
             allowed_tools={"technical_context_builder", "technical_evaluator", "technical_artifact_saver"},

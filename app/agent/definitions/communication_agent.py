@@ -18,6 +18,8 @@ class CommunicationIntelligenceAgent(BaseAgent):
             description="Enterprise unified communication hub managing outbound delivery, identity tracking, and event monitoring.",
             version="2.0.0",
             category="communications",
+            department_id="operations_success",      # CANONICAL TAXONOMY
+            department_name="Operations & Success",  # CANONICAL TAXONOMY
             capabilities={AgentCapability.RESEARCH}, 
             supported_task_types=["deliver proposal", "monitor engagement", "send communication", "outbound delivery", "contact client"],
             allowed_tools={"communication_context_builder", "communication_evaluator", "communication_artifact_saver"},

@@ -1,5 +1,7 @@
 import json
 import os
+import sys
+import importlib
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -72,6 +74,37 @@ class StubLiveDiscoveryProvider:
 
 
 class MissionIntelligenceTests(unittest.IsolatedAsyncioTestCase):
+    @classmethod
+    def setUpClass(cls):
+        """
+        Bulletproof loader: Force the registration of all agents by explicitly
+        executing every .py file in the definitions directory, even if __init__.py is missing,
+        and then instantiate them into the global agent registry.
+        """
+        import importlib
+        import os
+        import sys
+        from app.agent.agent_registry import agent_registry
+        from app.agent.base_agent import BaseAgent
+        
+        base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        definitions_dir = os.path.join(base_dir, "app", "agent", "definitions")
+        if os.path.exists(definitions_dir):
+            for filename in os.listdir(definitions_dir):
+                if filename.endswith(".py") and filename != "__init__.py":
+                    module_name = f"app.agent.definitions.{filename[:-3]}"
+                    if module_name in sys.modules:
+                        importlib.reload(sys.modules[module_name])
+                    else:
+                        importlib.import_module(module_name)
+                        
+        for agent_class in BaseAgent.__subclasses__():
+            try:
+                if "Mock" not in agent_class.__name__:
+                    agent_registry.register(agent_class())
+            except Exception:
+                pass
+
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.original_mission_file = mission_registry.mission_file

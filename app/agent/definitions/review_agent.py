@@ -18,6 +18,8 @@ class EngineeringReviewAgent(BaseAgent):
             description="Independently validates software implementations before deployment.",
             version="1.0.0",
             category="engineering_governance",
+            department_id="engineering_delivery",    # CANONICAL TAXONOMY
+            department_name="Engineering & Delivery",# CANONICAL TAXONOMY
             capabilities={AgentCapability.RESEARCH},
             supported_task_types=["review implementation", "audit code", "govern project"],
             allowed_tools={"review_context_builder", "review_evaluator", "review_artifact_saver"},

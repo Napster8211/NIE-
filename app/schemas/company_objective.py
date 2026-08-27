@@ -7,14 +7,13 @@ from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
-
 
 class CompanyObjectiveStatus(str, Enum):
     DRAFT = "DRAFT"
     ACTIVE = "ACTIVE"
+    PAUSED = "PAUSED"  # SPRINT 6D: Owner Control state
     WAITING_APPROVAL = "WAITING_APPROVAL"
     WAITING_DIRECTOR = "WAITING_DIRECTOR"
     BLOCKED = "BLOCKED"
@@ -24,7 +23,6 @@ class CompanyObjectiveStatus(str, Enum):
     ESCALATED = "ESCALATED"
     EXHAUSTED = "EXHAUSTED"
 
-
 TERMINAL_OBJECTIVE_STATUSES = frozenset({
     CompanyObjectiveStatus.COMPLETED,
     CompanyObjectiveStatus.FAILED,
@@ -33,13 +31,11 @@ TERMINAL_OBJECTIVE_STATUSES = frozenset({
     CompanyObjectiveStatus.EXHAUSTED,
 })
 
-
 class CompanyObjectiveSuccessCriteria(BaseModel):
     criterion: str = Field(min_length=1)
     required: int = Field(ge=1)
     unit: str = Field(default="verified_outcomes", min_length=1)
     evidence_requirements: List[str] = Field(default_factory=list)
-
 
 class CompanyObjective(BaseModel):
     """Persisted CEO-level objective; deliberately separate from mission success."""
@@ -69,6 +65,7 @@ class CompanyObjective(BaseModel):
     time_limit_seconds: Optional[int] = Field(default=None, gt=0)
     deadline: Optional[str] = None
     budget_limit: Optional[float] = Field(default=None, ge=0)
+    financial_budget_id: Optional[str] = Field(default=None)
     risk_limit: Optional[str] = None
     escalation_threshold: Optional[int] = Field(default=None, ge=0)
     current_strategy_version: int = Field(default=1, ge=1)

@@ -18,6 +18,8 @@ class BusinessSolutionArchitectAgent(BaseAgent):
             description="Transforms verified intelligence into a complete digital transformation blueprint.",
             version="1.0.0",
             category="solution_architecture",
+            department_id="engineering_delivery",    # CANONICAL TAXONOMY
+            department_name="Engineering & Delivery",# CANONICAL TAXONOMY
             capabilities={AgentCapability.RESEARCH},
             supported_task_types=["design solution", "architect solution", "build architecture"],
             allowed_tools={"solution_context_builder", "solution_evaluator", "solution_artifact_saver"},

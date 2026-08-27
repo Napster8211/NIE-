@@ -18,6 +18,8 @@ class SolutionVisualizationArchitectAgent(BaseAgent):
             description="Transforms business solutions into complete UX architecture and blueprints.",
             version="1.0.0",
             category="ux_architecture",
+            department_id="engineering_delivery",    # CANONICAL TAXONOMY
+            department_name="Engineering & Delivery",# CANONICAL TAXONOMY
             capabilities={AgentCapability.RESEARCH},
             supported_task_types=["visualize solution", "design ux", "architecture blueprint"],
             allowed_tools={"visualization_context_builder", "visualization_evaluator", "visualization_artifact_saver"},

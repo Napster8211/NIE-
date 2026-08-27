@@ -21,6 +21,12 @@ class DirectorIntelligenceAgent(BaseAgent):
             capabilities={AgentCapability.RESEARCH},
             supported_task_types=["how is napstertec doing", "director", "executive briefing", "strategic decision", "delegate task", "mission", "continue mission", "show mission", "inspect", "audit", "approve", "reject", "revoke"],
             allowed_tools={"director_context_builder", "director_evaluator", "director_artifact_saver"},
+            allowed_providers={"openrouter"},
+            cost_preference="performance",
+            reasoning_level="high",
+            model_profile="executive",
+            max_model_cost_per_request_usd=0.05,
+            allow_free_model_first=False,
             # WRITE is operation-scoped and granted only for an explicitly
             # classified internal mission mutation.
             required_permissions={AgentPermission.READ}

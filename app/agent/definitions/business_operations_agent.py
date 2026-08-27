@@ -16,8 +16,12 @@ class BusinessOperationsIntelligenceAgent(BaseAgent):
             name="business_operations_intelligence",
             display_name="Business Operations Director (AI COO)",
             description="Continuously monitors departments, agents, workflows, and KPIs to ensure optimal enterprise efficiency.",
-            version="1.1.0", # Enterprise Upgrade
+            version="1.1.0",
             category="operations",
+            # --- SPRINT 6B.2B HOTFIX: CANONICAL ORGANIZATION MAPPING ---
+            department_id="operations_success",
+            department_name="Operations & Success",
+            # -----------------------------------------------------------
             capabilities={AgentCapability.RESEARCH},
             supported_task_types=["analyze operations", "monitor health", "department analysis", "bottlenecks", "coo report"],
             allowed_tools={"business_operations_context_builder", "business_operations_evaluator", "business_operations_artifact_saver"},

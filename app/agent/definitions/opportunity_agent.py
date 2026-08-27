@@ -19,6 +19,8 @@ class OpportunityIntelligenceAgent(BaseAgent):
             description="Transforms verified intelligence into structured business opportunities and service mappings.",
             version="1.1.0",
             category="business_intelligence",
+            department_id="sales_revenue",           # CANONICAL TAXONOMY
+            department_name="Sales & Revenue",       # CANONICAL TAXONOMY
             capabilities={AgentCapability.RESEARCH},
             supported_task_types=["evaluate opportunity", "score lead", "business opportunity"],
             allowed_tools={"opportunity_context_builder", "opportunity_evaluator", "opportunity_artifact_saver"},

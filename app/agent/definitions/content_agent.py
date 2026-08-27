@@ -18,6 +18,8 @@ class ContentIntelligenceAgent(BaseAgent):
             description="Autonomously plans and structures enterprise content strategy and campaigns.",
             version="1.0.0",
             category="marketing_strategy",
+            department_id="growth_marketing",      # CANONICAL TAXONOMY
+            department_name="Growth & Marketing",  # CANONICAL TAXONOMY
             capabilities={AgentCapability.RESEARCH},
             supported_task_types=["create content strategy", "plan marketing", "audience segmentation"],
             allowed_tools={"content_context_builder", "content_evaluator", "content_artifact_saver"},

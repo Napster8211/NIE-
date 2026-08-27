@@ -1,14 +1,14 @@
-import os
 import logging
+import os
 import re
-from typing import AsyncGenerator, Dict, Any, List, Optional
+from typing import Any, AsyncGenerator, Dict, List, Optional
 
 from openai import AsyncOpenAI
 
 from .config import openrouter_config
-from .models import MODEL_REGISTRY
+from .models import MODEL_REGISTRY, get_model_chain_for_capability
 from app.providers.base import BaseProviderPlugin
-from app.engine.models import ProviderHealth, Capability
+from app.engine.models import Capability, ProviderHealth
 
 logger = logging.getLogger(__name__)
 
@@ -21,33 +21,51 @@ class ProviderRateLimitError(Exception):
 
 class OpenRouterProvider(BaseProviderPlugin):
     """
-    Production-ready OpenRouter integration.
+    Cost-aware OpenRouter integration for NIE.
 
-    Native providers such as Groq and Kimi are deliberately excluded from
-    model resolution. Poolside and Google remain accepted here because the
-    current centralized registry stores their OpenRouter-routed model IDs
-    under their upstream maker names.
+    Routing policy:
+    - low          -> free / ultra-cheap models first
+    - balanced     -> reliable low-cost paid models first
+    - performance  -> stronger models first
+
+    OpenRouter model fallback is used in addition to OpenRouter's normal
+    provider-level failover. This means NIE can survive both an unhealthy
+    provider endpoint and an unavailable model without hard-coding retries
+    across the rest of the agent system.
     """
 
-    _OPENROUTER_PROVIDER_NAMES = frozenset({"openrouter", "poolside", "google"})
+    _OPENROUTER_PROVIDER_NAMES = frozenset(
+        {"openrouter", "poolside", "google", "qwen", "deepseek", "openai"}
+    )
 
     def __init__(self):
         api_key = os.getenv("OPENROUTER_API_KEY")
         if api_key:
             api_key = str(api_key).strip().strip("\"'")
         self._api_key = api_key or "UNSET"
+
         self.last_model_id: Optional[str] = None
         self.last_retry_after_seconds: Optional[float] = None
+        self.last_cost_usd: float = 0.0
+        self.last_usage: Dict[str, Any] = {}
 
         headers = {
-            "HTTP-Referer": getattr(openrouter_config, "site_url", "https://localhost"),
-            "X-Title": getattr(openrouter_config, "site_name", "NIE Engine"),
+            "HTTP-Referer": getattr(
+                openrouter_config, "site_url", "https://localhost"
+            ),
+            "X-Title": getattr(
+                openrouter_config, "site_name", "NIE Engine"
+            ),
             "Authorization": f"Bearer {self._api_key}",
         }
 
         self.client = AsyncOpenAI(
             api_key=self._api_key,
-            base_url=getattr(openrouter_config, "base_url", "https://openrouter.ai/api/v1"),
+            base_url=getattr(
+                openrouter_config,
+                "base_url",
+                "https://openrouter.ai/api/v1",
+            ),
             timeout=getattr(openrouter_config, "timeout_seconds", 60),
             max_retries=getattr(openrouter_config, "max_retries", 3),
             default_headers=headers,
@@ -64,8 +82,6 @@ class OpenRouterProvider(BaseProviderPlugin):
         if provider == "openrouter":
             return True
 
-        # Backward compatibility for the existing registry: Poolside and
-        # Google entries contain OpenRouter-style provider/model identifiers.
         return (
             provider in self._OPENROUTER_PROVIDER_NAMES
             and "/" in model_id
@@ -80,15 +96,22 @@ class OpenRouterProvider(BaseProviderPlugin):
         return list(capabilities)
 
     def _build_messages(
-        self, prompt: str, attachments: Optional[List[Any]] = None
+        self,
+        prompt: str,
+        attachments: Optional[List[Any]] = None,
     ) -> List[Dict[str, Any]]:
         system_text = ""
         user_text = prompt
 
         if "[System Instruction]" in prompt:
-            parts = prompt.split("[System Instruction]", 1)[1].split("\n\n", 1)
+            parts = prompt.split("[System Instruction]", 1)[1].split(
+                "\n\n", 1
+            )
             if len(parts) == 2:
-                system_text, user_text = parts[0].strip(), parts[1].strip()
+                system_text, user_text = (
+                    parts[0].strip(),
+                    parts[1].strip(),
+                )
 
         if attachments:
             user_content = [{"type": "text", "text": user_text}]
@@ -110,13 +133,18 @@ class OpenRouterProvider(BaseProviderPlugin):
         if system_text:
             messages.append({"role": "system", "content": system_text})
         messages.append({"role": "user", "content": user_content})
-
         return messages
 
     def _extract_retry_after(
-        self, exc: Exception, default_seconds: float = 30.0
+        self,
+        exc: Exception,
+        default_seconds: float = 30.0,
     ) -> float:
-        for attr in ("retry_after_seconds", "retry_after", "cooldown_seconds"):
+        for attr in (
+            "retry_after_seconds",
+            "retry_after",
+            "cooldown_seconds",
+        ):
             value = getattr(exc, attr, None)
             if isinstance(value, (int, float)) and value > 0:
                 return float(value)
@@ -139,34 +167,39 @@ class OpenRouterProvider(BaseProviderPlugin):
         text = str(exc).lower()
         status_code = getattr(exc, "status_code", None)
 
-        if status_code == 429:
+        if status_code == 429 or "429" in text:
             return True
 
-        if "429" in text:
-            return True
-
-        if (
+        return (
             "rate limited" in text
             or "temporarily rate-limited" in text
             or "rate limit" in text
-        ):
-            return True
+        )
 
-        return False
-
-    def _raise_rate_limit(self, model_id: str, exc: Exception) -> None:
-        retry_after = self._extract_retry_after(exc, default_seconds=30.0)
+    def _raise_rate_limit(
+        self,
+        model_id: str,
+        exc: Exception,
+    ) -> None:
+        retry_after = self._extract_retry_after(
+            exc,
+            default_seconds=30.0,
+        )
         self.last_retry_after_seconds = retry_after
         raise ProviderRateLimitError(
             f"OpenRouter model {model_id} rate limited",
             retry_after_seconds=retry_after,
         ) from exc
 
-    def _resolve_model_id(
+    def _resolve_model_chain(
         self,
         capability: str | Capability,
         attachments: Optional[List[Any]] = None,
-    ) -> str:
+        *,
+        cost_preference: str = "balanced",
+        reasoning_level: str = "medium",
+        model_override: Optional[str] = None,
+    ) -> List[str]:
         effective_capability = (
             Capability.VISION
             if attachments
@@ -181,33 +214,98 @@ class OpenRouterProvider(BaseProviderPlugin):
             )
         )
 
-        capable_models = [
-            model
-            for model in MODEL_REGISTRY.values()
-            if (
-                model.enabled
-                and effective_capability in model.capabilities
-                and self._is_openrouter_model(model)
-            )
-        ]
+        chain = get_model_chain_for_capability(
+            effective_capability,
+            cost_preference=cost_preference,
+            reasoning_level=reasoning_level,
+            require_vision=bool(attachments),
+        )
 
-        if not capable_models:
-            raise ValueError(
-                "No enabled OpenRouter-routable model registered for "
-                f"capability: {effective_capability}"
-            )
+        if model_override:
+            model_override = str(model_override).strip()
+            chain = [
+                model_override,
+                *[model for model in chain if model != model_override],
+            ]
 
-        capable_models.sort(key=lambda model: model.priority, reverse=True)
-        return capable_models[0].model_id
+        return chain
+
+    def _routing_extra_body(
+        self,
+        chain: List[str],
+        cost_preference: str,
+        existing: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        body = dict(existing or {})
+
+        # OpenRouter model fallbacks. The first entry is also passed as `model`
+        # for OpenAI-SDK compatibility.
+        body["models"] = chain
+
+        # Ask OpenRouter to include live cost/token accounting.
+        usage = dict(body.get("usage") or {})
+        usage["include"] = True
+        body["usage"] = usage
+
+        # For explicitly low-cost traffic, select the cheapest provider endpoint.
+        # Balanced leaves OpenRouter's normal price/reliability load balancing intact.
+        if (cost_preference or "balanced").casefold() == "low":
+            provider = dict(body.get("provider") or {})
+            provider.setdefault("sort", "price")
+            body["provider"] = provider
+
+        return body
+
+    @staticmethod
+    def _usage_to_dict(usage: Any) -> Dict[str, Any]:
+        if usage is None:
+            return {}
+
+        if hasattr(usage, "model_dump"):
+            try:
+                data = usage.model_dump()
+                extra = getattr(usage, "model_extra", None)
+                if isinstance(extra, dict):
+                    data.update(extra)
+                return data
+            except Exception:
+                pass
+
+        result = {}
+        for key in (
+            "prompt_tokens",
+            "completion_tokens",
+            "total_tokens",
+            "cost",
+            "prompt_tokens_details",
+            "completion_tokens_details",
+        ):
+            value = getattr(usage, key, None)
+            if value is not None:
+                result[key] = value
+        return result
+
+    def _record_usage(self, usage: Any) -> Dict[str, Any]:
+        data = self._usage_to_dict(usage)
+        self.last_usage = data
+
+        cost = data.get("cost", 0.0)
+        try:
+            self.last_cost_usd = float(cost or 0.0)
+        except Exception:
+            self.last_cost_usd = 0.0
+
+        return data
 
     async def check_health(self) -> ProviderHealth:
         if self._api_key == "UNSET" or not self._api_key:
             return ProviderHealth.UNHEALTHY
+
         try:
             await self.client.models.list()
             return ProviderHealth.HEALTHY
-        except Exception as e:
-            logger.error(f"[OpenRouter] Health check failed: {e}")
+        except Exception as exc:
+            logger.error("[OpenRouter] Health check failed: %s", exc)
             return ProviderHealth.UNHEALTHY
 
     async def generate(
@@ -217,29 +315,93 @@ class OpenRouterProvider(BaseProviderPlugin):
         attachments: Optional[List[Any]] = None,
         **kwargs,
     ) -> Dict[str, Any]:
-        model_id = self._resolve_model_id(capability, attachments=attachments)
+        # NIE-only routing hints are removed before forwarding to OpenAI/OpenRouter.
+        cost_preference = kwargs.pop("cost_preference", "balanced")
+        reasoning_level = kwargs.pop("reasoning_level", "medium")
+        model_override = kwargs.pop("model_override", None)
+        soft_cost_limit = kwargs.pop(
+            "max_model_cost_per_request_usd",
+            None,
+        )
+
+        existing_extra_body = kwargs.pop("extra_body", None)
+
+        chain = self._resolve_model_chain(
+            capability,
+            attachments=attachments,
+            cost_preference=cost_preference,
+            reasoning_level=reasoning_level,
+            model_override=model_override,
+        )
+        model_id = chain[0]
+
         self.last_model_id = model_id
         self.last_retry_after_seconds = None
-        messages = self._build_messages(prompt, attachments=attachments)
+        self.last_cost_usd = 0.0
+        self.last_usage = {}
+
+        messages = self._build_messages(
+            prompt,
+            attachments=attachments,
+        )
+        extra_body = self._routing_extra_body(
+            chain,
+            cost_preference,
+            existing=existing_extra_body,
+        )
 
         try:
             response = await self.client.chat.completions.create(
                 model=model_id,
                 messages=messages,
                 stream=False,
+                extra_body=extra_body,
                 **kwargs,
             )
+
+            actual_model = getattr(response, "model", None) or model_id
+            self.last_model_id = actual_model
+            usage = self._record_usage(
+                getattr(response, "usage", None)
+            )
+
+            if (
+                soft_cost_limit is not None
+                and self.last_cost_usd > float(soft_cost_limit)
+            ):
+                logger.warning(
+                    "[OpenRouter] Request cost %.6f exceeded soft NIE limit %.6f "
+                    "(model=%s)",
+                    self.last_cost_usd,
+                    float(soft_cost_limit),
+                    actual_model,
+                )
+
             return {
                 "response": response.choices[0].message.content,
                 "provider": self.name,
-                "model_used": model_id,
-                "tokens_used": response.usage.total_tokens if response.usage else 0,
+                "model_used": actual_model,
+                "tokens_used": int(usage.get("total_tokens", 0) or 0),
+                "prompt_tokens": int(
+                    usage.get("prompt_tokens", 0) or 0
+                ),
+                "completion_tokens": int(
+                    usage.get("completion_tokens", 0) or 0
+                ),
+                "cost_usd": self.last_cost_usd,
+                "routing_profile": cost_preference,
+                "fallback_chain": chain,
             }
-        except Exception as e:
-            logger.error(f"[OpenRouter] Generation failed on {model_id}: {e}")
-            if self._is_rate_limit_error(e):
-                self._raise_rate_limit(model_id, e)
-            raise Exception("ProviderException") from e
+
+        except Exception as exc:
+            logger.error(
+                "[OpenRouter] Generation failed on chain %s: %s",
+                chain,
+                exc,
+            )
+            if self._is_rate_limit_error(exc):
+                self._raise_rate_limit(model_id, exc)
+            raise Exception("ProviderException") from exc
 
     async def generate_stream(
         self,
@@ -248,25 +410,67 @@ class OpenRouterProvider(BaseProviderPlugin):
         attachments: Optional[List[Any]] = None,
         **kwargs,
     ) -> AsyncGenerator[str, None]:
-        model_id = self._resolve_model_id(capability, attachments=attachments)
+        cost_preference = kwargs.pop("cost_preference", "balanced")
+        reasoning_level = kwargs.pop("reasoning_level", "medium")
+        model_override = kwargs.pop("model_override", None)
+        kwargs.pop("max_model_cost_per_request_usd", None)
+
+        existing_extra_body = kwargs.pop("extra_body", None)
+
+        chain = self._resolve_model_chain(
+            capability,
+            attachments=attachments,
+            cost_preference=cost_preference,
+            reasoning_level=reasoning_level,
+            model_override=model_override,
+        )
+        model_id = chain[0]
+
         self.last_model_id = model_id
         self.last_retry_after_seconds = None
-        messages = self._build_messages(prompt, attachments=attachments)
+        self.last_cost_usd = 0.0
+        self.last_usage = {}
+
+        messages = self._build_messages(
+            prompt,
+            attachments=attachments,
+        )
+        extra_body = self._routing_extra_body(
+            chain,
+            cost_preference,
+            existing=existing_extra_body,
+        )
 
         try:
             stream = await self.client.chat.completions.create(
                 model=model_id,
                 messages=messages,
                 stream=True,
+                extra_body=extra_body,
                 **kwargs,
             )
 
             async for chunk in stream:
-                if chunk.choices and chunk.choices[0].delta.content is not None:
+                chunk_model = getattr(chunk, "model", None)
+                if chunk_model:
+                    self.last_model_id = chunk_model
+
+                chunk_usage = getattr(chunk, "usage", None)
+                if chunk_usage is not None:
+                    self._record_usage(chunk_usage)
+
+                if (
+                    chunk.choices
+                    and chunk.choices[0].delta.content is not None
+                ):
                     yield chunk.choices[0].delta.content
 
-        except Exception as e:
-            logger.error(f"[OpenRouter] Streaming failed on {model_id}: {e}")
-            if self._is_rate_limit_error(e):
-                self._raise_rate_limit(model_id, e)
-            raise Exception("ProviderException") from e
+        except Exception as exc:
+            logger.error(
+                "[OpenRouter] Streaming failed on chain %s: %s",
+                chain,
+                exc,
+            )
+            if self._is_rate_limit_error(exc):
+                self._raise_rate_limit(model_id, exc)
+            raise Exception("ProviderException") from exc

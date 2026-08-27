@@ -414,6 +414,28 @@ class PostMissionEvaluationCoordinator:
                 "terminal_reason": reason if terminal else objective.terminal_reason,
             }
 
+        from app.services.finance_engine import FinanceEngine
+        snap = FinanceEngine().generate_snapshot(objective.objective_id)
+        assess = FinanceEngine().assess_finances(snap)
+        
+        financial_evidence = {
+            "financial_status": assess.financial_status,
+            "financial_risk": assess.risk_level,
+            "budget_available": assess.available_amount,
+            "budget_currency": assess.currency,
+            "finance_assessment_id": assess.assessment_id,
+            "financial_snapshot_id": snap.snapshot_id,
+            "financial_evidence_version": snap.ledger_version
+        }
+        
+        # SPRINT 4B: Add financial warnings to reasons
+        if assess.financial_status == "EXHAUSTED":
+            reason += " Budget is EXHAUSTED. Request additional budget."
+        elif assess.financial_status == "WARNING":
+            reason += " Budget is at WARNING threshold."
+        elif assess.financial_status == "OVER_BUDGET":
+            reason += " Budget is OVER_BUDGET. Escalate to human."
+
         decision = ExecutiveDecisionRecord(
             decision_id=f"exd_{uuid.uuid4().hex[:12]}",
             objective_id=objective.objective_id,
@@ -424,7 +446,7 @@ class PostMissionEvaluationCoordinator:
             decision_type=decision_type,
             reason=reason,
             evidence_artifact_ids=credited,
-            evidence_summary=self._evidence_summary(mission, relevant),
+            evidence_summary={**self._evidence_summary(mission, relevant), "financial_evidence": financial_evidence},
             selected_follow_up_action=follow_up,
             authority_scope="INTERNAL_COMPANY_OBJECTIVE_STATE",
             approval_required=(objective.status == CompanyObjectiveStatus.WAITING_APPROVAL),

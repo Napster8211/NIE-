@@ -1,7 +1,3 @@
-"""
-NapsterTec AI - Director Intelligence Engine
-Module: app/services/director_engine.py
-"""
 import uuid
 import asyncio
 from typing import Dict, Any
@@ -54,10 +50,153 @@ class DirectorEngine:
         meta = {"evaluation_method": "CEO Artifact Synthesis & Governance"}
         
         ledger = MutationLedger() # Start pristine 0-mutation ledger
+        summary = ""
+        recs = ""
+
+        if objective_id:
+            from app.services.finance_engine import FinanceEngine
+            snap = FinanceEngine().generate_snapshot(objective_id)
+            assess = FinanceEngine().assess_finances(snap)
+            metrics['financial_status'] = assess.financial_status
+            metrics['financial_risk'] = assess.risk_level
+            
+            if assess.financial_status == "EXHAUSTED":
+                recs += " PAUSE_COST_BEARING_WORK. REQUEST_BUDGET."
+            elif assess.financial_status == "WARNING":
+                recs += " CONTINUE_WITH_CAUTION. Review upcoming mission costs."
+            elif assess.financial_status == "OVER_BUDGET":
+                recs += " ESCALATE_TO_HUMAN. Budget limits exceeded."
+
+        # SPRINT 5A: STRATEGIC PLANNING ROUTING
+        if command_class == "STRATEGY_DEVELOP" or (mode == "STRATEGIC DECISION MODE" and objective_id and not m_id):
+            from app.services.director_strategy import DirectorStrategyService
+            
+            objective = self.objective_service.repository.get(objective_id)
+            if not objective:
+                raise ValueError(f"OBJECTIVE_NOT_FOUND: {objective_id}")
+                
+            strategy_service = DirectorStrategyService()
+            plan = strategy_service.develop_strategy(objective)
+            
+            summary = (
+                f"**Strategic Plan Generated**\n\n"
+                f"Objective: {objective.title}\n"
+                f"Status: {plan.status.value}\n"
+                f"Readiness: {plan.execution_readiness}\n"
+                f"Workstreams: {len(plan.workstreams)}\n"
+                f"Departments Assigned: {len(plan.department_assignments)}\n"
+            )
+            if plan.clarification_questions:
+                summary += f"\nQuestions:\n- " + "\n- ".join(plan.clarification_questions)
+                
+            meta.update({"strategic_plan": plan.model_dump(mode="json")})
+            
+            return DirectorArtifact(
+                artifact_id=f"dir_{uuid.uuid4().hex[:8]}", agent_run_id=session_id, lead_id=context.company_id,
+                operating_mode=mode, execution_context=exec_ctx, mission_id=m_id, mission_action=context.mission_action,
+                objective_id=objective_id, objective_action="STRATEGY_DEVELOP",
+                read_only=True, state_mutation_from_query="None", mutation_ledger=ledger,
+                company_health=metrics.get('financial_status', 'NOT_CONFIGURED'), executive_board_consulted=[],
+                executive_summary=summary, top_priorities=[], major_opportunities=[], major_risks=[],
+                delegations=[], pending_approvals=[], active_agent_sessions=[], executive_decisions=[],
+                recommended_actions=["Review Strategic Plan"], execution_metadata=meta
+            )
+
+        # SPRINT 5B: PORTFOLIO MATERIALIZATION ROUTING
+        if command_class == "PORTFOLIO_MATERIALIZE" or (mode == "STRATEGIC DECISION MODE" and objective_id and metrics.get("strategic_plan")):
+            from app.services.mission_portfolio_service import MissionPortfolioService
+            from app.repositories.strategic_plan_repository import strategic_plan_repository
+            
+            objective = self.objective_service.repository.get(objective_id)
+            plan_id = metrics.get("strategic_plan", {}).get("strategic_plan_id")
+            plan = strategic_plan_repository.get(plan_id) if plan_id else None
+            
+            if not objective:
+                raise ValueError(f"OBJECTIVE_NOT_FOUND: {objective_id}")
+            if not plan:
+                raise ValueError(f"STRATEGIC_PLAN_NOT_FOUND")
+                
+            port_service = MissionPortfolioService()
+            portfolio = port_service.materialize_portfolio(plan, objective)
+            
+            summary = (
+                f"**Mission Portfolio Materialized**\n\n"
+                f"Objective: {objective.title}\n"
+                f"Portfolio ID: {portfolio.portfolio_id}\n"
+                f"Status: {portfolio.status.value}\n"
+                f"Mission Count: {len(portfolio.mission_definitions)}\n"
+                f"Execution Groups: {len(portfolio.execution_groups)}\n"
+            )
+            if portfolio.blocking_reasons:
+                summary += f"\nBlockers:\n- " + "\n- ".join(portfolio.blocking_reasons)
+                
+            meta.update({"mission_portfolio": portfolio.model_dump(mode="json")})
+            
+            return DirectorArtifact(
+                artifact_id=f"dir_{uuid.uuid4().hex[:8]}", agent_run_id=session_id, lead_id=context.company_id,
+                operating_mode=mode, execution_context=exec_ctx, mission_id=m_id, mission_action=context.mission_action,
+                objective_id=objective_id, objective_action="PORTFOLIO_MATERIALIZE",
+                read_only=True, state_mutation_from_query="None", mutation_ledger=ledger,
+                company_health=metrics.get('financial_status', 'NOT_CONFIGURED'), executive_board_consulted=[],
+                executive_summary=summary, top_priorities=[], major_opportunities=[], major_risks=[],
+                delegations=[], pending_approvals=[], active_agent_sessions=[], executive_decisions=[],
+                recommended_actions=["Review Mission Portfolio"], execution_metadata=meta
+            )
+
+        # SPRINT 5C: EXECUTIVE STRATEGY LOOP ROUTING
+        if command_class == "EXECUTIVE_EVALUATION" or (mode == "STRATEGIC DECISION MODE" and m_id and metrics.get("mission_terminal_state")):
+            from app.services.executive_strategy_service import ExecutiveStrategyService
+            
+            terminal_state = metrics.get("mission_terminal_state")
+            terminal_def_id = metrics.get("mission_definition_id", "mdef_unknown")
+            portfolio_id = metrics.get("portfolio_id", "port_unknown")
+            evidence_refs = metrics.get("evidence_refs", [])
+            success_met = terminal_state == "COMPLETED"
+            
+            exec_service = ExecutiveStrategyService()
+            evaluation = exec_service.evaluate_portfolio_outcome(
+                objective_id=objective_id,
+                portfolio_id=portfolio_id,
+                terminal_mission_id=m_id,
+                terminal_definition_id=terminal_def_id,
+                verified_outcome=terminal_state,
+                evidence_refs=evidence_refs,
+                success_criteria_met=success_met
+            )
+            
+            decision = exec_service.generate_decision(evaluation)
+            
+            summary = (
+                f"**Executive Strategy Cycle Complete**\n\n"
+                f"Objective: {objective_id}\n"
+                f"Terminal Mission: {m_id}\n"
+                f"Outcome: {terminal_state}\n"
+                f"Progress Delta: {evaluation.progress_delta}%\n"
+                f"Strategy Effectiveness: {evaluation.strategy_effectiveness}\n"
+                f"Recommendation: {evaluation.recommendation}\n"
+                f"Reason: {', '.join(evaluation.reason_codes)}\n"
+            )
+            
+            meta.update({
+                "executive_evaluation": evaluation.model_dump(mode="json"),
+                "executive_decision": decision.model_dump(mode="json")
+            })
+            
+            return DirectorArtifact(
+                artifact_id=f"dir_{uuid.uuid4().hex[:8]}", agent_run_id=session_id, lead_id=context.company_id,
+                operating_mode=mode, execution_context=exec_ctx, mission_id=m_id, mission_action=context.mission_action,
+                objective_id=objective_id, objective_action="EXECUTIVE_EVALUATION",
+                read_only=True, state_mutation_from_query="None", mutation_ledger=ledger,
+                company_health=metrics.get('financial_status', 'NOT_CONFIGURED'), executive_board_consulted=[],
+                executive_summary=summary, top_priorities=[], major_opportunities=[], major_risks=[],
+                delegations=[], pending_approvals=[], active_agent_sessions=[], executive_decisions=[decision],
+                recommended_actions=[f"Execute {evaluation.recommendation}"], execution_metadata=meta
+            )
 
         if command_class == "UNKNOWN":
             raise ValueError(DIRECTOR_COMMAND_UNRESOLVED)
 
+        # ... (Keep existing code from `OBJECTIVE_CREATE` onward exact)
         if command_class == "OBJECTIVE_CREATE":
             objective_record = self.objective_service.create_from_request(context.query)
             objective_id = objective_record.objective_id
@@ -167,7 +306,7 @@ class DirectorEngine:
             operating_mode=mode, execution_context=exec_ctx, mission_id=m_id, mission_action=context.mission_action,
             objective_id=objective_id, objective_action=objective_action,
             read_only=read_only, state_mutation_from_query="None" if read_only else "Executed", mutation_ledger=ledger,
-            company_health=f"Excellent ({metrics.get('coo_health', 97)}/100)", executive_board_consulted=context.board_consultation_details,
+            company_health=metrics.get('financial_status', 'NOT_CONFIGURED'), executive_board_consulted=context.board_consultation_details,
             executive_summary=summary, top_priorities=priorities, major_opportunities=["Vertical expansion."], major_risks=["Manual queues."],
             delegations=delegations, pending_approvals=approvals, active_agent_sessions=sessions, executive_decisions=decisions,
             recommended_actions=[recs], execution_metadata=meta

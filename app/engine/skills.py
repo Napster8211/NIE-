@@ -42,7 +42,7 @@ class FullStackArchitectSkill(Skill):
 
     @property
     def provider_preferences(self) -> List[str]:
-        return ["kimi", "groq", "gemini", "openrouter", "ollama_free_api"]
+        return ["openrouter", "kimi", "groq", "gemini", "ollama_free_api"]
 
     async def format_execution_prompt(self, intent: Intent) -> str:
         system_instructions = (
@@ -63,7 +63,7 @@ class SecurityAuditorSkill(Skill):
 
     @property
     def provider_preferences(self) -> List[str]:
-        return ["kimi", "groq", "gemini", "openrouter", "ollama_free_api"]
+        return ["openrouter", "kimi", "groq", "gemini", "ollama_free_api"]
 
     async def format_execution_prompt(self, intent: Intent) -> str:
         system_instructions = (
@@ -84,7 +84,7 @@ class ResearchSkill(Skill):
 
     @property
     def provider_preferences(self) -> List[str]:
-        return ["kimi", "groq", "gemini", "openrouter", "ollama_free_api"]
+        return ["openrouter", "kimi", "groq", "gemini", "ollama_free_api"]
 
     async def format_execution_prompt(self, intent: Intent) -> str:
         system_instructions = (
@@ -128,7 +128,7 @@ class GeneralChatSkill(Skill):
 
     @property
     def provider_preferences(self) -> List[str]:
-        return ["kimi", "groq", "gemini", "openrouter", "ollama_free_api"]
+        return ["openrouter", "kimi", "groq", "gemini", "ollama_free_api"]
 
     async def format_execution_prompt(self, intent: Intent) -> str:
         return intent.original_prompt

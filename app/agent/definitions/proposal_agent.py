@@ -18,6 +18,8 @@ class ProposalIntelligenceAgent(BaseAgent):
             description="Transforms verified business blueprints into structured proposal architectures.",
             version="1.0.0",
             category="business_consulting",
+            department_id="sales_revenue",           # CANONICAL TAXONOMY
+            department_name="Sales & Revenue",       # CANONICAL TAXONOMY
             capabilities={AgentCapability.RESEARCH},
             supported_task_types=["generate proposal", "design proposal", "draft proposal architecture"],
             allowed_tools={"proposal_context_builder", "proposal_evaluator", "proposal_artifact_saver"},

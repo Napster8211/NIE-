@@ -18,6 +18,8 @@ class MarketingAnalyticsIntelligenceAgent(BaseAgent):
             description="Evaluates campaign performance, measures business impact, and generates optimization insights.",
             version="1.0.0",
             category="marketing_analytics",
+            department_id="growth_marketing",        # CANONICAL TAXONOMY
+            department_name="Growth & Marketing",    # CANONICAL TAXONOMY
             capabilities={AgentCapability.RESEARCH},
             supported_task_types=["analyze campaign", "measure performance", "marketing analytics", "roi analysis"],
             allowed_tools={"marketing_analytics_context_builder", "marketing_analytics_evaluator", "marketing_analytics_artifact_saver"},
