@@ -27,35 +27,73 @@ class SpeechChunkAccumulator:
     """
     Buffers streaming LLM tokens into natural spoken sentences/clauses
     before sending to ElevenLabs TTS, optimizing TTFA (Time to First Audio).
+
+    Phase 4 First-Chunk Aware Tuning:
+    - First chunk flushes early on short natural clause boundaries (~35-70 chars).
+    - Subsequent chunks buffer to standard clause/sentence boundaries (~80-140 chars).
     """
-    def __init__(self, max_chars: int = 140):
+    def __init__(
+        self,
+        first_chunk_min_chars: int = 35,
+        first_chunk_max_chars: int = 70,
+        max_chars: int = 140,
+    ):
         self.buffer = ""
+        self.first_chunk_min_chars = first_chunk_min_chars
+        self.first_chunk_max_chars = first_chunk_max_chars
         self.max_chars = max_chars
-        # Sentence and major clause boundaries
-        self.boundary_pattern = re.compile(r'([.?!:;]+(?:\s+|\Z)|\n+)')
+        self.is_first_chunk = True
+        self.clause_pattern = re.compile(r'([,;:—–.?!]+(?:\s+|\Z)|\n+)')
+        self.sentence_pattern = re.compile(r'([.?!]+(?:\s+|\Z)|\n+)')
 
     def add_token(self, token: str) -> List[str]:
         self.buffer += token
         chunks = []
 
         while True:
-            match = self.boundary_pattern.search(self.buffer)
-            if match:
-                end_pos = match.end()
-                chunk = self.buffer[:end_pos].strip()
-                self.buffer = self.buffer[end_pos:].lstrip()
-                if chunk:
-                    chunks.append(chunk)
-            elif len(self.buffer) >= self.max_chars:
-                # Break at last space if buffer exceeds threshold to prevent latency spikes
-                last_space = self.buffer.rfind(" ")
-                if last_space > 30:
-                    chunk = self.buffer[:last_space].strip()
-                    self.buffer = self.buffer[last_space:].lstrip()
+            if self.is_first_chunk:
+                match = self.clause_pattern.search(self.buffer)
+                if match and match.end() >= self.first_chunk_min_chars:
+                    end_pos = match.end()
+                    chunk = self.buffer[:end_pos].strip()
+                    self.buffer = self.buffer[end_pos:].lstrip()
                     if chunk:
                         chunks.append(chunk)
+                        self.is_first_chunk = False
+                        continue
+                elif len(self.buffer) >= self.first_chunk_max_chars:
+                    last_space = self.buffer.rfind(" ")
+                    if last_space >= self.first_chunk_min_chars:
+                        chunk = self.buffer[:last_space].strip()
+                        self.buffer = self.buffer[last_space:].lstrip()
+                        if chunk:
+                            chunks.append(chunk)
+                            self.is_first_chunk = False
+                            continue
                 break
             else:
+                match = self.clause_pattern.search(self.buffer)
+                if match:
+                    end_pos = match.end()
+                    if (
+                        len(self.buffer[:end_pos]) >= 60
+                        or self.sentence_pattern.search(self.buffer[:end_pos])
+                        or len(self.buffer) >= self.max_chars
+                    ):
+                        chunk = self.buffer[:end_pos].strip()
+                        self.buffer = self.buffer[end_pos:].lstrip()
+                        if chunk:
+                            chunks.append(chunk)
+                            continue
+
+                if len(self.buffer) >= self.max_chars:
+                    last_space = self.buffer.rfind(" ")
+                    if last_space > 40:
+                        chunk = self.buffer[:last_space].strip()
+                        self.buffer = self.buffer[last_space:].lstrip()
+                        if chunk:
+                            chunks.append(chunk)
+                            continue
                 break
 
         return chunks
@@ -148,12 +186,12 @@ class DirectorInteractionService:
             yield protected.message
             return
 
-        # 2. Strategic Mission Escalation (Fast conversational feedback)
+        # 2. Strategic Mission Escalation
         if any(term in msg_lower for term in ("research competitors", "build market strategy", "create comprehensive plan")):
             yield "I can coordinate that as a strategic mission, Sayibu. I am preparing the mission scope for your review in Owner Control."
             return
 
-        # 3. Live Streaming LLM Reasoning
+        # 3. Live Streaming LLM Reasoning with Monotonic Timing Instrumentation
         state = self.state_service.get_bootstrap_state()
         system_prompt = self._build_system_prompt(state)
         prompt = (
@@ -163,18 +201,31 @@ class DirectorInteractionService:
             f"{msg}"
         )
 
+        voice_llm_start = time.perf_counter()
+        first_token_time: Optional[float] = None
+
         try:
-            # Dedicated DIRECTOR_LIVE_VOICE routing profile (Speed / Low TTFT prioritized)
             async for chunk in capability_router.route_skill_execution(
                 prompt=prompt,
                 required_capabilities=[Capability.CHAT],
-                preferences=["groq", "cerebras", "gemini", "openrouter", "auto"],
+                preferences=["openrouter", "groq", "cerebras", "gemini", "auto"],
                 cost_preference="balanced",
-                reasoning_level="low",  # Low reasoning level prevents deep CoT delay in live voice
+                reasoning_level="low",
                 max_model_cost_per_request_usd=0.01,
             ):
                 if chunk:
+                    if first_token_time is None:
+                        first_token_time = time.perf_counter()
+                        logger.debug(
+                            "[DirectorVoiceLLM] TTFT: %.0fms (turn=%s)",
+                            (first_token_time - voice_llm_start) * 1000,
+                            conv_id,
+                        )
                     yield str(chunk)
+
+            total_llm_ms = (time.perf_counter() - voice_llm_start) * 1000
+            logger.debug("[DirectorVoiceLLM] Complete: %.0fms (turn=%s)", total_llm_ms, conv_id)
+
         except Exception as exc:
             logger.error("[DirectorInteraction] Realtime streaming inference error: %s", exc, exc_info=True)
             yield "My cognitive logic is momentarily delayed, Sayibu, but executive telemetry is operational."

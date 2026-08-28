@@ -23,40 +23,90 @@ logger = logging.getLogger(__name__)
 
 
 class DirectorVoiceLatencyTrace:
-    """Tracks latency across turn phases to identify bottlenecks."""
+    """Tracks granular latency across turn phases without exposing secrets or transcripts."""
     def __init__(self, turn_id: str):
         self.turn_id = turn_id
-        self.speech_end_ms: Optional[float] = None
-        self.stt_final_ms: Optional[float] = None
-        self.llm_first_token_ms: Optional[float] = None
-        self.tts_first_audio_ms: Optional[float] = None
-        self.playback_start_ms: Optional[float] = None
-        self.turn_start_time = time.perf_counter()
+        self.turn_received_time = time.perf_counter()
+        
+        self.llm_start_time: Optional[float] = None
+        self.llm_first_token_time: Optional[float] = None
+        self.first_tts_enqueued_time: Optional[float] = None
+        self.tts_request_start_time: Optional[float] = None
+        self.tts_first_audio_time: Optional[float] = None
+        self.first_audio_sent_time: Optional[float] = None
+        self.llm_complete_time: Optional[float] = None
+        self.tts_complete_time: Optional[float] = None
+        self.turn_complete_time: Optional[float] = None
 
-    def mark_speech_end(self):
-        self.speech_end_ms = (time.perf_counter() - self.turn_start_time) * 1000
-
-    def mark_stt_final(self):
-        self.stt_final_ms = (time.perf_counter() - self.turn_start_time) * 1000
+    def mark_llm_start(self):
+        self.llm_start_time = time.perf_counter()
 
     def mark_llm_first_token(self):
-        self.llm_first_token_ms = (time.perf_counter() - self.turn_start_time) * 1000
+        if self.llm_first_token_time is None:
+            self.llm_first_token_time = time.perf_counter()
+
+    def mark_first_tts_enqueued(self):
+        if self.first_tts_enqueued_time is None:
+            self.first_tts_enqueued_time = time.perf_counter()
+
+    def mark_tts_request_start(self):
+        if self.tts_request_start_time is None:
+            self.tts_request_start_time = time.perf_counter()
 
     def mark_tts_first_audio(self):
-        self.tts_first_audio_ms = (time.perf_counter() - self.turn_start_time) * 1000
+        if self.tts_first_audio_time is None:
+            self.tts_first_audio_time = time.perf_counter()
+
+    def mark_first_audio_sent(self):
+        if self.first_audio_sent_time is None:
+            self.first_audio_sent_time = time.perf_counter()
+
+    def mark_llm_complete(self):
+        self.llm_complete_time = time.perf_counter()
+
+    def mark_tts_complete(self):
+        self.tts_complete_time = time.perf_counter()
+
+    def mark_turn_complete(self):
+        self.turn_complete_time = time.perf_counter()
 
     def log_summary(self):
-        total = (time.perf_counter() - self.turn_start_time) * 1000
-        perceived = (self.tts_first_audio_ms - self.speech_end_ms) if (self.tts_first_audio_ms and self.speech_end_ms) else total
+        now = self.turn_complete_time or time.perf_counter()
+        total_turn_ms = (now - self.turn_received_time) * 1000
+
+        backend_to_llm_first_token_ms = (
+            (self.llm_first_token_time - self.turn_received_time) * 1000
+            if self.llm_first_token_time
+            else 0.0
+        )
+        llm_first_token_to_tts_request_ms = (
+            (self.tts_request_start_time - self.llm_first_token_time) * 1000
+            if self.tts_request_start_time and self.llm_first_token_time
+            else 0.0
+        )
+        tts_request_to_first_audio_ms = (
+            (self.tts_first_audio_time - self.tts_request_start_time) * 1000
+            if self.tts_first_audio_time and self.tts_request_start_time
+            else 0.0
+        )
+        backend_to_first_audio_ms = (
+            (self.first_audio_sent_time - self.turn_received_time) * 1000
+            if self.first_audio_sent_time
+            else 0.0
+        )
+
         logger.info(
-            "[DirectorVoiceLatency] turn=%s vad=%.0fms stt_final=%.0fms llm_first_token=%.0fms tts_first_audio=%.0fms perceived_response=%.0fms total=%.0fms",
+            "[DirectorVoiceLatency] turn=%s transcript_received=0ms llm_first_token=%.0fms "
+            "tts_first_audio=%.0fms first_audio_sent=%.0fms backend_to_first_audio=%.0fms "
+            "llm_to_tts_req=%.0fms tts_req_to_audio=%.0fms total=%.0fms",
             self.turn_id,
-            self.speech_end_ms or 0,
-            self.stt_final_ms or 0,
-            self.llm_first_token_ms or 0,
-            self.tts_first_audio_ms or 0,
-            perceived,
-            total,
+            backend_to_llm_first_token_ms,
+            (self.tts_first_audio_time - self.turn_received_time) * 1000 if self.tts_first_audio_time else 0.0,
+            backend_to_first_audio_ms,
+            backend_to_first_audio_ms,
+            llm_first_token_to_tts_request_ms,
+            tts_request_to_first_audio_ms,
+            total_turn_ms,
         )
 
 
@@ -69,6 +119,7 @@ class DirectorVoiceSession:
         self.current_turn_id: Optional[str] = None
         self.current_trace: Optional[DirectorVoiceLatencyTrace] = None
         self.active_tasks: list[asyncio.Task] = []
+        self.tts_queue: Optional[asyncio.Queue] = None
 
     def cancel_active_turn(self):
         """Barge-in cancellation: cleanly halts active LLM and TTS tasks."""
@@ -77,16 +128,26 @@ class DirectorVoiceSession:
             if not task.done():
                 task.cancel()
         self.active_tasks.clear()
+        self.tts_queue = None
 
 
 class DirectorRealtimeVoiceService:
     def __init__(self):
         self.sessions: Dict[str, DirectorVoiceSession] = {}
+        self._http_client: Optional[httpx.AsyncClient] = None
+
+    def _get_http_client(self) -> httpx.AsyncClient:
+        """Maintains a persistent connection pool for low-latency streaming TTS."""
+        if self._http_client is None or self._http_client.is_closed:
+            self._http_client = httpx.AsyncClient(
+                timeout=httpx.Timeout(10.0, connect=3.0),
+                limits=httpx.Limits(max_keepalive_connections=10, max_connections=20),
+            )
+        return self._http_client
 
     async def handle_connection(self, websocket: WebSocket, owner_id: str):
-        # CRITICAL FIX: We MUST pass the subprotocol back, otherwise the browser severs the connection!
         await websocket.accept(subprotocol=owner_id)
-        
+
         session_id = f"vses_{uuid.uuid4().hex[:8]}"
         session = DirectorVoiceSession(session_id, owner_id, websocket)
         self.sessions[session_id] = session
@@ -111,8 +172,6 @@ class DirectorRealtimeVoiceService:
                         turn_id = f"trn_{uuid.uuid4().hex[:6]}"
                         session.current_turn_id = turn_id
                         session.current_trace = DirectorVoiceLatencyTrace(turn_id)
-                        session.current_trace.mark_speech_end()
-                        session.current_trace.mark_stt_final()
                         session.status = "PROCESSING"
 
                         await websocket.send_json({
@@ -150,8 +209,23 @@ class DirectorRealtimeVoiceService:
 
     async def _execute_streaming_turn(self, session: DirectorVoiceSession, turn_id: str, transcript: str):
         trace = session.current_trace
-        accumulator = SpeechChunkAccumulator(max_chars=120)
-        first_token_marked = False
+        if trace:
+            trace.mark_llm_start()
+
+        # Bounded asynchronous queue to decouple LLM token streaming from TTS synthesis
+        tts_queue: asyncio.Queue[Optional[str]] = asyncio.Queue(maxsize=5)
+        session.tts_queue = tts_queue
+
+        tts_worker_task = asyncio.create_task(
+            self._tts_consumer_worker(session, turn_id, tts_queue)
+        )
+        session.active_tasks.append(tts_worker_task)
+
+        accumulator = SpeechChunkAccumulator(
+            first_chunk_min_chars=35,
+            first_chunk_max_chars=70,
+            max_chars=140,
+        )
         full_text = []
 
         async def send_proposal(proposal):
@@ -166,18 +240,17 @@ class DirectorRealtimeVoiceService:
                 pass
 
         try:
-            # Stream LLM tokens using your custom Capability Router
+            # LLM Producer: streams tokens without blocking on TTS HTTP responses
             async for token in director_interaction_service.stream_interaction(
                 user_message=transcript,
                 conversation_id=session.session_id,
                 on_proposal=send_proposal,
             ):
-                if session.status == "INTERRUPTED":
+                if session.status == "INTERRUPTED" or session.current_turn_id != turn_id:
                     break
 
-                if not first_token_marked and trace:
+                if trace:
                     trace.mark_llm_first_token()
-                    first_token_marked = True
 
                 full_text.append(token)
                 await session.websocket.send_json({
@@ -187,17 +260,27 @@ class DirectorRealtimeVoiceService:
                     "delta": token,
                 })
 
-                # Buffer tokens into spoken sentence chunks for fluid TTS
                 chunks = accumulator.add_token(token)
                 for chunk in chunks:
-                    await self._synthesize_and_stream_chunk(session, turn_id, chunk)
+                    if trace:
+                        trace.mark_first_tts_enqueued()
+                    await tts_queue.put(chunk)
 
-            # Flush any remaining text
+            # Flush accumulator tail
             rem_chunk = accumulator.flush()
-            if rem_chunk and session.status != "INTERRUPTED":
-                await self._synthesize_and_stream_chunk(session, turn_id, rem_chunk)
+            if rem_chunk and session.status != "INTERRUPTED" and session.current_turn_id == turn_id:
+                if trace:
+                    trace.mark_first_tts_enqueued()
+                await tts_queue.put(rem_chunk)
 
-            if session.status != "INTERRUPTED":
+            if trace:
+                trace.mark_llm_complete()
+
+            # Sentinel to notify TTS consumer that LLM output is complete
+            await tts_queue.put(None)
+            await tts_worker_task
+
+            if session.status != "INTERRUPTED" and session.current_turn_id == turn_id:
                 await session.websocket.send_json({
                     "type": "director.text.final",
                     "session_id": session.session_id,
@@ -205,25 +288,63 @@ class DirectorRealtimeVoiceService:
                     "text": "".join(full_text),
                 })
                 if trace:
+                    trace.mark_turn_complete()
                     trace.log_summary()
 
         except asyncio.CancelledError:
-            logger.info("[DirectorRealtimeVoice] Turn %s cancelled (barge-in)", turn_id)
+            logger.info("[DirectorRealtimeVoice] Turn %s cancelled by barge-in", turn_id)
         except Exception as exc:
-            logger.error("[DirectorRealtimeVoice] Error in turn %s: %s", turn_id, exc, exc_info=True)
+            logger.error("[DirectorRealtimeVoice] Turn execution error: %s", exc, exc_info=True)
             await session.websocket.send_json({
                 "type": "error",
                 "session_id": session.session_id,
                 "detail": "STREAMING_ERROR",
             })
 
-    async def _synthesize_and_stream_chunk(self, session: DirectorVoiceSession, turn_id: str, text: str):
+    async def _tts_consumer_worker(
+        self,
+        session: DirectorVoiceSession,
+        turn_id: str,
+        queue: asyncio.Queue[Optional[str]],
+    ):
+        """Sequential TTS worker consuming speech chunks in guaranteed order."""
+        try:
+            while True:
+                chunk_text = await queue.get()
+                if chunk_text is None:
+                    queue.task_done()
+                    break
+
+                if session.status == "INTERRUPTED" or session.current_turn_id != turn_id:
+                    queue.task_done()
+                    break
+
+                await self._stream_synthesize_chunk(session, turn_id, chunk_text)
+                queue.task_done()
+
+            if session.current_trace:
+                session.current_trace.mark_tts_complete()
+
+        except asyncio.CancelledError:
+            pass
+
+    async def _stream_synthesize_chunk(
+        self,
+        session: DirectorVoiceSession,
+        turn_id: str,
+        text: str,
+    ):
+        """Streams synthesis from ElevenLabs and pushes output chunks immediately."""
         api_key = os.getenv("ELEVENLABS_API_KEY")
         voice_id = os.getenv("ELEVENLABS_VOICE_ID")
         model_id = os.getenv("ELEVENLABS_LIVE_TTS_MODEL_ID", "eleven_turbo_v2_5")
 
         if not api_key or not voice_id or not text.strip():
             return
+
+        trace = session.current_trace
+        if trace:
+            trace.mark_tts_request_start()
 
         url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}/stream"
         headers = {
@@ -237,28 +358,54 @@ class DirectorRealtimeVoiceService:
             "voice_settings": {
                 "stability": 0.5,
                 "similarity_boost": 0.8,
-                "optimize_streaming_latency": 3,
+                "optimize_streaming_latency": 4,
             },
         }
 
+        client = self._get_http_client()
+
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                response = await client.post(url, json=payload, headers=headers)
-                if response.status_code == 200 and response.content:
-                    if session.current_trace and session.current_trace.tts_first_audio_ms is None:
-                        session.current_trace.mark_tts_first_audio()
+            async with client.stream("POST", url, json=payload, headers=headers) as response:
+                if response.status_code != 200:
+                    logger.warning("[DirectorRealtimeVoice] ElevenLabs stream error status=%s", response.status_code)
+                    return
+
+                audio_bytes_list = []
+                first_byte_received = False
+
+                async for byte_chunk in response.aiter_bytes(chunk_size=4096):
+                    if session.status == "INTERRUPTED" or session.current_turn_id != turn_id:
+                        return
+
+                    if not first_byte_received and trace:
+                        trace.mark_tts_first_audio()
+                        first_byte_received = True
+
+                    audio_bytes_list.append(byte_chunk)
+
+                complete_chunk_audio = b"".join(audio_bytes_list)
+                if complete_chunk_audio and session.status != "INTERRUPTED" and session.current_turn_id == turn_id:
+                    if trace:
+                        trace.mark_first_audio_sent()
 
                     session.status = "SPEAKING"
-                    b64_audio = base64.b64encode(response.content).decode("utf-8")
+                    b64_audio = base64.b64encode(complete_chunk_audio).decode("utf-8")
+
                     await session.websocket.send_json({
                         "type": "audio.output.chunk",
                         "session_id": session.session_id,
                         "turn_id": turn_id,
                         "audio_base64": b64_audio,
+                        "audio_format": "mp3",
+                        "sample_rate": 44100,
+                        "channels": 1,
                         "text": text,
                     })
-        except Exception as e:
-            logger.warning("[DirectorRealtimeVoice] Chunk TTS failed: %s", e)
+
+        except httpx.RequestError as exc:
+            logger.warning("[DirectorRealtimeVoice] HTTP stream transport failure: %s", exc)
+        except Exception as exc:
+            logger.warning("[DirectorRealtimeVoice] Synthesize stream failed: %s", exc)
 
 
 director_realtime_voice_service = DirectorRealtimeVoiceService()

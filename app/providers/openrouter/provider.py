@@ -238,9 +238,20 @@ class OpenRouterProvider(BaseProviderPlugin):
     ) -> Dict[str, Any]:
         body = dict(existing or {})
 
-        # OpenRouter model fallbacks. The first entry is also passed as `model`
-        # for OpenAI-SDK compatibility.
-        body["models"] = chain
+        # SPRINT 6G.3 FIX: OpenRouter limits extra_body["models"] fallback array to <= 3 items.
+        # Preserve NIE's internal candidate chain while bounding the OpenRouter payload.
+        openrouter_request_chain = [m for m in chain if m][:3]
+        if not openrouter_request_chain and chain:
+            openrouter_request_chain = chain[:3]
+
+        body["models"] = openrouter_request_chain
+
+        logger.debug(
+            "[OpenRouter] Routing telemetry: primary_model=%s internal_candidate_count=%d openrouter_request_candidate_count=%d",
+            openrouter_request_chain[0] if openrouter_request_chain else "none",
+            len(chain),
+            len(openrouter_request_chain),
+        )
 
         # Ask OpenRouter to include live cost/token accounting.
         usage = dict(body.get("usage") or {})
