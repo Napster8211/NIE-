@@ -484,4 +484,4 @@ class OpenRouterProvider(BaseProviderPlugin):
             )
             if self._is_rate_limit_error(exc):
                 self._raise_rate_limit(model_id, exc)
-            raise Exception("ProviderException") from exc
+            raise Exception("ProviderException") from excq*

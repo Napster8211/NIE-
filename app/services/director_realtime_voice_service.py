@@ -6,18 +6,17 @@ import asyncio
 import base64
 import json
 import logging
-import os
 import time
 import uuid
 from typing import Any, Dict, Optional
 
-import httpx
 from fastapi import WebSocket, WebSocketDisconnect
 
 from app.services.director_interaction_service import (
     SpeechChunkAccumulator,
     director_interaction_service,
 )
+from app.services.director_voice_service import director_voice_service
 
 logger = logging.getLogger(__name__)
 
@@ -134,16 +133,6 @@ class DirectorVoiceSession:
 class DirectorRealtimeVoiceService:
     def __init__(self):
         self.sessions: Dict[str, DirectorVoiceSession] = {}
-        self._http_client: Optional[httpx.AsyncClient] = None
-
-    def _get_http_client(self) -> httpx.AsyncClient:
-        """Maintains a persistent connection pool for low-latency streaming TTS."""
-        if self._http_client is None or self._http_client.is_closed:
-            self._http_client = httpx.AsyncClient(
-                timeout=httpx.Timeout(10.0, connect=3.0),
-                limits=httpx.Limits(max_keepalive_connections=10, max_connections=20),
-            )
-        return self._http_client
 
     async def handle_connection(self, websocket: WebSocket, owner_id: str):
         await websocket.accept(subprotocol=owner_id)
@@ -222,9 +211,9 @@ class DirectorRealtimeVoiceService:
         session.active_tasks.append(tts_worker_task)
 
         accumulator = SpeechChunkAccumulator(
-            first_chunk_min_chars=35,
-            first_chunk_max_chars=70,
-            max_chars=140,
+            first_chunk_min_chars=20,
+            first_chunk_max_chars=48,
+            max_chars=110,
         )
         full_text = []
 
@@ -334,78 +323,48 @@ class DirectorRealtimeVoiceService:
         turn_id: str,
         text: str,
     ):
-        """Streams synthesis from ElevenLabs and pushes output chunks immediately."""
-        api_key = os.getenv("ELEVENLABS_API_KEY")
-        voice_id = os.getenv("ELEVENLABS_VOICE_ID")
-        model_id = os.getenv("ELEVENLABS_LIVE_TTS_MODEL_ID", "eleven_turbo_v2_5")
-
-        if not api_key or not voice_id or not text.strip():
+        """Synthesize one speech chunk as WAV through the internal Piper gateway."""
+        if not text.strip():
             return
 
         trace = session.current_trace
         if trace:
             trace.mark_tts_request_start()
 
-        url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}/stream"
-        headers = {
-            "Accept": "audio/mpeg",
-            "Content-Type": "application/json",
-            "xi-api-key": api_key,
-        }
-        payload = {
-            "text": text,
-            "model_id": model_id,
-            "voice_settings": {
-                "stability": 0.5,
-                "similarity_boost": 0.8,
-                "optimize_streaming_latency": 4,
-            },
-        }
-
-        client = self._get_http_client()
-
         try:
-            async with client.stream("POST", url, json=payload, headers=headers) as response:
-                if response.status_code != 200:
-                    logger.warning("[DirectorRealtimeVoice] ElevenLabs stream error status=%s", response.status_code)
-                    return
+            audio = await director_voice_service.synthesize_text(text)
+        except ValueError as exc:
+            logger.warning(
+                "[DirectorRealtimeVoice] Voice gateway synthesis skipped code=%s",
+                str(exc),
+            )
+            return
+        except Exception:
+            logger.warning("[DirectorRealtimeVoice] Voice gateway synthesis failed")
+            return
 
-                audio_bytes_list = []
-                first_byte_received = False
+        # A completed request from an interrupted or superseded turn is discarded.
+        if session.status == "INTERRUPTED" or session.current_turn_id != turn_id:
+            return
+        if not audio.audio_bytes:
+            return
 
-                async for byte_chunk in response.aiter_bytes(chunk_size=4096):
-                    if session.status == "INTERRUPTED" or session.current_turn_id != turn_id:
-                        return
+        if trace:
+            trace.mark_tts_first_audio()
+            trace.mark_first_audio_sent()
 
-                    if not first_byte_received and trace:
-                        trace.mark_tts_first_audio()
-                        first_byte_received = True
-
-                    audio_bytes_list.append(byte_chunk)
-
-                complete_chunk_audio = b"".join(audio_bytes_list)
-                if complete_chunk_audio and session.status != "INTERRUPTED" and session.current_turn_id == turn_id:
-                    if trace:
-                        trace.mark_first_audio_sent()
-
-                    session.status = "SPEAKING"
-                    b64_audio = base64.b64encode(complete_chunk_audio).decode("utf-8")
-
-                    await session.websocket.send_json({
-                        "type": "audio.output.chunk",
-                        "session_id": session.session_id,
-                        "turn_id": turn_id,
-                        "audio_base64": b64_audio,
-                        "audio_format": "mp3",
-                        "sample_rate": 44100,
-                        "channels": 1,
-                        "text": text,
-                    })
-
-        except httpx.RequestError as exc:
-            logger.warning("[DirectorRealtimeVoice] HTTP stream transport failure: %s", exc)
-        except Exception as exc:
-            logger.warning("[DirectorRealtimeVoice] Synthesize stream failed: %s", exc)
+        session.status = "SPEAKING"
+        b64_audio = base64.b64encode(audio.audio_bytes).decode("utf-8")
+        await session.websocket.send_json({
+            "type": "audio.output.chunk",
+            "session_id": session.session_id,
+            "turn_id": turn_id,
+            "audio_base64": b64_audio,
+            "audio_format": audio.audio_format,
+            "sample_rate": audio.sample_rate,
+            "channels": audio.channels,
+            "text": text,
+        })
 
 
 director_realtime_voice_service = DirectorRealtimeVoiceService()

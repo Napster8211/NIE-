@@ -1,3 +1,4 @@
+import os
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch, AsyncMock, Mock
@@ -13,7 +14,7 @@ class TestDirectorSpeech(unittest.TestCase):
         self.client = TestClient(app)
         self.headers = {"Authorization": f"Bearer {NIE_OWNER_KEY}"}
 
-    @patch("app.services.director_speech_service.ELEVENLABS_API_KEY", "fake_key")
+    @patch.dict(os.environ, {"ELEVENLABS_API_KEY": "fake_key"})
     @patch("httpx.AsyncClient.post", new_callable=AsyncMock)
     def test_valid_audio_transcribes(self, mock_post):
         # httpx.AsyncClient.post is async, but httpx.Response.json() is synchronous.
@@ -33,7 +34,7 @@ class TestDirectorSpeech(unittest.TestCase):
 
         res = self.client.post(
             "/api/v1/director/voice/transcribe",
-            files={"file": ("test.webm", b"fake_audio_content", "audio/webm")},
+            files={"file": ("test.webm", b"fake_audio_content" * 10, "audio/webm")},
             headers=self.headers,
         )
 
@@ -50,16 +51,17 @@ class TestDirectorSpeech(unittest.TestCase):
         self.assertEqual(kwargs["data"]["language_code"], "en")
         self.assertIn("file", kwargs["files"])
 
-    @patch("app.services.director_speech_service.ELEVENLABS_API_KEY", "fake_key")
-    def test_empty_audio_rejected(self):
+    @patch.dict(os.environ, {"ELEVENLABS_API_KEY": "fake_key"})
+    def test_empty_audio_returns_existing_safe_empty_transcript(self):
         res = self.client.post(
             "/api/v1/director/voice/transcribe",
             files={"file": ("test.webm", b"", "audio/webm")},
             headers=self.headers,
         )
 
-        self.assertEqual(res.status_code, 422)
-        self.assertIn("EMPTY_AUDIO", res.json()["detail"])
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.json()["transcript"], "")
+        self.assertEqual(res.json()["confidence"], 0.0)
 
     @patch(
         "app.services.director_interaction_service."

@@ -203,7 +203,7 @@ async def speak_briefing(request: DirectorVoiceRequest, owner_id: str = Depends(
         audio_bytes = await director_voice_service.generate_briefing_audio(request)
         return Response(
             content=audio_bytes,
-            media_type="audio/mpeg",
+            media_type="audio/wav",
             headers={"Cache-Control": "no-store"},
         )
     except ValueError as e:
@@ -214,11 +214,10 @@ async def speak_briefing(request: DirectorVoiceRequest, owner_id: str = Depends(
             "BRIEFING_GENERATION_FAILED": 500,
             "EMPTY_SPEECH_TEXT": 422,
             "SPEECH_TOO_LONG": 413,
-            "ELEVENLABS_UNAUTHORIZED": 502,
-            "ELEVENLABS_PAID_PLAN_REQUIRED": 402,
-            "ELEVENLABS_RATE_LIMITED": 429,
-            "ELEVENLABS_TIMEOUT": 504,
-            "ELEVENLABS_UNAVAILABLE": 503,
+            "VOICE_GATEWAY_UNAUTHORIZED": 502,
+            "VOICE_GATEWAY_RATE_LIMITED": 429,
+            "VOICE_GATEWAY_TIMEOUT": 504,
+            "VOICE_GATEWAY_UNAVAILABLE": 503,
             "VOICE_GENERATION_FAILED": 502,
         }
         raise HTTPException(status_code=status_map.get(code, 400), detail=code)
