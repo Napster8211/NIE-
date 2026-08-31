@@ -6,8 +6,11 @@ from unittest.mock import AsyncMock, patch
 import httpx
 from fastapi.testclient import TestClient
 
+TEST_NIE_OWNER_KEY = "explicit-test-only-owner-key"
+os.environ.setdefault("NIE_ENV", "test")
+os.environ["NIE_OWNER_KEY"] = TEST_NIE_OWNER_KEY
+
 from app.main import app
-from app.services.authorization import NIE_OWNER_KEY
 from app.services.director_interaction_service import director_interaction_service
 from app.services.director_realtime_voice_service import (
     DirectorVoiceSession,
@@ -46,7 +49,7 @@ class _WebSocketRecorder:
 class TestDirectorVoice(unittest.TestCase):
     def setUp(self):
         self.client = TestClient(app)
-        self.headers = {"Authorization": f"Bearer {NIE_OWNER_KEY}"}
+        self.headers = {"Authorization": f"Bearer {TEST_NIE_OWNER_KEY}"}
         self.environment = patch.dict(os.environ, {
             "VOICE_GATEWAY_URL": "https://voice-gateway.test/",
             "VOICE_GATEWAY_API_KEY": "internal-test-secret",

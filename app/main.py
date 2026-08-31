@@ -18,6 +18,7 @@ from app.database import engine, Base
 import app.models.memory_models 
 import app.models.image  
 import app.models.document 
+import app.models.director_auth
 
 # Core APIs and Engine Memory
 from app.api.endpoints import router as api_router
@@ -29,6 +30,8 @@ from app.api.routers.images import router as images_router
 from app.api.routers.analytics import router as analytics_router
 from app.api.routers.system import system_router
 from app.api.director_desktop import router as director_desktop_router
+from app.api.director_auth import router as director_auth_router
+from app.services.director_auth_service import trusted_frontend_origins
 
 # --- SPRINT 25.5: AUTONOMOUS MISSION WORKER IMPORT ---
 from app.engine.autonomous_worker import autonomous_worker
@@ -61,16 +64,17 @@ app = FastAPI(
 # Configure CORS Middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=list(trusted_frontend_origins()),
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_headers=["Accept", "Authorization", "Content-Type", "X-CSRF-Token"],
 )
 
 # Register routers
 app.include_router(api_router, prefix="/api/v1")
 app.include_router(memory_router)
 app.include_router(director_desktop_router, prefix="/api/v1")
+app.include_router(director_auth_router, prefix="/api/v1")
 
 app.include_router(documents_router)
 app.include_router(images_router)

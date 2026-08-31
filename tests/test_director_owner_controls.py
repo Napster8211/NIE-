@@ -3,13 +3,16 @@ import os
 import tempfile
 from fastapi.testclient import TestClient
 
+TEST_NIE_OWNER_KEY = "explicit-test-only-owner-key"
+os.environ.setdefault("NIE_ENV", "test")
+os.environ["NIE_OWNER_KEY"] = TEST_NIE_OWNER_KEY
+
 from app.main import app
 from app.repositories.approval_repository import approval_repository
 from app.repositories.company_objective_repository import company_objective_repository
 from app.engine.mission_engine import mission_registry
 from app.schemas.shared_artifacts import ApprovalRequest, ApprovalStatus, ApprovalType
 from app.schemas.company_objective import CompanyObjective, CompanyObjectiveStatus, CompanyObjectiveSuccessCriteria
-from app.services.authorization import NIE_OWNER_KEY
 
 class TestDirectorOwnerControls(unittest.TestCase):
     def setUp(self):
@@ -27,7 +30,7 @@ class TestDirectorOwnerControls(unittest.TestCase):
         mission_registry.missions = {}
 
         # Set Authenticated Headers
-        self.headers = {"Authorization": f"Bearer {NIE_OWNER_KEY}"}
+        self.headers = {"Authorization": f"Bearer {TEST_NIE_OWNER_KEY}"}
 
     def tearDown(self):
         self.temp_dir.cleanup()

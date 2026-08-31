@@ -134,8 +134,9 @@ class DirectorRealtimeVoiceService:
     def __init__(self):
         self.sessions: Dict[str, DirectorVoiceSession] = {}
 
-    async def handle_connection(self, websocket: WebSocket, owner_id: str):
-        await websocket.accept(subprotocol=owner_id)
+    async def handle_connection(self, websocket: WebSocket, owner_id: str, already_accepted: bool = False):
+        if not already_accepted:
+            await websocket.accept(subprotocol="nie-director-v1")
 
         session_id = f"vses_{uuid.uuid4().hex[:8]}"
         session = DirectorVoiceSession(session_id, owner_id, websocket)

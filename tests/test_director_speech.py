@@ -5,14 +5,17 @@ from unittest.mock import patch, AsyncMock, Mock
 
 from fastapi.testclient import TestClient
 
+TEST_NIE_OWNER_KEY = "explicit-test-only-owner-key"
+os.environ.setdefault("NIE_ENV", "test")
+os.environ["NIE_OWNER_KEY"] = TEST_NIE_OWNER_KEY
+
 from app.main import app
-from app.services.authorization import NIE_OWNER_KEY
 
 
 class TestDirectorSpeech(unittest.TestCase):
     def setUp(self):
         self.client = TestClient(app)
-        self.headers = {"Authorization": f"Bearer {NIE_OWNER_KEY}"}
+        self.headers = {"Authorization": f"Bearer {TEST_NIE_OWNER_KEY}"}
 
     @patch.dict(os.environ, {"ELEVENLABS_API_KEY": "fake_key"})
     @patch("httpx.AsyncClient.post", new_callable=AsyncMock)

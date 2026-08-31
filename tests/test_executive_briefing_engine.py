@@ -1,5 +1,10 @@
 import unittest
+import os
 from fastapi.testclient import TestClient
+
+TEST_NIE_OWNER_KEY = "explicit-test-only-owner-key"
+os.environ.setdefault("NIE_ENV", "test")
+os.environ["NIE_OWNER_KEY"] = TEST_NIE_OWNER_KEY
 
 from app.main import app
 from app.services.executive_briefing_service import executive_briefing_service
@@ -7,6 +12,7 @@ from app.services.executive_briefing_service import executive_briefing_service
 class TestExecutiveBriefingEngine(unittest.TestCase):
     def setUp(self):
         self.client = TestClient(app)
+        self.client.headers.update({"Authorization": f"Bearer {TEST_NIE_OWNER_KEY}"})
 
     def test_deterministic_company_status_briefing(self):
         briefing = executive_briefing_service.generate_company_status_briefing()

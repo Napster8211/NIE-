@@ -3,6 +3,11 @@ import os
 import tempfile
 from fastapi.testclient import TestClient
 from fastapi import FastAPI
+
+TEST_NIE_OWNER_KEY = "explicit-test-only-owner-key"
+os.environ.setdefault("NIE_ENV", "test")
+os.environ["NIE_OWNER_KEY"] = TEST_NIE_OWNER_KEY
+
 from app.api.director_desktop import router as desktop_router
 
 # Repositories and models
@@ -31,6 +36,7 @@ class TestDirectorDesktopAPI(unittest.TestCase):
         self.app = FastAPI()
         self.app.include_router(desktop_router)
         self.client = TestClient(self.app)
+        self.client.headers.update({"Authorization": f"Bearer {TEST_NIE_OWNER_KEY}"})
 
         # Sandbox repositories
         self.temp_dir = tempfile.TemporaryDirectory()

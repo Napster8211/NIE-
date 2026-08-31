@@ -2,6 +2,7 @@ import os
 import logging
 import hashlib
 import json
+import secrets
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -21,26 +22,41 @@ logger = logging.getLogger(__name__)
 # ==========================================
 
 # Canonical security scheme
-security = HTTPBearer()
+security = HTTPBearer(auto_error=False)
 
-# Strict environment-driven owner key. 
-# Defaults to a hardcoded local key for local sandbox dev if env is absent.
-NIE_OWNER_KEY = os.getenv("NIE_OWNER_KEY", "local-dev-owner-key-12345")
+# Privileged server/CLI credential. There is deliberately no predictable
+# fallback: every environment that uses administrative Bearer access must
+# configure it explicitly.
+NIE_OWNER_KEY = os.getenv("NIE_OWNER_KEY")
 
-def verify_owner(credentials: HTTPAuthorizationCredentials = Depends(security)) -> str:
+
+def verify_owner_key_token(token: str) -> str:
+    configured_key = os.getenv("NIE_OWNER_KEY")
+    if not configured_key:
+        logger.error("Owner administrative authentication is not configured.")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="OWNER_AUTH_NOT_CONFIGURED",
+        )
+    if not token or not secrets.compare_digest(token, configured_key):
+        logger.warning("Unauthorized owner administrative attempt blocked.")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="OWNER_AUTH_REQUIRED",
+        )
+    return "canonical_owner_identity"
+
+def verify_owner(credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)) -> str:
     """
     Canonical owner identity validation.
     Extracts the Bearer token and verifies it against the configured owner key.
     """
-    if not credentials or credentials.credentials != NIE_OWNER_KEY:
-        logger.warning("Unauthorized owner mutation attempt blocked.")
+    if credentials is None:
         raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="OWNER_AUTH_REQUIRED"
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="OWNER_AUTH_REQUIRED",
         )
-    
-    # Return canonical identity representation
-    return "canonical_owner_identity"
+    return verify_owner_key_token(credentials.credentials)
 
 # ==========================================
 # MISSION INTELLIGENCE AUTHORIZATION GATES

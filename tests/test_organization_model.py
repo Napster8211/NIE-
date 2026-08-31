@@ -4,6 +4,10 @@ import os
 import sys
 from fastapi.testclient import TestClient
 
+TEST_NIE_OWNER_KEY = "explicit-test-only-owner-key"
+os.environ.setdefault("NIE_ENV", "test")
+os.environ["NIE_OWNER_KEY"] = TEST_NIE_OWNER_KEY
+
 from app.main import app
 from app.agent.agent_registry import agent_registry
 from app.agent.base_agent import BaseAgent
@@ -37,6 +41,7 @@ class TestOrganizationModel(unittest.TestCase):
             
     def setUp(self):
         self.client = TestClient(app)
+        self.client.headers.update({"Authorization": f"Bearer {TEST_NIE_OWNER_KEY}"})
         self.agents = agent_registry.list_all_metadata()
 
     def test_total_specialist_agents(self):
