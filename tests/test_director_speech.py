@@ -41,6 +41,7 @@ class TestDirectorSpeech(unittest.TestCase):
         res = self.client.post(
             "/api/v1/director/voice/transcribe",
             files={"file": ("test.webm", b"fake_audio_content" * 10, "audio/webm")},
+            data={"correlation_id": "vsi_secure_test"},
             headers=self.headers,
         )
 
@@ -50,6 +51,9 @@ class TestDirectorSpeech(unittest.TestCase):
         self.assertEqual(body["language"], "en")
         self.assertAlmostEqual(body["confidence"], 0.99)
         self.assertEqual(body["duration_ms"], 950)
+        self.assertEqual(body["correlation_id"], "vsi_secure_test")
+        self.assertTrue(body["requires_confirmation"])
+        self.assertIn("transcription_total_ms", body["timings"])
         mock_transcribe.assert_awaited_once()
         self.assertIsNotNone(captured_path)
         self.assertFalse(captured_path.exists())

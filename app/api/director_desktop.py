@@ -41,7 +41,7 @@ from app.schemas.director_interaction import DirectorInteractionRequest, Directo
 from app.services.director_interaction_service import director_interaction_service
 
 # --- SPRINT 6G IMPORTS ---
-from fastapi import UploadFile, File
+from fastapi import UploadFile, File, Form
 from app.schemas.director_speech import DirectorTranscriptionResponse
 from app.services.director_speech_service import director_speech_service
 
@@ -279,10 +279,11 @@ async def interact_with_director(
 @router.post("/voice/transcribe", response_model=DirectorTranscriptionResponse)
 async def transcribe_voice(
     file: UploadFile = File(...),
+    correlation_id: Optional[str] = Form(None),
     principal: DirectorPrincipal = Depends(require_director_mutation),
 ):
     try:
-        return await director_speech_service.transcribe(file)
+        return await director_speech_service.transcribe(file, correlation_id=correlation_id)
     except ValueError as e:
         code = str(e)
         status_map = {

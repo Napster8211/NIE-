@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Callable, Optional, Protocol, Tuple
+from typing import Callable, Optional, Protocol
 
 
 logger = logging.getLogger(__name__)
@@ -44,6 +44,8 @@ class WhisperSTTConfig:
     max_audio_seconds: float = 20.0
     cpu_threads: int = 1
     beam_size: int = 1
+    temperature: float = 0.0
+    initial_prompt: Optional[str] = None
 
     @classmethod
     def from_env(cls) -> "WhisperSTTConfig":
@@ -73,6 +75,8 @@ class WhisperSTTConfig:
             ),
             cpu_threads=max(1, int(os.getenv("WHISPER_CPU_THREADS", "1"))),
             beam_size=max(1, int(os.getenv("WHISPER_BEAM_SIZE", "1"))),
+            temperature=float(os.getenv("WHISPER_TEMPERATURE", "0")),
+            initial_prompt=os.getenv("WHISPER_INITIAL_PROMPT", "").strip() or None,
         )
 
 
@@ -82,6 +86,12 @@ class WhisperTranscription:
     language: str
     language_probability: Optional[float]
     duration_seconds: float
+    avg_logprob: Optional[float] = None
+    no_speech_probability: Optional[float] = None
+    compression_ratio: Optional[float] = None
+    queue_wait_ms: int = 0
+    audio_decode_ms: int = 0
+    inference_ms: int = 0
 
 
 class WhisperModelProtocol(Protocol):
@@ -261,11 +271,17 @@ class WhisperSTTProvider:
 
     async def transcribe(self, audio_path: Path) -> WhisperTranscription:
         model = await self._ensure_loaded()
+        submitted_at = time.monotonic()
         with self._lock:
             active = self._transcription_future
             if active is not None and not active.done():
                 raise STTProviderError("STT_NOT_READY")
-            future = self._executor.submit(self._transcribe_sync, model, audio_path)
+            future = self._executor.submit(
+                self._transcribe_sync,
+                model,
+                audio_path,
+                submitted_at,
+            )
             self._transcription_future = future
             future.add_done_callback(self._finish_transcription)
 
@@ -312,22 +328,32 @@ class WhisperSTTProvider:
         self,
         model: WhisperModelProtocol,
         audio_path: Path,
+        submitted_at: float,
     ) -> WhisperTranscription:
+        started_at = time.monotonic()
+        queue_wait_ms = max(0, int((started_at - submitted_at) * 1000))
+        decode_started_at = time.monotonic()
         duration = self._audio_probe(audio_path)
+        audio_decode_ms = max(0, int((time.monotonic() - decode_started_at) * 1000))
         if duration > self.config.max_audio_seconds:
             raise STTProviderError("STT_INVALID_AUDIO")
+        inference_started_at = time.monotonic()
         segments, info = model.transcribe(
             str(audio_path),
             language=self.config.language,
             beam_size=self.config.beam_size,
+            temperature=self.config.temperature,
             vad_filter=True,
             condition_on_previous_text=False,
+            initial_prompt=self.config.initial_prompt,
         )
+        materialized_segments = list(segments)
         text = " ".join(
             str(getattr(segment, "text", "")).strip()
-            for segment in segments
+            for segment in materialized_segments
             if str(getattr(segment, "text", "")).strip()
         ).strip()
+        inference_ms = max(0, int((time.monotonic() - inference_started_at) * 1000))
         language = str(
             getattr(info, "language", None)
             or self.config.language
@@ -337,14 +363,29 @@ class WhisperSTTProvider:
         confidence = (
             float(probability) if isinstance(probability, (int, float)) else None
         )
-        duration = getattr(info, "duration_after_vad", None)
-        if not isinstance(duration, (int, float)):
-            duration = getattr(info, "duration", 0.0)
+        result_duration = getattr(info, "duration_after_vad", None)
+        if not isinstance(result_duration, (int, float)):
+            result_duration = getattr(info, "duration", duration)
+
+        def mean_segment_value(name: str) -> Optional[float]:
+            values = [
+                float(value)
+                for segment in materialized_segments
+                if isinstance((value := getattr(segment, name, None)), (int, float))
+            ]
+            return (sum(values) / len(values)) if values else None
+
         return WhisperTranscription(
             text=text,
             language=language,
             language_probability=confidence,
-            duration_seconds=max(0.0, float(duration or 0.0)),
+            duration_seconds=max(0.0, float(result_duration or 0.0)),
+            avg_logprob=mean_segment_value("avg_logprob"),
+            no_speech_probability=mean_segment_value("no_speech_prob"),
+            compression_ratio=mean_segment_value("compression_ratio"),
+            queue_wait_ms=queue_wait_ms,
+            audio_decode_ms=audio_decode_ms,
+            inference_ms=inference_ms,
         )
 
     async def shutdown(self) -> None:

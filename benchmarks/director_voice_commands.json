@@ -1,0 +1,12 @@
+[
+  {"id": "01_hello_director", "expected": "Hello, Director."},
+  {"id": "02_director_role", "expected": "What is your role in NapsterTec?"},
+  {"id": "03_active_objectives", "expected": "Give me a summary of the active objectives."},
+  {"id": "04_sales_department", "expected": "Which department handles sales and revenue?"},
+  {"id": "05_engineering_task", "expected": "Create a task for the Engineering and Delivery department."},
+  {"id": "06_mission_status", "expected": "What is the status of the current mission?"},
+  {"id": "07_stop_listening", "expected": "Stop listening."},
+  {"id": "08_repeat", "expected": "Repeat what I just said."},
+  {"id": "09_owner_name", "expected": "My name is Sayibu."},
+  {"id": "10_nie_name", "expected": "NapsterTec Intelligence Engine."}
+]

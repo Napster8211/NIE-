@@ -23,8 +23,9 @@ logger = logging.getLogger(__name__)
 
 class DirectorVoiceLatencyTrace:
     """Tracks granular latency across turn phases without exposing secrets or transcripts."""
-    def __init__(self, turn_id: str):
+    def __init__(self, turn_id: str, correlation_id: Optional[str] = None):
         self.turn_id = turn_id
+        self.correlation_id = correlation_id or turn_id
         self.turn_received_time = time.perf_counter()
         
         self.llm_start_time: Optional[float] = None
@@ -98,7 +99,7 @@ class DirectorVoiceLatencyTrace:
             "[DirectorVoiceLatency] turn=%s transcript_received=0ms llm_first_token=%.0fms "
             "tts_first_audio=%.0fms first_audio_sent=%.0fms backend_to_first_audio=%.0fms "
             "llm_to_tts_req=%.0fms tts_req_to_audio=%.0fms total=%.0fms",
-            self.turn_id,
+            self.correlation_id,
             backend_to_llm_first_token_ms,
             (self.tts_first_audio_time - self.turn_received_time) * 1000 if self.tts_first_audio_time else 0.0,
             backend_to_first_audio_ms,
@@ -160,8 +161,14 @@ class DirectorRealtimeVoiceService:
                     if transcript:
                         session.cancel_active_turn()
                         turn_id = f"trn_{uuid.uuid4().hex[:6]}"
+                        client_session_id = self._safe_correlation_id(
+                            message.get("client_session_id")
+                        )
                         session.current_turn_id = turn_id
-                        session.current_trace = DirectorVoiceLatencyTrace(turn_id)
+                        session.current_trace = DirectorVoiceLatencyTrace(
+                            turn_id,
+                            client_session_id,
+                        )
                         session.status = "PROCESSING"
 
                         await websocket.send_json({
@@ -235,6 +242,7 @@ class DirectorRealtimeVoiceService:
                 user_message=transcript,
                 conversation_id=session.session_id,
                 on_proposal=send_proposal,
+                correlation_id=trace.correlation_id if trace else turn_id,
             ):
                 if session.status == "INTERRUPTED" or session.current_turn_id != turn_id:
                     break
@@ -332,6 +340,7 @@ class DirectorRealtimeVoiceService:
         if trace:
             trace.mark_tts_request_start()
 
+        piper_started_at = time.perf_counter()
         try:
             audio = await director_voice_service.synthesize_text(text)
         except ValueError as exc:
@@ -350,6 +359,13 @@ class DirectorRealtimeVoiceService:
         if not audio.audio_bytes:
             return
 
+        logger.info(
+            "[TTS][%s] piper_request_ms=%.0f audio_bytes=%d",
+            trace.correlation_id if trace else turn_id,
+            (time.perf_counter() - piper_started_at) * 1000,
+            len(audio.audio_bytes),
+        )
+
         if trace:
             trace.mark_tts_first_audio()
             trace.mark_first_audio_sent()
@@ -366,6 +382,16 @@ class DirectorRealtimeVoiceService:
             "channels": audio.channels,
             "text": text,
         })
+
+    @staticmethod
+    def _safe_correlation_id(value: Any) -> Optional[str]:
+        candidate = str(value or "").strip()
+        if candidate and len(candidate) <= 64 and all(
+            character.isalnum() or character in {"_", "-"}
+            for character in candidate
+        ):
+            return candidate
+        return None
 
 
 director_realtime_voice_service = DirectorRealtimeVoiceService()

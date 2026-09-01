@@ -24,7 +24,20 @@ class FakeWhisperModel:
     def transcribe(self, audio, **kwargs):
         self.calls += 1
         return (
-            [SimpleNamespace(text=" Director"), SimpleNamespace(text=" ready. ")],
+            [
+                SimpleNamespace(
+                    text=" Director",
+                    avg_logprob=-0.2,
+                    no_speech_prob=0.02,
+                    compression_ratio=1.1,
+                ),
+                SimpleNamespace(
+                    text=" ready. ",
+                    avg_logprob=-0.4,
+                    no_speech_prob=0.04,
+                    compression_ratio=1.3,
+                ),
+            ],
             SimpleNamespace(
                 language="en",
                 language_probability=0.98,
@@ -52,7 +65,7 @@ class TestWhisperSTTProvider(unittest.IsolatedAsyncioTestCase):
             compute_type="int8",
             language="en",
             initialization_timeout_seconds=kwargs.pop("init_timeout", 0.25),
-            transcription_timeout_seconds=kwargs.pop("timeout", 0.25),
+            transcription_timeout_seconds=kwargs.pop("timeout", 2.0),
             max_audio_seconds=30,
             cpu_threads=1,
             beam_size=1,
@@ -81,6 +94,10 @@ class TestWhisperSTTProvider(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first.language, "en")
         self.assertAlmostEqual(first.language_probability, 0.98)
         self.assertAlmostEqual(first.duration_seconds, 1.25)
+        self.assertAlmostEqual(first.avg_logprob, -0.3)
+        self.assertAlmostEqual(first.no_speech_probability, 0.03)
+        self.assertAlmostEqual(first.compression_ratio, 1.2)
+        self.assertGreaterEqual(first.inference_ms, 0)
         self.assertEqual(second.text, first.text)
         readiness = provider.readiness()
         self.assertTrue(readiness["loaded"])
@@ -171,6 +188,8 @@ class TestWhisperSTTProvider(unittest.IsolatedAsyncioTestCase):
             "WHISPER_MAX_AUDIO_SECONDS",
             "WHISPER_CPU_THREADS",
             "WHISPER_BEAM_SIZE",
+            "WHISPER_TEMPERATURE",
+            "WHISPER_INITIAL_PROMPT",
         }
         clean_environment = {
             key: value for key, value in os.environ.items() if key not in whisper_names
@@ -183,6 +202,8 @@ class TestWhisperSTTProvider(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(config.compute_type, "int8")
         self.assertEqual(config.cpu_threads, 1)
         self.assertEqual(config.beam_size, 1)
+        self.assertEqual(config.temperature, 0.0)
+        self.assertIsNone(config.initial_prompt)
         self.assertEqual(config.max_audio_seconds, 20.0)
         self.assertFalse(config.local_files_only)
 

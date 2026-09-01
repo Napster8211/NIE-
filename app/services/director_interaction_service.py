@@ -26,7 +26,7 @@ capability_router = CapabilityRouter(provider_registry=provider_registry)
 class SpeechChunkAccumulator:
     """
     Buffers streaming LLM tokens into natural spoken sentences/clauses
-    before sending to ElevenLabs TTS, optimizing TTFA (Time to First Audio).
+    before sending to the registered Piper voice path, optimizing TTFA.
 
     Phase 4 First-Chunk Aware Tuning:
     - First chunk flushes early on short natural clause boundaries (~35-70 chars).
@@ -154,6 +154,7 @@ class DirectorInteractionService:
         conversation_id: Optional[str] = None,
         context_objective_id: Optional[str] = None,
         on_proposal: Optional[Any] = None,
+        correlation_id: Optional[str] = None,
     ) -> AsyncIterator[str]:
         """
         Director Fast Conversational Path:
@@ -163,6 +164,8 @@ class DirectorInteractionService:
         msg_lower = msg.casefold()
         ix_id = f"ix_{uuid.uuid4().hex[:8]}"
         conv_id = conversation_id or f"conv_{uuid.uuid4().hex[:8]}"
+        trace_id = correlation_id or conv_id
+        route_started_at = time.perf_counter()
 
         if not msg:
             yield "I didn't catch that, Sayibu."
@@ -181,17 +184,39 @@ class DirectorInteractionService:
             msg_lower=msg_lower,
         )
         if protected is not None:
+            logger.info(
+                "[DIRECTOR][%s] route=protected route_ms=%.0f",
+                trace_id,
+                (time.perf_counter() - route_started_at) * 1000,
+            )
             if protected.proposed_action and on_proposal:
                 await on_proposal(protected.proposed_action)
             yield protected.message
             return
 
-        # 2. Strategic Mission Escalation
+        # 2. Deterministic low-risk conversational fast path. It never handles
+        # operational, destructive, financial, outreach, or ambiguous commands.
+        fast_response = self._resolve_conversational_fast_path(msg_lower)
+        if fast_response is not None:
+            logger.info(
+                "[DIRECTOR][%s] route=conversational_fast_path route_ms=%.0f",
+                trace_id,
+                (time.perf_counter() - route_started_at) * 1000,
+            )
+            yield fast_response
+            return
+
+        # 3. Strategic Mission Escalation
         if any(term in msg_lower for term in ("research competitors", "build market strategy", "create comprehensive plan")):
+            logger.info(
+                "[DIRECTOR][%s] route=strategic_review route_ms=%.0f",
+                trace_id,
+                (time.perf_counter() - route_started_at) * 1000,
+            )
             yield "I can coordinate that as a strategic mission, Sayibu. I am preparing the mission scope for your review in Owner Control."
             return
 
-        # 3. Live Streaming LLM Reasoning with Monotonic Timing Instrumentation
+        # 4. Live Streaming LLM Reasoning with Monotonic Timing Instrumentation
         state = self.state_service.get_bootstrap_state()
         system_prompt = self._build_system_prompt(state)
         prompt = (
@@ -203,6 +228,11 @@ class DirectorInteractionService:
 
         voice_llm_start = time.perf_counter()
         first_token_time: Optional[float] = None
+        logger.info(
+            "[DIRECTOR][%s] route=conversational_llm route_ms=%.0f",
+            trace_id,
+            (voice_llm_start - route_started_at) * 1000,
+        )
 
         try:
             async for chunk in capability_router.route_skill_execution(
@@ -219,16 +249,55 @@ class DirectorInteractionService:
                         logger.debug(
                             "[DirectorVoiceLLM] TTFT: %.0fms (turn=%s)",
                             (first_token_time - voice_llm_start) * 1000,
-                            conv_id,
+                            trace_id,
                         )
                     yield str(chunk)
 
             total_llm_ms = (time.perf_counter() - voice_llm_start) * 1000
-            logger.debug("[DirectorVoiceLLM] Complete: %.0fms (turn=%s)", total_llm_ms, conv_id)
+            logger.info(
+                "[DIRECTOR][%s] first_token_ms=%.0f director_total_ms=%.0f",
+                trace_id,
+                ((first_token_time - voice_llm_start) * 1000) if first_token_time else 0.0,
+                total_llm_ms,
+            )
 
         except Exception as exc:
             logger.error("[DirectorInteraction] Realtime streaming inference error: %s", exc, exc_info=True)
             yield "My cognitive logic is momentarily delayed, Sayibu, but executive telemetry is operational."
+
+    @staticmethod
+    def _resolve_conversational_fast_path(msg_lower: str) -> Optional[str]:
+        normalized = re.sub(r"[^a-z0-9\s']", "", msg_lower).strip()
+        normalized = re.sub(r"\s+", " ", normalized)
+        greetings = {
+            "hello",
+            "hello director",
+            "hi",
+            "hi director",
+            "good morning",
+            "good morning director",
+            "good afternoon director",
+            "good evening director",
+        }
+        if normalized in greetings:
+            return "Hello, Sayibu. Director is online and ready."
+        identity_questions = {
+            "who are you",
+            "what is your role",
+            "what is your role in napstertec",
+            "tell me your role in napstertec",
+        }
+        if normalized in identity_questions:
+            return (
+                "I am Director Intelligence, NapsterTec's executive AI coordinator. "
+                "I help you interpret company state and coordinate governed work without bypassing Owner controls."
+            )
+        if normalized in {
+            "which department handles sales and revenue",
+            "what department handles sales and revenue",
+        }:
+            return "Sales and Revenue handles sales and revenue work in NapsterTec."
+        return None
 
     def _intercept_protected_command(
         self,

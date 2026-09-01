@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 import os
 import tempfile
+import time
 import uuid
 from pathlib import Path
 from typing import Optional
@@ -11,6 +12,7 @@ from typing import Optional
 from fastapi import UploadFile
 
 from app.schemas.director_speech import DirectorTranscriptionResponse
+from app.services.director_transcript_quality import assess_transcript_quality
 from app.services.whisper_stt_provider import (
     STTProviderError,
     WhisperSTTProvider,
@@ -65,7 +67,13 @@ class DirectorSpeechService:
     def readiness(self) -> dict:
         return self.provider.readiness()
 
-    async def transcribe(self, file: UploadFile) -> DirectorTranscriptionResponse:
+    async def transcribe(
+        self,
+        file: UploadFile,
+        correlation_id: Optional[str] = None,
+    ) -> DirectorTranscriptionResponse:
+        total_started_at = time.monotonic()
+        safe_correlation_id = self._safe_correlation_id(correlation_id)
         content_type = _normalized_content_type(file)
         if content_type not in ALLOWED_AUDIO_TYPES:
             raise STTProviderError("STT_INVALID_AUDIO")
@@ -82,9 +90,18 @@ class DirectorSpeechService:
             )
         except (TypeError, ValueError) as exc:
             raise STTProviderError("STT_NOT_READY") from exc
+        validation_started_at = time.monotonic()
         audio_bytes = await file.read(max_audio_bytes + 1)
+        audio_validation_ms = max(
+            0,
+            int((time.monotonic() - validation_started_at) * 1000),
+        )
         if not audio_bytes or len(audio_bytes) < 100:
-            return self._empty_response(self.provider.config.language)
+            return self._empty_response(
+                self.provider.config.language,
+                safe_correlation_id,
+                audio_validation_ms,
+            )
         if len(audio_bytes) > max_audio_bytes:
             raise STTProviderError("AUDIO_TOO_LARGE")
 
@@ -101,14 +118,48 @@ class DirectorSpeechService:
                 temp_path = Path(temp_file.name)
 
             result = await self.provider.transcribe(temp_path)
-            if not result.text:
-                return self._empty_response(result.language)
+            quality = assess_transcript_quality(
+                result.text,
+                duration_seconds=result.duration_seconds,
+                avg_logprob=result.avg_logprob,
+                no_speech_probability=result.no_speech_probability,
+                language_probability=result.language_probability,
+            )
+            total_ms = max(0, int((time.monotonic() - total_started_at) * 1000))
+            timings = {
+                "audio_validation_ms": audio_validation_ms,
+                "whisper_queue_wait_ms": result.queue_wait_ms,
+                "audio_decode_ms": result.audio_decode_ms,
+                "whisper_inference_ms": result.inference_ms,
+                "transcription_total_ms": total_ms,
+            }
+            logger.info(
+                "[STT][%s] model=%s bytes=%d duration_ms=%d queue_wait_ms=%d "
+                "decode_ms=%d inference_ms=%d total_ms=%d clarification=%s",
+                safe_correlation_id,
+                self.provider.config.model_size,
+                len(audio_bytes),
+                int(result.duration_seconds * 1000),
+                result.queue_wait_ms,
+                result.audio_decode_ms,
+                result.inference_ms,
+                total_ms,
+                quality.clarification_required,
+            )
             return DirectorTranscriptionResponse(
                 request_id=f"req_{uuid.uuid4().hex[:12]}",
+                correlation_id=safe_correlation_id,
                 transcript=result.text,
-                confidence=result.language_probability,
+                confidence=quality.confidence,
                 language=result.language,
+                language_probability=result.language_probability,
                 duration_ms=int(result.duration_seconds * 1000),
+                clarification_required=quality.clarification_required,
+                requires_confirmation=quality.requires_confirmation,
+                quality_reasons=list(quality.reasons),
+                avg_logprob=result.avg_logprob,
+                no_speech_probability=result.no_speech_probability,
+                timings=timings,
             )
         except STTProviderError as exc:
             if (
@@ -131,13 +182,38 @@ class DirectorSpeechService:
                         exc_info=True,
                     )
 
-    def _empty_response(self, language: Optional[str]) -> DirectorTranscriptionResponse:
+    @staticmethod
+    def _safe_correlation_id(value: Optional[str]) -> str:
+        candidate = (value or "").strip()
+        if candidate and len(candidate) <= 64 and all(
+            character.isalnum() or character in {"_", "-"}
+            for character in candidate
+        ):
+            return candidate
+        return f"vsi_{uuid.uuid4().hex[:12]}"
+
+    def _empty_response(
+        self,
+        language: Optional[str],
+        correlation_id: str,
+        audio_validation_ms: int = 0,
+    ) -> DirectorTranscriptionResponse:
         return DirectorTranscriptionResponse(
             request_id=f"req_{uuid.uuid4().hex[:12]}",
+            correlation_id=correlation_id,
             transcript="",
             confidence=0.0,
             language=language or "en",
             duration_ms=0,
+            clarification_required=True,
+            quality_reasons=["EMPTY_TRANSCRIPT"],
+            timings={
+                "audio_validation_ms": audio_validation_ms,
+                "whisper_queue_wait_ms": 0,
+                "audio_decode_ms": 0,
+                "whisper_inference_ms": 0,
+                "transcription_total_ms": audio_validation_ms,
+            },
         )
 
 director_speech_service = DirectorSpeechService()
