@@ -3,6 +3,8 @@ NapsterTec AI - Coding Repository
 Module: app/repositories/coding_repository.py
 """
 import logging
+from typing import Any
+
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, text
 
