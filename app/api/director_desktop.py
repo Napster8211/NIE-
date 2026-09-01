@@ -286,17 +286,14 @@ async def transcribe_voice(
     except ValueError as e:
         code = str(e)
         status_map = {
-            "STT_NOT_CONFIGURED": 503,
             "EMPTY_AUDIO": 422,
             "EMPTY_TRANSCRIPT": 422,
             "AUDIO_TOO_LARGE": 413,
             "STT_INVALID_AUDIO": 422,
-            "STT_UNAUTHORIZED": 502,
-            "STT_PAYMENT_REQUIRED": 402,
-            "STT_RATE_LIMITED": 429,
+            "STT_NOT_READY": 503,
+            "STT_MODEL_LOAD_FAILED": 503,
             "STT_TIMEOUT": 504,
-            "STT_UNAVAILABLE": 503,
-            "TRANSCRIPTION_FAILED": 502,
+            "STT_TRANSCRIPTION_FAILED": 502,
         }
         raise HTTPException(status_code=status_map.get(code, 400), detail=code)
 

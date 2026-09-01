@@ -83,6 +83,9 @@ logs/
 storage/uploads/
 storage/images/
 
+# Build-time model cache. Render creates this inside the deploy artifact.
+.cache/whisper/
+
 # OS junk
 .DS_Store
 Thumbs.db

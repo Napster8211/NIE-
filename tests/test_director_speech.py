@@ -1,7 +1,8 @@
 import os
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch, AsyncMock, Mock
+from unittest.mock import AsyncMock, patch
 
 from fastapi.testclient import TestClient
 
@@ -10,6 +11,8 @@ os.environ.setdefault("NIE_ENV", "test")
 os.environ["NIE_OWNER_KEY"] = TEST_NIE_OWNER_KEY
 
 from app.main import app
+from app.services.director_speech_service import director_speech_service
+from app.services.whisper_stt_provider import STTProviderError, WhisperTranscription
 
 
 class TestDirectorSpeech(unittest.TestCase):
@@ -17,23 +20,23 @@ class TestDirectorSpeech(unittest.TestCase):
         self.client = TestClient(app)
         self.headers = {"Authorization": f"Bearer {TEST_NIE_OWNER_KEY}"}
 
-    @patch.dict(os.environ, {"ELEVENLABS_API_KEY": "fake_key"})
-    @patch("httpx.AsyncClient.post", new_callable=AsyncMock)
-    def test_valid_audio_transcribes(self, mock_post):
-        # httpx.AsyncClient.post is async, but httpx.Response.json() is synchronous.
-        mock_response = Mock()
-        mock_response.status_code = 200
-        mock_response.json.return_value = {
-            "text": "Approve the outreach.",
-            "language_code": "en",
-            "language_probability": 0.99,
-            "words": [
-                {"text": "Approve", "start": 0.0, "end": 0.35},
-                {"text": "the", "start": 0.36, "end": 0.48},
-                {"text": "outreach.", "start": 0.49, "end": 0.95},
-            ],
-        }
-        mock_post.return_value = mock_response
+    @patch.object(director_speech_service.provider, "transcribe", new_callable=AsyncMock)
+    def test_valid_audio_transcribes(self, mock_transcribe):
+        captured_path = None
+
+        async def transcribe(path):
+            nonlocal captured_path
+            captured_path = Path(path)
+            self.assertTrue(captured_path.exists())
+            self.assertEqual(captured_path.suffix, ".webm")
+            return WhisperTranscription(
+                text="Approve the outreach.",
+                language="en",
+                language_probability=0.99,
+                duration_seconds=0.95,
+            )
+
+        mock_transcribe.side_effect = transcribe
 
         res = self.client.post(
             "/api/v1/director/voice/transcribe",
@@ -47,15 +50,12 @@ class TestDirectorSpeech(unittest.TestCase):
         self.assertEqual(body["language"], "en")
         self.assertAlmostEqual(body["confidence"], 0.99)
         self.assertEqual(body["duration_ms"], 950)
-        self.assertNotIn("fake_key", res.text)
+        mock_transcribe.assert_awaited_once()
+        self.assertIsNotNone(captured_path)
+        self.assertFalse(captured_path.exists())
 
-        _, kwargs = mock_post.call_args
-        self.assertEqual(kwargs["data"]["model_id"], "scribe_v2")
-        self.assertEqual(kwargs["data"]["language_code"], "en")
-        self.assertIn("file", kwargs["files"])
-
-    @patch.dict(os.environ, {"ELEVENLABS_API_KEY": "fake_key"})
-    def test_empty_audio_returns_existing_safe_empty_transcript(self):
+    @patch.object(director_speech_service.provider, "transcribe", new_callable=AsyncMock)
+    def test_empty_audio_returns_existing_safe_empty_transcript(self, mock_transcribe):
         res = self.client.post(
             "/api/v1/director/voice/transcribe",
             files={"file": ("test.webm", b"", "audio/webm")},
@@ -65,6 +65,85 @@ class TestDirectorSpeech(unittest.TestCase):
         self.assertEqual(res.status_code, 200)
         self.assertEqual(res.json()["transcript"], "")
         self.assertEqual(res.json()["confidence"], 0.0)
+        mock_transcribe.assert_not_awaited()
+
+    def test_unsupported_audio_type_is_rejected(self):
+        res = self.client.post(
+            "/api/v1/director/voice/transcribe",
+            files={"file": ("test.txt", b"not_audio" * 20, "text/plain")},
+            headers=self.headers,
+        )
+        self.assertEqual(res.status_code, 422)
+        self.assertEqual(res.json()["detail"], "STT_INVALID_AUDIO")
+
+    @patch.object(director_speech_service.provider, "transcribe", new_callable=AsyncMock)
+    def test_supported_browser_audio_types_preserve_container_suffix(self, mock_transcribe):
+        seen_suffixes = []
+
+        async def transcribe(path):
+            seen_suffixes.append(Path(path).suffix)
+            return WhisperTranscription("hello", "en", 0.9, 0.5)
+
+        mock_transcribe.side_effect = transcribe
+        cases = (
+            ("voice.webm", "audio/webm;codecs=opus", ".webm"),
+            ("voice.webm", "audio/webm", ".webm"),
+            ("voice.mp4", "audio/mp4", ".mp4"),
+            ("voice.ogg", "audio/ogg;codecs=opus", ".ogg"),
+            ("voice.ogg", "audio/ogg", ".ogg"),
+        )
+        for filename, mime_type, suffix in cases:
+            with self.subTest(mime_type=mime_type):
+                res = self.client.post(
+                    "/api/v1/director/voice/transcribe",
+                    files={"file": (filename, b"fake_audio_content" * 10, mime_type)},
+                    headers=self.headers,
+                )
+                self.assertEqual(res.status_code, 200)
+                self.assertEqual(seen_suffixes[-1], suffix)
+        self.assertEqual(mock_transcribe.await_count, len(cases))
+
+    def test_provider_neutral_error_mapping(self):
+        expected = {
+            "STT_NOT_READY": 503,
+            "STT_MODEL_LOAD_FAILED": 503,
+            "STT_INVALID_AUDIO": 422,
+            "STT_TIMEOUT": 504,
+            "STT_TRANSCRIPTION_FAILED": 502,
+        }
+        for code, status in expected.items():
+            with self.subTest(code=code), patch.object(
+                director_speech_service.provider,
+                "transcribe",
+                new=AsyncMock(side_effect=STTProviderError(code)),
+            ):
+                res = self.client.post(
+                    "/api/v1/director/voice/transcribe",
+                    files={
+                        "file": ("test.webm", b"fake_audio_content" * 10, "audio/webm")
+                    },
+                    headers=self.headers,
+                )
+                self.assertEqual(res.status_code, status)
+                self.assertEqual(res.json()["detail"], code)
+
+    def test_health_exposes_provider_neutral_stt_readiness(self):
+        res = self.client.get("/health")
+        self.assertEqual(res.status_code, 200)
+        readiness = res.json()["director_stt"]
+        self.assertEqual(readiness["provider"], "whisper")
+        self.assertIn("loaded", readiness)
+        self.assertIn("state", readiness)
+        self.assertIn("load_duration_ms", readiness)
+        self.assertIn("error", readiness)
+
+    def test_director_stt_source_no_longer_calls_elevenlabs(self):
+        service_source = (
+            Path(__file__).parents[1] / "app" / "services" / "director_speech_service.py"
+        ).read_text(encoding="utf-8")
+        self.assertNotIn("api.elevenlabs.io/v1/speech-to-text", service_source)
+        self.assertNotIn("ELEVENLABS_STT_MODEL_ID", service_source)
+        self.assertNotIn("ELEVENLABS_STT_LANGUAGE", service_source)
 
     @patch(
         "app.services.director_interaction_service."

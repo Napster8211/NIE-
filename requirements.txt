@@ -18,6 +18,11 @@ google-genai>=1.0.0
 google-auth>=2.0.0
 python-multipart>=0.0.9
 openai>=1.0.0
+# Self-hosted Director STT. Pin the native runtime stack for repeatable Render builds.
+faster-whisper==1.2.1
+ctranslate2==4.8.2
+onnxruntime==1.29.0
+av==18.1.0
 
 # Optional document and rich URL extraction paths shipped in app/
 PyPDF2>=3.0.0

@@ -32,6 +32,7 @@ from app.api.routers.system import system_router
 from app.api.director_desktop import router as director_desktop_router
 from app.api.director_auth import router as director_auth_router
 from app.services.director_auth_service import trusted_frontend_origins
+from app.services.director_speech_service import director_speech_service
 
 # --- SPRINT 25.5: AUTONOMOUS MISSION WORKER IMPORT ---
 from app.engine.autonomous_worker import autonomous_worker
@@ -41,6 +42,10 @@ async def lifespan(app: FastAPI):
     # Startup Phase: Connect to PostgreSQL and provision missing tables.
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+
+    # Warm the self-hosted STT model once per application process. Loading is
+    # asynchronous; readiness stays false and transcription fails closed until ready.
+    director_speech_service.startup()
     
     # Launch the Autonomous Mission Worker background polling loop (Sprint 25.5)
     logger.info("[Main] Launching Autonomous Mission Worker background loop...")
@@ -51,6 +56,7 @@ async def lifespan(app: FastAPI):
     # Shutdown Phase: Stop worker loop and clean up DB connections.
     logger.info("[Main] Shutting down Autonomous Mission Worker...")
     await autonomous_worker.stop_worker_loop()
+    await director_speech_service.shutdown()
     await engine.dispose()
 
 # Initialize FastAPI with the lifespan context manager
@@ -87,7 +93,8 @@ async def health_check():
         "status": "online",
         "architecture": "capability_centric",
         "engine": "NIE v25.5",
-        "database_status": "connected"
+        "database_status": "connected",
+        "director_stt": director_speech_service.readiness(),
     }
 
 if __name__ == "__main__":
