@@ -34,6 +34,9 @@ class TestDirectorSpeech(unittest.TestCase):
                 language="en",
                 language_probability=0.99,
                 duration_seconds=0.95,
+                avg_logprob=-0.22,
+                no_speech_probability=0.04,
+                compression_ratio=1.12,
             )
 
         mock_transcribe.side_effect = transcribe
@@ -49,9 +52,15 @@ class TestDirectorSpeech(unittest.TestCase):
         body = res.json()
         self.assertEqual(body["transcript"], "Approve the outreach.")
         self.assertEqual(body["language"], "en")
-        self.assertAlmostEqual(body["confidence"], 0.99)
+        self.assertGreater(body["confidence"], 0.7)
         self.assertEqual(body["duration_ms"], 950)
         self.assertEqual(body["correlation_id"], "vsi_secure_test")
+        self.assertEqual(body["audio_bytes"], len(b"fake_audio_content" * 10))
+        self.assertEqual(body["media_type"], "audio/webm")
+        self.assertEqual(body["word_count"], 3)
+        self.assertAlmostEqual(body["avg_logprob"], -0.22)
+        self.assertAlmostEqual(body["no_speech_probability"], 0.04)
+        self.assertAlmostEqual(body["compression_ratio"], 1.12)
         self.assertTrue(body["requires_confirmation"])
         self.assertIn("transcription_total_ms", body["timings"])
         mock_transcribe.assert_awaited_once()

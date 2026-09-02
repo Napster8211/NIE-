@@ -1,4 +1,5 @@
 import base64
+import asyncio
 import os
 import unittest
 from unittest.mock import AsyncMock, patch
@@ -14,6 +15,7 @@ from app.main import app
 from app.services.director_interaction_service import director_interaction_service
 from app.services.director_realtime_voice_service import (
     DirectorVoiceSession,
+    QueuedSpeechChunk,
     director_realtime_voice_service,
 )
 from app.services.director_voice_service import (
@@ -150,6 +152,76 @@ class TestDirectorVoice(unittest.TestCase):
 
 
 class TestDirectorRealtimeVoice(unittest.IsolatedAsyncioTestCase):
+    async def test_tts_worker_preserves_chunk_order_without_playback_ack(self):
+        websocket = _WebSocketRecorder()
+        session = DirectorVoiceSession("session", "owner", websocket)
+        session.status = "PROCESSING"
+        session.current_turn_id = "turn-buffer"
+        queue = asyncio.Queue(maxsize=5)
+        now = asyncio.get_running_loop().time()
+        await queue.put(QueuedSpeechChunk("First.", 0, now, 1000))
+        await queue.put(QueuedSpeechChunk("Second.", 1, now, 1001))
+        await queue.put(None)
+
+        with patch.object(
+            director_voice_service,
+            "synthesize_text",
+            new=AsyncMock(side_effect=[
+                DirectorAudioResult(b"RIFF-first"),
+                DirectorAudioResult(b"RIFF-second"),
+            ]),
+        ) as synthesize:
+            emitted = await director_realtime_voice_service._tts_consumer_worker(
+                session,
+                "turn-buffer",
+                queue,
+            )
+
+        self.assertEqual(emitted, [0, 1])
+        self.assertEqual(synthesize.await_count, 2)
+        self.assertEqual(
+            [message["chunk_index"] for message in websocket.messages],
+            [0, 1],
+        )
+
+    async def test_streaming_turn_emits_explicit_audio_completion(self):
+        websocket = _WebSocketRecorder()
+        session = DirectorVoiceSession("session", "owner", websocket)
+        session.status = "PROCESSING"
+        session.current_turn_id = "turn-complete"
+
+        async def stream_tokens(**_kwargs):
+            yield "First complete sentence. Second complete sentence."
+
+        with patch.object(
+            director_voice_service,
+            "synthesize_text",
+            new=AsyncMock(return_value=DirectorAudioResult(b"RIFF-buffered")),
+        ), patch.object(
+            director_interaction_service,
+            "stream_interaction",
+            new=stream_tokens,
+        ):
+            await director_realtime_voice_service._execute_streaming_turn(
+                session,
+                "turn-complete",
+                "Status please",
+            )
+
+        audio_chunks = [
+            message for message in websocket.messages
+            if message["type"] == "audio.output.chunk"
+        ]
+        complete = next(
+            message for message in websocket.messages
+            if message["type"] == "audio.output.complete"
+        )
+        self.assertEqual(
+            complete["chunk_indexes"],
+            [message["chunk_index"] for message in audio_chunks],
+        )
+        self.assertEqual(complete["chunk_count"], len(audio_chunks))
+
     async def test_realtime_emits_wav_with_gateway_sample_rate(self):
         websocket = _WebSocketRecorder()
         session = DirectorVoiceSession("session", "owner", websocket)

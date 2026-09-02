@@ -6,6 +6,7 @@ import os
 import tempfile
 import time
 import uuid
+import re
 from pathlib import Path
 from typing import Optional
 
@@ -126,6 +127,7 @@ class DirectorSpeechService:
                 language_probability=result.language_probability,
             )
             total_ms = max(0, int((time.monotonic() - total_started_at) * 1000))
+            word_count = len(re.findall(r"[a-z0-9']+", result.text.casefold()))
             timings = {
                 "audio_validation_ms": audio_validation_ms,
                 "whisper_queue_wait_ms": result.queue_wait_ms,
@@ -134,17 +136,27 @@ class DirectorSpeechService:
                 "transcription_total_ms": total_ms,
             }
             logger.info(
-                "[STT][%s] model=%s bytes=%d duration_ms=%d queue_wait_ms=%d "
-                "decode_ms=%d inference_ms=%d total_ms=%d clarification=%s",
+                "[STT][%s] model=%s beam_size=%d media_type=%s bytes=%d "
+                "duration_ms=%d queue_wait_ms=%d decode_ms=%d inference_ms=%d "
+                "total_ms=%d transcript_length=%d word_count=%d avg_logprob=%s "
+                "no_speech_prob=%s compression_ratio=%s gate_decision=%s gate_reasons=%s",
                 safe_correlation_id,
                 self.provider.config.model_size,
+                self.provider.config.beam_size,
+                content_type,
                 len(audio_bytes),
                 int(result.duration_seconds * 1000),
                 result.queue_wait_ms,
                 result.audio_decode_ms,
                 result.inference_ms,
                 total_ms,
-                quality.clarification_required,
+                len(result.text),
+                word_count,
+                result.avg_logprob,
+                result.no_speech_probability,
+                result.compression_ratio,
+                "CLARIFICATION_REQUIRED" if quality.clarification_required else "ACCEPTED",
+                ",".join(quality.reasons) or "NONE",
             )
             return DirectorTranscriptionResponse(
                 request_id=f"req_{uuid.uuid4().hex[:12]}",
@@ -159,6 +171,10 @@ class DirectorSpeechService:
                 quality_reasons=list(quality.reasons),
                 avg_logprob=result.avg_logprob,
                 no_speech_probability=result.no_speech_probability,
+                compression_ratio=result.compression_ratio,
+                audio_bytes=len(audio_bytes),
+                media_type=content_type,
+                word_count=word_count,
                 timings=timings,
             )
         except STTProviderError as exc:
@@ -207,6 +223,8 @@ class DirectorSpeechService:
             duration_ms=0,
             clarification_required=True,
             quality_reasons=["EMPTY_TRANSCRIPT"],
+            audio_bytes=0,
+            word_count=0,
             timings={
                 "audio_validation_ms": audio_validation_ms,
                 "whisper_queue_wait_ms": 0,

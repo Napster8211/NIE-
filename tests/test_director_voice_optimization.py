@@ -3,10 +3,30 @@ import unittest
 from unittest.mock import AsyncMock, patch
 
 from app.services.director_interaction_service import DirectorInteractionService
-from app.services.director_transcript_quality import assess_transcript_quality
+from app.services.director_transcript_quality import (
+    MIN_AVERAGE_LOGPROB,
+    assess_transcript_quality,
+)
 
 
 class TestDirectorTranscriptQuality(unittest.TestCase):
+    def test_average_logprob_threshold_is_explicit_and_fail_closed(self):
+        self.assertEqual(MIN_AVERAGE_LOGPROB, -1.0)
+        accepted = assess_transcript_quality(
+            "Hello Director",
+            duration_seconds=1.0,
+            avg_logprob=-1.0,
+            no_speech_probability=0.01,
+        )
+        rejected = assess_transcript_quality(
+            "Hello Director",
+            duration_seconds=1.0,
+            avg_logprob=-1.01,
+            no_speech_probability=0.01,
+        )
+        self.assertNotIn("LOW_AVERAGE_LOGPROB", accepted.reasons)
+        self.assertIn("LOW_AVERAGE_LOGPROB", rejected.reasons)
+
     def test_high_confidence_transcript_passes(self):
         result = assess_transcript_quality(
             "What is your role in NapsterTec?",

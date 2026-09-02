@@ -23,4 +23,8 @@ class DirectorTranscriptionResponse(BaseModel):
     quality_reasons: List[str] = Field(default_factory=list)
     avg_logprob: Optional[float] = None
     no_speech_probability: Optional[float] = None
+    compression_ratio: Optional[float] = None
+    audio_bytes: int = Field(default=0, ge=0)
+    media_type: Optional[str] = None
+    word_count: int = Field(default=0, ge=0)
     timings: dict = Field(default_factory=dict)

@@ -4,10 +4,13 @@ Module: app/services/director_realtime_voice_service.py
 """
 import asyncio
 import base64
+import io
 import json
 import logging
 import time
 import uuid
+import wave
+from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
 from fastapi import WebSocket, WebSocketDisconnect
@@ -19,6 +22,14 @@ from app.services.director_interaction_service import (
 from app.services.director_voice_service import director_voice_service
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class QueuedSpeechChunk:
+    text: str
+    index: int
+    created_at_monotonic: float
+    created_at_epoch_ms: int
 
 
 class DirectorVoiceLatencyTrace:
@@ -210,7 +221,7 @@ class DirectorRealtimeVoiceService:
             trace.mark_llm_start()
 
         # Bounded asynchronous queue to decouple LLM token streaming from TTS synthesis
-        tts_queue: asyncio.Queue[Optional[str]] = asyncio.Queue(maxsize=5)
+        tts_queue: asyncio.Queue[Optional[QueuedSpeechChunk]] = asyncio.Queue(maxsize=5)
         session.tts_queue = tts_queue
 
         tts_worker_task = asyncio.create_task(
@@ -224,6 +235,18 @@ class DirectorRealtimeVoiceService:
             max_chars=110,
         )
         full_text = []
+        next_chunk_index = 0
+
+        async def enqueue_speech_chunk(text: str) -> None:
+            nonlocal next_chunk_index
+            chunk = QueuedSpeechChunk(
+                text=text,
+                index=next_chunk_index,
+                created_at_monotonic=time.perf_counter(),
+                created_at_epoch_ms=int(time.time() * 1000),
+            )
+            next_chunk_index += 1
+            await tts_queue.put(chunk)
 
         async def send_proposal(proposal):
             try:
@@ -262,23 +285,31 @@ class DirectorRealtimeVoiceService:
                 for chunk in chunks:
                     if trace:
                         trace.mark_first_tts_enqueued()
-                    await tts_queue.put(chunk)
+                    await enqueue_speech_chunk(chunk)
 
             # Flush accumulator tail
             rem_chunk = accumulator.flush()
             if rem_chunk and session.status != "INTERRUPTED" and session.current_turn_id == turn_id:
                 if trace:
                     trace.mark_first_tts_enqueued()
-                await tts_queue.put(rem_chunk)
+                await enqueue_speech_chunk(rem_chunk)
 
             if trace:
                 trace.mark_llm_complete()
 
             # Sentinel to notify TTS consumer that LLM output is complete
             await tts_queue.put(None)
-            await tts_worker_task
+            emitted_chunk_indexes = await tts_worker_task
 
             if session.status != "INTERRUPTED" and session.current_turn_id == turn_id:
+                await session.websocket.send_json({
+                    "type": "audio.output.complete",
+                    "session_id": session.session_id,
+                    "turn_id": turn_id,
+                    "correlation_id": trace.correlation_id if trace else turn_id,
+                    "chunk_count": len(emitted_chunk_indexes),
+                    "chunk_indexes": emitted_chunk_indexes,
+                })
                 await session.websocket.send_json({
                     "type": "director.text.final",
                     "session_id": session.session_id,
@@ -303,13 +334,14 @@ class DirectorRealtimeVoiceService:
         self,
         session: DirectorVoiceSession,
         turn_id: str,
-        queue: asyncio.Queue[Optional[str]],
+        queue: asyncio.Queue[Optional[QueuedSpeechChunk]],
     ):
         """Sequential TTS worker consuming speech chunks in guaranteed order."""
+        emitted_chunk_indexes = []
         try:
             while True:
-                chunk_text = await queue.get()
-                if chunk_text is None:
+                chunk = await queue.get()
+                if chunk is None:
                     queue.task_done()
                     break
 
@@ -317,30 +349,46 @@ class DirectorRealtimeVoiceService:
                     queue.task_done()
                     break
 
-                await self._stream_synthesize_chunk(session, turn_id, chunk_text)
+                emitted = await self._stream_synthesize_chunk(
+                    session,
+                    turn_id,
+                    chunk.text,
+                    chunk_index=chunk.index,
+                    chunk_created_at_monotonic=chunk.created_at_monotonic,
+                    chunk_created_at_epoch_ms=chunk.created_at_epoch_ms,
+                )
+                if emitted:
+                    emitted_chunk_indexes.append(chunk.index)
                 queue.task_done()
 
             if session.current_trace:
                 session.current_trace.mark_tts_complete()
 
         except asyncio.CancelledError:
-            pass
+            return emitted_chunk_indexes
+        return emitted_chunk_indexes
 
     async def _stream_synthesize_chunk(
         self,
         session: DirectorVoiceSession,
         turn_id: str,
         text: str,
-    ):
+        *,
+        chunk_index: int = 0,
+        chunk_created_at_monotonic: Optional[float] = None,
+        chunk_created_at_epoch_ms: Optional[int] = None,
+    ) -> bool:
         """Synthesize one speech chunk as WAV through the internal Piper gateway."""
         if not text.strip():
-            return
+            return False
 
         trace = session.current_trace
         if trace:
             trace.mark_tts_request_start()
 
         piper_started_at = time.perf_counter()
+        piper_started_at_epoch_ms = int(time.time() * 1000)
+        created_at = chunk_created_at_monotonic or piper_started_at
         try:
             audio = await director_voice_service.synthesize_text(text)
         except ValueError as exc:
@@ -348,22 +396,32 @@ class DirectorRealtimeVoiceService:
                 "[DirectorRealtimeVoice] Voice gateway synthesis skipped code=%s",
                 str(exc),
             )
-            return
+            return False
         except Exception:
             logger.warning("[DirectorRealtimeVoice] Voice gateway synthesis failed")
-            return
+            return False
 
         # A completed request from an interrupted or superseded turn is discarded.
         if session.status == "INTERRUPTED" or session.current_turn_id != turn_id:
-            return
+            return False
         if not audio.audio_bytes:
-            return
+            return False
+
+        piper_response_at = time.perf_counter()
+        piper_response_at_epoch_ms = int(time.time() * 1000)
+        piper_request_ms = max(0, int((piper_response_at - piper_started_at) * 1000))
+        audio_duration_ms = self._wav_duration_ms(audio.audio_bytes)
 
         logger.info(
-            "[TTS][%s] piper_request_ms=%.0f audio_bytes=%d",
+            "[TTS][%s] chunk_index=%d character_count=%d chunk_queue_wait_ms=%d "
+            "piper_request_ms=%d wav_bytes=%d audio_duration_ms=%d",
             trace.correlation_id if trace else turn_id,
-            (time.perf_counter() - piper_started_at) * 1000,
+            chunk_index,
+            len(text),
+            max(0, int((piper_started_at - created_at) * 1000)),
+            piper_request_ms,
             len(audio.audio_bytes),
+            audio_duration_ms,
         )
 
         if trace:
@@ -376,12 +434,32 @@ class DirectorRealtimeVoiceService:
             "type": "audio.output.chunk",
             "session_id": session.session_id,
             "turn_id": turn_id,
+            "correlation_id": trace.correlation_id if trace else turn_id,
+            "chunk_index": chunk_index,
+            "character_count": len(text),
+            "chunk_created_at_epoch_ms": chunk_created_at_epoch_ms,
+            "piper_request_started_at_epoch_ms": piper_started_at_epoch_ms,
+            "piper_response_received_at_epoch_ms": piper_response_at_epoch_ms,
+            "piper_request_ms": piper_request_ms,
+            "audio_duration_ms": audio_duration_ms,
             "audio_base64": b64_audio,
             "audio_format": audio.audio_format,
             "sample_rate": audio.sample_rate,
             "channels": audio.channels,
             "text": text,
         })
+        return True
+
+    @staticmethod
+    def _wav_duration_ms(audio_bytes: bytes) -> int:
+        try:
+            with wave.open(io.BytesIO(audio_bytes), "rb") as wav_file:
+                frame_rate = wav_file.getframerate()
+                if frame_rate <= 0:
+                    return 0
+                return max(0, int((wav_file.getnframes() / frame_rate) * 1000))
+        except (EOFError, wave.Error):
+            return 0
 
     @staticmethod
     def _safe_correlation_id(value: Any) -> Optional[str]:

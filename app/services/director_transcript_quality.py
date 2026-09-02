@@ -14,6 +14,11 @@ HIGH_IMPACT_PATTERNS = (
     r"\b(?:permission|credential|password|api key|security)\b",
 )
 
+# Conservative initial gate. This value is intentionally named and observable;
+# changing it requires recorded-audio evidence rather than UI-driven tuning.
+MIN_AVERAGE_LOGPROB = -1.0
+MAX_NO_SPEECH_PROBABILITY = 0.65
+
 
 @dataclass(frozen=True)
 class TranscriptQualityAssessment:
@@ -45,9 +50,12 @@ def assess_transcript_quality(
 
     if not normalized:
         reasons.append("EMPTY_TRANSCRIPT")
-    if avg_logprob is not None and avg_logprob < -1.0:
+    if avg_logprob is not None and avg_logprob < MIN_AVERAGE_LOGPROB:
         reasons.append("LOW_AVERAGE_LOGPROB")
-    if no_speech_probability is not None and no_speech_probability > 0.65:
+    if (
+        no_speech_probability is not None
+        and no_speech_probability > MAX_NO_SPEECH_PROBABILITY
+    ):
         reasons.append("HIGH_NO_SPEECH_PROBABILITY")
     if duration_seconds >= 1.5 and len(tokens) < 2:
         reasons.append("IMPLAUSIBLY_SHORT_TRANSCRIPT")
