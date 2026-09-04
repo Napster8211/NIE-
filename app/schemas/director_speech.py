@@ -27,4 +27,8 @@ class DirectorTranscriptionResponse(BaseModel):
     audio_bytes: int = Field(default=0, ge=0)
     media_type: Optional[str] = None
     word_count: int = Field(default=0, ge=0)
+    whisper_model: Optional[str] = None
+    beam_size: Optional[int] = Field(default=None, ge=1)
     timings: dict = Field(default_factory=dict)
+    diagnostics_enabled: bool = False
+    audio_quality: Optional[dict] = None

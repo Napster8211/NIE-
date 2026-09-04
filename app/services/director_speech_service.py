@@ -13,6 +13,10 @@ from typing import Optional
 from fastapi import UploadFile
 
 from app.schemas.director_speech import DirectorTranscriptionResponse
+from app.services.director_audio_diagnostics import (
+    analyze_audio_file,
+    director_voice_diagnostics_enabled,
+)
 from app.services.director_transcript_quality import assess_transcript_quality
 from app.services.whisper_stt_provider import (
     STTProviderError,
@@ -66,7 +70,10 @@ class DirectorSpeechService:
         await self.provider.shutdown()
 
     def readiness(self) -> dict:
-        return self.provider.readiness()
+        return {
+            **self.provider.readiness(),
+            "voice_diagnostics_enabled": director_voice_diagnostics_enabled(),
+        }
 
     async def transcribe(
         self,
@@ -107,6 +114,8 @@ class DirectorSpeechService:
             raise STTProviderError("AUDIO_TOO_LARGE")
 
         temp_path: Optional[Path] = None
+        audio_quality: Optional[dict] = None
+        diagnostics_enabled = director_voice_diagnostics_enabled()
         try:
             with tempfile.NamedTemporaryFile(
                 mode="wb",
@@ -117,6 +126,36 @@ class DirectorSpeechService:
                 temp_file.write(audio_bytes)
                 temp_file.flush()
                 temp_path = Path(temp_file.name)
+
+            if diagnostics_enabled:
+                try:
+                    audio_quality = analyze_audio_file(temp_path).to_safe_dict()
+                    logger.info(
+                        "[STT][%s] audio_diagnostics decoded_duration_ms=%d "
+                        "sample_rate=%d channels=%d peak=%s rms=%s "
+                        "leading_silence_ms=%d trailing_silence_ms=%d "
+                        "clipping_ratio=%s analysis_ms=%d",
+                        safe_correlation_id,
+                        audio_quality["decoded_duration_ms"],
+                        audio_quality["sample_rate"],
+                        audio_quality["channels"],
+                        audio_quality["peak_amplitude"],
+                        audio_quality["rms_amplitude"],
+                        audio_quality["leading_silence_ms"],
+                        audio_quality["trailing_silence_ms"],
+                        audio_quality["clipping_ratio"],
+                        audio_quality["analysis_ms"],
+                    )
+                except (OSError, ValueError):
+                    # Diagnostic analysis must never alter the transcription contract.
+                    audio_quality = {
+                        "available": False,
+                        "error": "AUDIO_DIAGNOSTIC_UNAVAILABLE",
+                    }
+                    logger.warning(
+                        "[STT][%s] audio_diagnostics unavailable",
+                        safe_correlation_id,
+                    )
 
             result = await self.provider.transcribe(temp_path)
             quality = assess_transcript_quality(
@@ -175,7 +214,11 @@ class DirectorSpeechService:
                 audio_bytes=len(audio_bytes),
                 media_type=content_type,
                 word_count=word_count,
+                whisper_model=self.provider.config.model_size,
+                beam_size=self.provider.config.beam_size,
                 timings=timings,
+                diagnostics_enabled=diagnostics_enabled,
+                audio_quality=audio_quality,
             )
         except STTProviderError as exc:
             if (
@@ -232,6 +275,7 @@ class DirectorSpeechService:
                 "whisper_inference_ms": 0,
                 "transcription_total_ms": audio_validation_ms,
             },
+            diagnostics_enabled=director_voice_diagnostics_enabled(),
         )
 
 director_speech_service = DirectorSpeechService()

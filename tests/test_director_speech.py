@@ -67,6 +67,49 @@ class TestDirectorSpeech(unittest.TestCase):
         self.assertIsNotNone(captured_path)
         self.assertFalse(captured_path.exists())
 
+    @patch("app.services.director_speech_service.director_voice_diagnostics_enabled", return_value=True)
+    @patch("app.services.director_speech_service.analyze_audio_file")
+    @patch.object(director_speech_service.provider, "transcribe", new_callable=AsyncMock)
+    def test_opt_in_diagnostics_return_numeric_metrics_without_retaining_audio(
+        self,
+        mock_transcribe,
+        mock_analyze,
+        _mock_enabled,
+    ):
+        captured_path = None
+
+        async def transcribe(path):
+            nonlocal captured_path
+            captured_path = Path(path)
+            return WhisperTranscription("Hello Director", "en", 0.99, 1.0, avg_logprob=-0.2)
+
+        mock_transcribe.side_effect = transcribe
+        mock_analyze.return_value.to_safe_dict.return_value = {
+            "available": True,
+            "decoded_duration_ms": 1_000,
+            "sample_rate": 16_000,
+            "channels": 1,
+            "peak_amplitude": 0.5,
+            "rms_amplitude": 0.1,
+            "leading_silence_ms": 40,
+            "trailing_silence_ms": 100,
+            "clipping_ratio": 0.0,
+            "analysis_ms": 2,
+        }
+        res = self.client.post(
+            "/api/v1/director/voice/transcribe",
+            files={"file": ("test.webm", b"fake_audio_content" * 10, "audio/webm")},
+            data={"correlation_id": "vsi_diagnostics"},
+            headers=self.headers,
+        )
+        self.assertEqual(res.status_code, 200)
+        body = res.json()
+        self.assertTrue(body["diagnostics_enabled"])
+        self.assertEqual(body["audio_quality"]["sample_rate"], 16_000)
+        self.assertNotIn("audio", body["audio_quality"])
+        self.assertIsNotNone(captured_path)
+        self.assertFalse(captured_path.exists())
+
     @patch.object(director_speech_service.provider, "transcribe", new_callable=AsyncMock)
     def test_empty_audio_returns_existing_safe_empty_transcript(self, mock_transcribe):
         res = self.client.post(
