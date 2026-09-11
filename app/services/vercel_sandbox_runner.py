@@ -48,6 +48,8 @@ class VercelSandboxSettings:
     synchronization_timeout_seconds: int
     cleanup_timeout_seconds: int
     max_concurrent_executions: int
+    sandbox_vcpus: int
+    sandbox_memory_mb: int
     network_policy: str
     network_allowlist: tuple[str, ...]
 
@@ -80,6 +82,10 @@ class VercelSandboxSettings:
         if snapshot_id and not re.fullmatch(r"[A-Za-z0-9._:@/-]{1,240}", snapshot_id):
             raise ToolExecutionError("VERCEL_SANDBOX_SNAPSHOT_ID_INVALID")
         cls._bounded_int("NIE_ENGINEERING_MAX_OUTPUT_BYTES", 100_000, 1_000, 1_000_000)
+        sandbox_vcpus = cls._bounded_int("NIE_ENGINEERING_SANDBOX_VCPUS", 1, 1, 32)
+        sandbox_memory_mb = cls._bounded_int("NIE_ENGINEERING_SANDBOX_MEMORY_MB", 2_048, 2_048, 65_536)
+        if sandbox_memory_mb != sandbox_vcpus * 2_048:
+            raise ToolExecutionError("VERCEL_SANDBOX_RESOURCE_RATIO_INVALID")
         return cls(
             token=required["VERCEL_TOKEN"],
             team_id=required["VERCEL_TEAM_ID"],
@@ -92,6 +98,8 @@ class VercelSandboxSettings:
             ),
             cleanup_timeout_seconds=cls._bounded_int("NIE_ENGINEERING_CLEANUP_TIMEOUT_SECONDS", 15, 3, 60),
             max_concurrent_executions=cls._bounded_int("NIE_ENGINEERING_MAX_CONCURRENT_EXECUTIONS", 1, 1, 10),
+            sandbox_vcpus=sandbox_vcpus,
+            sandbox_memory_mb=sandbox_memory_mb,
             network_policy=policy,
             network_allowlist=hosts,
         )
@@ -131,6 +139,8 @@ class SandboxCreateRequest:
     max_file_bytes: int
     max_workspace_bytes: int
     max_file_count: int
+    vcpus: int = 1
+    memory_mb: int = 2_048
 
 
 @dataclass(frozen=True)
@@ -256,6 +266,7 @@ class VercelPythonSandboxClient:
         from vercel.sandbox import (
             NetworkPolicy,
             SandboxCredentials,
+            SandboxResources,
             SandboxServiceOptions,
             SnapshotSource,
         )
@@ -277,6 +288,7 @@ class VercelPythonSandboxClient:
             "project_id": self.settings.project_id,
             "persistent": False,
             "execution_time_limit": timedelta(seconds=request.execution_time_limit_seconds),
+            "resources": SandboxResources(vcpus=request.vcpus, memory=request.memory_mb),
             "network_policy": (
                 NetworkPolicy.custom(allow={host: () for host in request.network_allowed_hosts})
                 if request.network_allowed_hosts
@@ -377,6 +389,8 @@ class VercelSandboxRunner(CommandRunner):
             max_file_bytes=self.storage.max_file_bytes,
             max_workspace_bytes=self.storage.max_workspace_bytes,
             max_file_count=self.storage.max_file_count,
+            vcpus=self.settings.sandbox_vcpus,
+            memory_mb=self.settings.sandbox_memory_mb,
         )
         session: SandboxSession | None = None
         stage = "create"
@@ -508,4 +522,6 @@ def vercel_sandbox_readiness() -> dict[str, object]:
         "network_policy": settings.network_policy,
         "sandbox_timeout_seconds": settings.sandbox_timeout_seconds,
         "max_concurrent_executions": settings.max_concurrent_executions,
+        "vcpus": settings.sandbox_vcpus,
+        "memory_mb": settings.sandbox_memory_mb,
     }

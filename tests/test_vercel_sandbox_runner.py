@@ -36,6 +36,8 @@ def settings(**overrides):
         "synchronization_timeout_seconds": 5,
         "cleanup_timeout_seconds": 3,
         "max_concurrent_executions": 1,
+        "sandbox_vcpus": 1,
+        "sandbox_memory_mb": 2048,
         "network_policy": "deny_all",
         "network_allowlist": (),
     }
@@ -205,6 +207,8 @@ class VercelSandboxRunnerTests(unittest.IsolatedAsyncioTestCase):
         request = client.requests[0]
         self.assertEqual((), request.network_allowed_hosts)
         self.assertEqual(1024, request.max_file_bytes)
+        self.assertEqual(1, request.vcpus)
+        self.assertEqual(2048, request.memory_mb)
         self.assertTrue(session.closed)
         self.assertNotIn(session.identifier, str(result.data))
         self.assertRegex(result.data["sandbox_reference"], r"^[0-9a-f]{20}$")
@@ -234,6 +238,30 @@ class VercelSandboxRunnerTests(unittest.IsolatedAsyncioTestCase):
         runner, client = self.runner(configured=allowed)
         await self.run_command(runner, network=True, approved=True)
         self.assertEqual(("pypi.org", "files.pythonhosted.org"), client.requests[0].network_allowed_hosts)
+
+    async def test_resource_settings_are_bounded(self):
+        environment = {
+            "VERCEL_TOKEN": "test-token",
+            "VERCEL_TEAM_ID": "team-test",
+            "VERCEL_PROJECT_ID": "project-test",
+            "NIE_ENGINEERING_SANDBOX_VCPUS": "1",
+            "NIE_ENGINEERING_SANDBOX_MEMORY_MB": "2048",
+        }
+        with patch.dict(os.environ, environment, clear=False):
+            configured = VercelSandboxSettings.from_environment()
+        self.assertEqual(1, configured.sandbox_vcpus)
+        self.assertEqual(2048, configured.sandbox_memory_mb)
+
+        environment["NIE_ENGINEERING_SANDBOX_MEMORY_MB"] = "512"
+        with patch.dict(os.environ, environment, clear=False):
+            with self.assertRaisesRegex(ToolExecutionError, "NIE_ENGINEERING_SANDBOX_MEMORY_MB_INVALID"):
+                VercelSandboxSettings.from_environment()
+
+        environment["NIE_ENGINEERING_SANDBOX_VCPUS"] = "2"
+        environment["NIE_ENGINEERING_SANDBOX_MEMORY_MB"] = "2048"
+        with patch.dict(os.environ, environment, clear=False):
+            with self.assertRaisesRegex(ToolExecutionError, "VERCEL_SANDBOX_RESOURCE_RATIO_INVALID"):
+                VercelSandboxSettings.from_environment()
 
     async def test_invalid_network_hosts_and_missing_credentials_fail_closed(self):
         for host in ("*", "localhost", "169.254.169.254", "metadata.google.internal"):

@@ -50,6 +50,8 @@ Configure these only in Render staging, never as `VITE_*` variables:
 - `NIE_ENGINEERING_SANDBOX_IMAGE`
 - `NIE_ENGINEERING_SANDBOX_SNAPSHOT_ID` (optional)
 - `NIE_ENGINEERING_SANDBOX_TIMEOUT_SECONDS`
+- `NIE_ENGINEERING_SANDBOX_VCPUS`
+- `NIE_ENGINEERING_SANDBOX_MEMORY_MB`
 - `NIE_ENGINEERING_SYNCHRONIZATION_TIMEOUT_SECONDS`
 - `NIE_ENGINEERING_CLEANUP_TIMEOUT_SECONDS`
 - `NIE_ENGINEERING_NETWORK_POLICY`
@@ -59,6 +61,12 @@ Keep `NIE_ENGINEERING_NETWORK_POLICY=deny_all` during initial staging. An
 approved dependency installation also requires authenticated user approval and
 `allow_network=true`. Only after a separate network-policy smoke test may the
 owner set the policy to `allowlist`; the model cannot enable networking.
+
+The adapter requests one vCPU and 2048 MB by default through the SDK's
+`SandboxResources`. These are explicit Sandbox resources; the separate
+`NIE_ENGINEERING_CPU_LIMIT`, `NIE_ENGINEERING_MEMORY_LIMIT`, and
+`NIE_ENGINEERING_PROCESS_LIMIT` settings apply to the retained Docker/local
+runner contract and are not presented as Vercel-enforced process limits.
 
 The adapter uses `vercel/sandbox/universal:latest` without a snapshot. An
 optional snapshot may contain only reviewed runtimes and build tools. Create it
