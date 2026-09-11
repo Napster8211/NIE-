@@ -1,75 +1,115 @@
-from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.ext.asyncio import AsyncSession
+from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import select
-from typing import List
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db_session
 from app.models.memory_models import Conversation, Message
-from app.schemas.memory_schemas import (
-    ConversationCreate, 
-    ConversationResponse, 
-    MessageCreate, 
-    MessageResponse
+from app.schemas.memory_schemas import ConversationCreate, ConversationResponse, MessageCreate, MessageResponse
+from app.services.director_auth_service import (
+    DirectorAuthError,
+    validate_trusted_origin,
+    verify_firebase_identity,
 )
 
 router = APIRouter(prefix="/api/v1/memory", tags=["Memory"])
+_optional_bearer = HTTPBearer(auto_error=False)
+
+
+async def resolve_memory_owner(
+    request: Request,
+    credentials: HTTPAuthorizationCredentials | None = Depends(_optional_bearer),
+) -> str:
+    """Use verified browser identity when present; preserve legacy anonymous chat only."""
+    if credentials is None:
+        return "local_user"
+    try:
+        validate_trusted_origin(request)
+        identity = await verify_firebase_identity(credentials.credentials, error_prefix="CHAT")
+    except DirectorAuthError as error:
+        raise HTTPException(status_code=error.http_status, detail=error.code) from error
+    return f"firebase:{identity.uid}"
+
 
 @router.post("/conversations", response_model=ConversationResponse)
 async def create_conversation(
-    conv: ConversationCreate, 
-    db: AsyncSession = Depends(get_db_session)
+    conv: ConversationCreate,
+    db: AsyncSession = Depends(get_db_session),
+    owner_id: str = Depends(resolve_memory_owner),
 ):
-    new_conv = Conversation(title=conv.title, user_id=conv.user_id)
+    new_conv = Conversation(title=conv.title, user_id=owner_id)
     db.add(new_conv)
     await db.commit()
     await db.refresh(new_conv)
     return new_conv
 
-@router.get("/conversations", response_model=List[ConversationResponse])
+
+@router.get("/conversations", response_model=list[ConversationResponse])
 async def list_conversations(
-    user_id: str = "local_user",
-    db: AsyncSession = Depends(get_db_session)
+    db: AsyncSession = Depends(get_db_session),
+    owner_id: str = Depends(resolve_memory_owner),
 ):
     result = await db.execute(
-        select(Conversation).where(Conversation.user_id == user_id).order_by(Conversation.updated_at.desc())
+        select(Conversation).where(Conversation.user_id == owner_id).order_by(Conversation.updated_at.desc())
     )
     return result.scalars().all()
 
+
 @router.post("/conversations/{conversation_id}/messages", response_model=MessageResponse)
 async def add_message(
-    conversation_id: str, 
-    message: MessageCreate, 
-    db: AsyncSession = Depends(get_db_session)
+    conversation_id: str,
+    message: MessageCreate,
+    db: AsyncSession = Depends(get_db_session),
+    owner_id: str = Depends(resolve_memory_owner),
 ):
-    # Verify conversation exists
-    result = await db.execute(select(Conversation).where(Conversation.id == conversation_id))
+    # A caller may mutate only a conversation owned by its verified identity.
+    result = await db.execute(
+        select(Conversation).where(
+            Conversation.id == conversation_id,
+            Conversation.user_id == owner_id,
+        )
+    )
     conversation = result.scalars().first()
-    
+
     if not conversation:
         raise HTTPException(status_code=404, detail="Conversation not found")
-        
+
     new_message = Message(
         conversation_id=conversation_id,
         role=message.role,
         content=message.content,
-        tokens_used=message.tokens_used
+        tokens_used=message.tokens_used,
+        status=message.status,
+        correlation_id=message.correlation_id,
+        message_metadata=message.message_metadata,
     )
     db.add(new_message)
-    
+
     # Update conversation timestamp to bump it up in the sidebar
     from datetime import datetime, timezone
+
     conversation.updated_at = datetime.now(timezone.utc)
-    
+
     await db.commit()
     await db.refresh(new_message)
     return new_message
 
-@router.get("/conversations/{conversation_id}/messages", response_model=List[MessageResponse])
+
+@router.get("/conversations/{conversation_id}/messages", response_model=list[MessageResponse])
 async def get_messages(
-    conversation_id: str, 
+    conversation_id: str,
     limit: int = 50,
-    db: AsyncSession = Depends(get_db_session)
+    db: AsyncSession = Depends(get_db_session),
+    owner_id: str = Depends(resolve_memory_owner),
 ):
+    conversation = await db.execute(
+        select(Conversation.id).where(
+            Conversation.id == conversation_id,
+            Conversation.user_id == owner_id,
+        )
+    )
+    if conversation.scalar_one_or_none() is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
     result = await db.execute(
         select(Message)
         .where(Message.conversation_id == conversation_id)

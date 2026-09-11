@@ -17,7 +17,6 @@ from app.repositories.director_auth_repository import (
     director_auth_repository,
 )
 from app.schemas.director_auth import DirectorPrincipal
-from app.services.authorization import verify_owner_key_token
 
 
 DIRECTOR_SESSION_COOKIE = "nie_director_session"
@@ -106,6 +105,51 @@ class VerifiedOwnerIdentity:
     email: Optional[str]
 
 
+async def verify_firebase_identity(
+    assertion: str,
+    *,
+    error_prefix: str = "DIRECTOR",
+) -> VerifiedOwnerIdentity:
+    """Verify a Firebase assertion without assigning an application role."""
+    project_id = os.getenv("FIREBASE_PROJECT_ID", "").strip()
+    if not project_id:
+        raise DirectorAuthError(
+            f"{error_prefix}_IDENTITY_NOT_CONFIGURED",
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+    if not assertion:
+        raise DirectorAuthError(f"{error_prefix}_IDENTITY_REQUIRED", status.HTTP_401_UNAUTHORIZED)
+
+    try:
+        claims: dict[str, Any] = await asyncio.to_thread(
+            google_id_token.verify_firebase_token,
+            assertion,
+            GoogleAuthRequest(),
+            project_id,
+        )
+    except TransportError as exc:
+        raise DirectorAuthError(
+            f"{error_prefix}_IDENTITY_PROVIDER_UNAVAILABLE",
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+        ) from exc
+    except (ValueError, TypeError) as exc:
+        raise DirectorAuthError(
+            f"{error_prefix}_IDENTITY_INVALID",
+            status.HTTP_401_UNAUTHORIZED,
+        ) from exc
+
+    uid = str(claims.get("sub") or claims.get("user_id") or "").strip()
+    if not uid:
+        raise DirectorAuthError(f"{error_prefix}_IDENTITY_INVALID", status.HTTP_401_UNAUTHORIZED)
+    email = claims.get("email")
+    if email and claims.get("email_verified") is not True:
+        raise DirectorAuthError(
+            f"{error_prefix}_EMAIL_NOT_VERIFIED",
+            status.HTTP_403_FORBIDDEN,
+        )
+    return VerifiedOwnerIdentity(uid=uid, email=str(email) if email else None)
+
+
 @dataclass(frozen=True)
 class IssuedDirectorSession:
     token: str
@@ -123,42 +167,17 @@ class FirebaseOwnerIdentityVerifier:
     """Verifies Firebase assertions and applies a server-side UID allowlist."""
 
     async def verify(self, assertion: str) -> VerifiedOwnerIdentity:
-        project_id = os.getenv("FIREBASE_PROJECT_ID", "").strip()
         allowlisted_uids = {
             item.strip()
             for item in os.getenv("NIE_OWNER_FIREBASE_UIDS", "").split(",")
             if item.strip()
         }
-        if not project_id or not allowlisted_uids:
+        if not allowlisted_uids:
             raise DirectorAuthError("DIRECTOR_IDENTITY_NOT_CONFIGURED", status.HTTP_503_SERVICE_UNAVAILABLE)
-        if not assertion:
-            raise DirectorAuthError("DIRECTOR_IDENTITY_REQUIRED", status.HTTP_401_UNAUTHORIZED)
-
-        try:
-            claims: dict[str, Any] = await asyncio.to_thread(
-                google_id_token.verify_firebase_token,
-                assertion,
-                GoogleAuthRequest(),
-                project_id,
-            )
-        except TransportError as exc:
-            raise DirectorAuthError(
-                "DIRECTOR_IDENTITY_PROVIDER_UNAVAILABLE",
-                status.HTTP_503_SERVICE_UNAVAILABLE,
-            ) from exc
-        except (ValueError, TypeError) as exc:
-            raise DirectorAuthError("DIRECTOR_IDENTITY_INVALID", status.HTTP_401_UNAUTHORIZED) from exc
-
-        uid = str(claims.get("sub") or claims.get("user_id") or "").strip()
-        if not uid:
-            raise DirectorAuthError("DIRECTOR_IDENTITY_INVALID", status.HTTP_401_UNAUTHORIZED)
-        if uid not in allowlisted_uids:
+        identity = await verify_firebase_identity(assertion)
+        if identity.uid not in allowlisted_uids:
             raise DirectorAuthError("DIRECTOR_OWNER_NOT_ALLOWED", status.HTTP_403_FORBIDDEN)
-
-        email = claims.get("email")
-        if email and claims.get("email_verified") is not True:
-            raise DirectorAuthError("DIRECTOR_EMAIL_NOT_VERIFIED", status.HTTP_403_FORBIDDEN)
-        return VerifiedOwnerIdentity(uid=uid, email=str(email) if email else None)
+        return identity
 
 
 class DirectorAuthService:
@@ -348,6 +367,10 @@ async def require_director_access(
         except DirectorAuthError as error:
             _raise_http(error)
     if credentials:
+        # Avoid importing the broader operational authority graph while the
+        # browser identity module itself is being initialized.
+        from app.services.authorization import verify_owner_key_token
+
         owner_id = verify_owner_key_token(credentials.credentials)
         return DirectorPrincipal(
             owner_id=owner_id,

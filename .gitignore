@@ -54,6 +54,7 @@ trash
 .env
 .env.*
 !.env.example
+!.env.staging.example
 
 # NIE runtime registries / temporary persistence
 .napstertec_missions.json
@@ -82,6 +83,7 @@ logs/
 # Runtime uploads and generated user content
 storage/uploads/
 storage/images/
+storage/engineering_workspaces/
 
 # Build-time model cache. Render creates this inside the deploy artifact.
 .cache/whisper/

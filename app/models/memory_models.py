@@ -1,6 +1,6 @@
 import uuid
 from datetime import datetime, timezone
-from sqlalchemy import Column, String, Text, Integer, DateTime, ForeignKey
+from sqlalchemy import Column, String, Text, Integer, DateTime, ForeignKey, JSON
 from sqlalchemy.orm import relationship
 from app.database import Base
 
@@ -27,6 +27,9 @@ class Message(Base):
     role = Column(String, nullable=False) # Expected values: "user", "assistant", "system"
     content = Column(Text, nullable=False)
     tokens_used = Column(Integer, default=0)
+    status = Column(String(32), nullable=False, default="COMPLETED")
+    correlation_id = Column(String(120), nullable=True, index=True)
+    message_metadata = Column("metadata", JSON, nullable=False, default=dict)
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
     conversation = relationship("Conversation", back_populates="messages")

@@ -40,6 +40,7 @@ from app.tools.tool_registry import tool_registry, ToolRegistry
 from app.tools.tool_executor import ToolExecutor
 from app.tools.workspace_reader import WorkspaceReaderTool
 from app.tools.workspace_writer import WorkspaceWriterTool
+from app.services.stream_events import sse_event
 
 # --- SPRINT 2 IMPORTS (Lead Intelligence) ---
 from app.tools.plugins.business_discovery import BusinessDiscoveryTool
@@ -964,10 +965,81 @@ async def chat_endpoint(request: ChatRequest, db: AsyncSession = Depends(get_db_
 
         if request.stream:
             async def profiled_stream_wrapper():
-                async for chunk in event_generator():
-                    yield chunk
+                character_count = 0
+                terminal_sent = False
+                yield sse_event(
+                    "message.started",
+                    {"correlation_id": request_id, "conversation_id": conversation_id},
+                    request_id,
+                )
+                source = event_generator().__aiter__()
+                next_chunk = asyncio.create_task(source.__anext__())
+                try:
+                    while True:
+                        done, _ = await asyncio.wait({next_chunk}, timeout=15)
+                        if not done:
+                            yield sse_event(
+                                "stream.keepalive",
+                                {"correlation_id": request_id},
+                                request_id,
+                            )
+                            continue
+                        try:
+                            chunk = next_chunk.result()
+                        except StopAsyncIteration:
+                            break
+                        character_count += len(chunk)
+                        yield sse_event(
+                            "message.delta",
+                            {"correlation_id": request_id, "content": chunk},
+                            request_id,
+                        )
+                        next_chunk = asyncio.create_task(source.__anext__())
+                    terminal_sent = True
+                    yield sse_event(
+                        "message.completed",
+                        {
+                            "correlation_id": request_id,
+                            "conversation_id": conversation_id,
+                            "character_count": character_count,
+                            "incomplete": False,
+                        },
+                        request_id,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as stream_error:
+                    logger.error(
+                        "[Chat Stream Error][%s]: %s",
+                        request_id,
+                        type(stream_error).__name__,
+                        exc_info=True,
+                    )
+                    if not terminal_sent:
+                        yield sse_event(
+                            "message.failed",
+                            {
+                                "correlation_id": request_id,
+                                "conversation_id": conversation_id,
+                                "error": "CHAT_STREAM_INTERRUPTED",
+                                "character_count": character_count,
+                                "incomplete": True,
+                            },
+                            request_id,
+                        )
+                finally:
+                    if not next_chunk.done():
+                        next_chunk.cancel()
+                        await asyncio.gather(next_chunk, return_exceptions=True)
 
-            return StreamingResponse(profiled_stream_wrapper(), media_type="text/event-stream")
+            return StreamingResponse(
+                profiled_stream_wrapper(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache, no-transform",
+                    "X-Accel-Buffering": "no",
+                },
+            )
         else:
             full_response = ""
             async for chunk in event_generator():

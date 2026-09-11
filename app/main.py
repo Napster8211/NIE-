@@ -19,6 +19,7 @@ import app.models.memory_models
 import app.models.image  
 import app.models.document 
 import app.models.director_auth
+import app.models.engineering_workspace
 
 # Core APIs and Engine Memory
 from app.api.endpoints import router as api_router
@@ -31,14 +32,23 @@ from app.api.routers.analytics import router as analytics_router
 from app.api.routers.system import system_router
 from app.api.director_desktop import router as director_desktop_router
 from app.api.director_auth import router as director_auth_router
+from app.api.engineering_workspace import router as engineering_workspace_router
 from app.services.director_auth_service import trusted_frontend_origins
 from app.services.director_speech_service import director_speech_service
+from app.services.engineering_process_service import ProcessManager
+from app.services.engineering_execution_service import (
+    engineering_runner_readiness,
+    validate_engineering_runner_configuration,
+)
 
 # --- SPRINT 25.5: AUTONOMOUS MISSION WORKER IMPORT ---
 from app.engine.autonomous_worker import autonomous_worker
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Engineering mode may be staged while disabled, but can never start
+    # enabled with an unavailable isolated runner.
+    validate_engineering_runner_configuration()
     # Startup Phase: Connect to PostgreSQL and provision missing tables.
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
@@ -56,6 +66,7 @@ async def lifespan(app: FastAPI):
     # Shutdown Phase: Stop worker loop and clean up DB connections.
     logger.info("[Main] Shutting down Autonomous Mission Worker...")
     await autonomous_worker.stop_worker_loop()
+    await ProcessManager.shutdown_active()
     await director_speech_service.shutdown()
     await engine.dispose()
 
@@ -72,7 +83,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=list(trusted_frontend_origins()),
     allow_credentials=True,
-    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["Accept", "Authorization", "Content-Type", "X-CSRF-Token"],
 )
 
@@ -81,6 +92,7 @@ app.include_router(api_router, prefix="/api/v1")
 app.include_router(memory_router)
 app.include_router(director_desktop_router, prefix="/api/v1")
 app.include_router(director_auth_router, prefix="/api/v1")
+app.include_router(engineering_workspace_router, prefix="/api/v1")
 
 app.include_router(documents_router)
 app.include_router(images_router)
@@ -95,6 +107,7 @@ async def health_check():
         "engine": "NIE v25.5",
         "database_status": "connected",
         "director_stt": director_speech_service.readiness(),
+        "engineering": engineering_runner_readiness(),
     }
 
 if __name__ == "__main__":
