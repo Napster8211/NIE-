@@ -1,0 +1,30 @@
+name: Engineering Workspace quality
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    env:
+      NIE_ENV: test
+      DATABASE_URL: postgresql+asyncpg://test:test@127.0.0.1:5432/test
+      NIE_ENGINEERING_MODE_ENABLED: "true"
+      NIE_ENGINEERING_OWNER_ONLY: "true"
+      NIE_ENGINEERING_WORKSPACE_ROOT: /tmp/nie-engineering-tests
+      NIE_ENGINEERING_RUNNER: local
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install -r requirements-dev.txt
+      - run: python -m ruff format --check app/api/engineering_workspace.py app/api/memory.py app/models/engineering_workspace.py app/repositories/engineering_workspace_repository.py app/schemas/engineering_workspace.py app/schemas/memory_schemas.py app/services/engineering_authorization.py app/services/engineering_chat_service.py app/services/engineering_execution_service.py app/services/engineering_process_service.py app/services/engineering_workspace_service.py app/services/engineering_workspace_storage.py app/services/runtime_environment.py app/services/stream_events.py app/services/supabase_workspace_storage.py app/services/vercel_sandbox_runner.py scripts/apply_engineering_migration.py scripts/cleanup_engineering_staged_objects.py scripts/validate_engineering_staging.py scripts/verify_engineering_postgres.py tests/test_engineering_workspace.py tests/test_engineering_postgres_verifier.py tests/test_supabase_storage_integration.py tests/test_supabase_workspace_storage.py tests/test_vercel_sandbox_runner.py
+      - run: python -m ruff check app/api/engineering_workspace.py app/api/memory.py app/models/engineering_workspace.py app/repositories/engineering_workspace_repository.py app/schemas/engineering_workspace.py app/schemas/memory_schemas.py app/services/engineering_authorization.py app/services/engineering_chat_service.py app/services/engineering_execution_service.py app/services/engineering_process_service.py app/services/engineering_workspace_service.py app/services/engineering_workspace_storage.py app/services/runtime_environment.py app/services/stream_events.py app/services/supabase_workspace_storage.py app/services/vercel_sandbox_runner.py scripts/apply_engineering_migration.py scripts/cleanup_engineering_staged_objects.py scripts/validate_engineering_staging.py scripts/verify_engineering_postgres.py tests/test_engineering_workspace.py tests/test_engineering_postgres_verifier.py tests/test_supabase_storage_integration.py tests/test_supabase_workspace_storage.py tests/test_vercel_sandbox_runner.py
+      - run: python scripts/validate_engineering_staging.py
+      - run: python -m mypy --follow-imports=skip app/api/memory.py app/repositories/engineering_workspace_repository.py app/services/engineering_authorization.py app/services/engineering_chat_service.py app/services/engineering_execution_service.py app/services/engineering_process_service.py app/services/engineering_workspace_service.py app/services/engineering_workspace_storage.py app/services/stream_events.py app/services/supabase_workspace_storage.py app/services/vercel_sandbox_runner.py
+      - run: python -m unittest tests.test_engineering_workspace tests.test_engineering_postgres_verifier tests.test_supabase_workspace_storage tests.test_supabase_storage_integration tests.test_vercel_sandbox_runner tests.test_director_browser_auth
+      - run: python -c "from app.main import app; print(app.title)"

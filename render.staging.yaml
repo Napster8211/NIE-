@@ -1,0 +1,85 @@
+# Proposed staging Blueprint. It is intentionally not named render.yaml so it
+# cannot alter an existing service unless an owner explicitly selects it.
+services:
+  - type: web
+    name: napstertec-engine-staging
+    runtime: python
+    plan: 0.5c-512mb
+    region: oregon
+    autoDeployTrigger: off
+    buildCommand: pip install -r requirements.txt && python scripts/cache_whisper_model.py
+    preDeployCommand: python scripts/apply_engineering_migration.py
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT --workers 1
+    healthCheckPath: /health
+    maxShutdownDelaySeconds: 60
+    envVars:
+      - key: NIE_ENV
+        value: staging
+      - key: DATABASE_URL
+        sync: false
+      - key: NIE_TRUSTED_FRONTEND_ORIGINS
+        sync: false
+      - key: FIREBASE_PROJECT_ID
+        sync: false
+      - key: NIE_OWNER_FIREBASE_UIDS
+        sync: false
+      - key: NIE_OWNER_KEY
+        sync: false
+      - key: DIRECTOR_SESSION_COOKIE_SECURE
+        value: "true"
+      - key: DIRECTOR_SESSION_COOKIE_SAMESITE
+        value: none
+      - key: NIE_ENGINEERING_MODE_ENABLED
+        value: "false"
+      - key: NIE_ENGINEERING_OWNER_ONLY
+        value: "true"
+      - key: NIE_ENGINEERING_ALLOWED_FIREBASE_UIDS
+        sync: false
+      - key: NIE_ENGINEERING_STORAGE_BACKEND
+        value: supabase
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: NIE_ENGINEERING_STORAGE_BUCKET
+        value: engineering-workspaces
+      - key: NIE_ENGINEERING_STORAGE_TIMEOUT_SECONDS
+        value: "30"
+      - key: NIE_ENGINEERING_RUNNER
+        value: vercel_sandbox
+      - key: VERCEL_TOKEN
+        sync: false
+      - key: VERCEL_TEAM_ID
+        sync: false
+      - key: VERCEL_PROJECT_ID
+        sync: false
+      - key: NIE_ENGINEERING_SANDBOX_IMAGE
+        value: vercel/sandbox/universal:latest
+      - key: NIE_ENGINEERING_SANDBOX_SNAPSHOT_ID
+        sync: false
+      - key: NIE_ENGINEERING_SANDBOX_TIMEOUT_SECONDS
+        value: "300"
+      - key: NIE_ENGINEERING_SANDBOX_VCPUS
+        value: "1"
+      - key: NIE_ENGINEERING_SANDBOX_MEMORY_MB
+        value: "2048"
+      - key: NIE_ENGINEERING_SYNCHRONIZATION_TIMEOUT_SECONDS
+        value: "60"
+      - key: NIE_ENGINEERING_CLEANUP_TIMEOUT_SECONDS
+        value: "15"
+      - key: NIE_ENGINEERING_NETWORK_POLICY
+        value: deny_all
+      - key: NIE_ENGINEERING_NETWORK_ALLOWLIST
+        value: pypi.org,files.pythonhosted.org,registry.npmjs.org
+      - key: NIE_ENGINEERING_MAX_FILE_COUNT
+        value: "2000"
+      - key: NIE_ENGINEERING_MAX_FILE_BYTES
+        value: "1000000"
+      - key: NIE_ENGINEERING_MAX_WORKSPACE_BYTES
+        value: "100000000"
+      - key: NIE_ENGINEERING_MAX_OUTPUT_BYTES
+        value: "100000"
+      - key: NIE_ENGINEERING_MAX_PROCESSES
+        value: "1"
+      - key: NIE_ENGINEERING_MAX_CONCURRENT_EXECUTIONS
+        value: "1"
