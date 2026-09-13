@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import os
 import shutil
@@ -11,8 +12,14 @@ import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
+from typing import Any, Protocol, runtime_checkable
 
-from app.services.engineering_workspace_service import WorkspacePathResolver
+from app.services.engineering_workspace_service import WorkspacePathResolver, configured_workspace_storage_backend
+from app.services.runtime_environment import runtime_environment
+
+
+def _deployed_environment() -> bool:
+    return runtime_environment() in {"production", "prod", "staging", "stage"}
 
 
 class WorkspaceStorageError(Exception):
@@ -63,6 +70,123 @@ class WorkspaceStorage:
         returned_files: Mapping[str, bytes],
     ) -> WorkspaceSyncResult:
         raise NotImplementedError
+
+
+@runtime_checkable
+class AsyncWorkspaceStorage(Protocol):
+    """Database-backed storage contract used by ephemeral remote runners."""
+
+    is_async: bool
+    max_file_bytes: int
+    max_workspace_bytes: int
+    max_file_count: int
+
+    async def capture(self, target: Any) -> WorkspaceSnapshot: ...
+
+    async def reconcile(
+        self,
+        target: Any,
+        execution_id: str,
+        base_revision: str,
+        returned_files: Mapping[str, bytes],
+    ) -> WorkspaceSyncResult: ...
+
+
+WorkspaceStorageBackend = WorkspaceStorage | AsyncWorkspaceStorage
+
+
+def build_workspace_storage(repository=None) -> WorkspaceStorageBackend:
+    backend = configured_workspace_storage_backend()
+    if backend == "local":
+        if _deployed_environment():
+            raise WorkspaceStorageError("EPHEMERAL_LOCAL_STORAGE_FORBIDDEN")
+        return LocalDurableWorkspaceStorage()
+    if backend == "supabase":
+        if repository is None:
+            raise WorkspaceStorageError("SUPABASE_STORAGE_REPOSITORY_REQUIRED")
+        from app.services.supabase_workspace_storage import SupabaseWorkspaceStorage
+
+        return SupabaseWorkspaceStorage(repository)
+    raise WorkspaceStorageError("WORKSPACE_STORAGE_BACKEND_INVALID")
+
+
+def workspace_storage_readiness() -> dict[str, object]:
+    backend = configured_workspace_storage_backend()
+    enabled = os.getenv("NIE_ENGINEERING_MODE_ENABLED", "false").strip().casefold() in {"1", "true", "yes", "on"}
+    runner = os.getenv("NIE_ENGINEERING_RUNNER", "docker" if _deployed_environment() else "local").strip().casefold()
+    if backend == "supabase":
+        from app.services.supabase_workspace_storage import supabase_storage_readiness
+
+        result = supabase_storage_readiness()
+        compatible = runner == "vercel_sandbox"
+        result["enabled"] = enabled
+        result["compatible_runner"] = compatible
+        result["safe_for_production"] = bool(result.get("configured") and compatible)
+        if not compatible:
+            result["reason"] = "ENGINEERING_STORAGE_RUNNER_INCOMPATIBLE"
+        return result
+    if backend == "local":
+        safe = not _deployed_environment()
+        return {
+            "backend": "local",
+            "configured": safe or bool(os.getenv("NIE_ENGINEERING_WORKSPACE_ROOT", "").strip()),
+            "reachable": None,
+            "enabled": enabled,
+            "safe_for_production": safe,
+            "reason": None if safe else "EPHEMERAL_LOCAL_STORAGE_FORBIDDEN",
+        }
+    return {
+        "backend": backend,
+        "configured": False,
+        "reachable": False,
+        "enabled": enabled,
+        "safe_for_production": False,
+        "reason": "WORKSPACE_STORAGE_BACKEND_INVALID",
+    }
+
+
+def validate_workspace_storage_configuration() -> None:
+    readiness = workspace_storage_readiness()
+    if readiness.get("enabled") and (not readiness.get("configured") or not readiness.get("safe_for_production")):
+        raise RuntimeError(str(readiness.get("reason") or "ENGINEERING_STORAGE_NOT_READY"))
+
+
+async def probe_workspace_storage() -> dict[str, object]:
+    readiness = workspace_storage_readiness()
+    if readiness.get("backend") != "supabase" or not readiness.get("configured"):
+        return readiness
+    from app.services.supabase_workspace_storage import probe_supabase_storage
+
+    probed = await probe_supabase_storage()
+    probed["enabled"] = readiness.get("enabled", False)
+    compatible = bool(readiness.get("compatible_runner"))
+    probed["compatible_runner"] = compatible
+    probed["safe_for_production"] = bool(probed.get("configured") and probed.get("reachable") and compatible)
+    if not compatible:
+        probed["reason"] = "ENGINEERING_STORAGE_RUNNER_INCOMPATIBLE"
+    elif probed.get("configured") and not probed.get("reachable"):
+        probed["reason"] = "SUPABASE_STORAGE_PRIVATE_BUCKET_UNAVAILABLE"
+    return probed
+
+
+async def capture_workspace(storage: WorkspaceStorageBackend, target) -> WorkspaceSnapshot:
+    if isinstance(storage, AsyncWorkspaceStorage):
+        return await storage.capture(target)
+    root_path = str(getattr(target, "root_path", target))
+    return await asyncio.to_thread(storage.capture, root_path)
+
+
+async def reconcile_workspace(
+    storage: WorkspaceStorageBackend,
+    target,
+    execution_id: str,
+    base_revision: str,
+    returned_files: Mapping[str, bytes],
+) -> WorkspaceSyncResult:
+    if isinstance(storage, AsyncWorkspaceStorage):
+        return await storage.reconcile(target, execution_id, base_revision, returned_files)
+    root_path = str(getattr(target, "root_path", target))
+    return await asyncio.to_thread(storage.reconcile, root_path, base_revision, returned_files)
 
 
 class LocalDurableWorkspaceStorage(WorkspaceStorage):

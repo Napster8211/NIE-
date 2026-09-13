@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import sys
+import tempfile
 import time
 import uuid
 from collections.abc import Awaitable, Callable
@@ -30,7 +31,21 @@ from app.schemas.engineering_workspace import (
     SearchFilesInput,
     StructuredToolResult,
 )
-from app.services.engineering_workspace_service import FileOperationResult, FileSystemTool, SearchTool, WorkspaceError
+from app.services.engineering_workspace_service import (
+    FileOperationResult,
+    FileSystemTool,
+    SearchTool,
+    WorkspaceError,
+    WorkspacePathResolver,
+)
+from app.services.engineering_workspace_storage import (
+    LocalDurableWorkspaceStorage,
+    WorkspaceStorageBackend,
+    WorkspaceStorageError,
+    build_workspace_storage,
+    capture_workspace,
+    reconcile_workspace,
+)
 from app.services.runtime_environment import is_production
 
 
@@ -287,7 +302,11 @@ class SecretRedactor:
             for key, value in os.environ.items()
             if value
             and len(value) >= 8
-            and any(marker in key.upper() for marker in ("KEY", "TOKEN", "SECRET", "PASSWORD"))
+            and (
+                any(marker in key.upper() for marker in ("KEY", "TOKEN", "SECRET", "PASSWORD"))
+                or key.upper() == "DATABASE_URL"
+                or key.upper().endswith("_DATABASE_URL")
+            )
         ]
 
     def redact(self, value: str) -> str:
@@ -709,7 +728,7 @@ def engineering_tool_schemas() -> list[dict[str, Any]]:
     ]
 
 
-def build_command_runner(mode: str | None = None) -> CommandRunner:
+def build_command_runner(mode: str | None = None, *, storage: WorkspaceStorageBackend | None = None) -> CommandRunner:
     default_mode = "docker" if is_production() else "local"
     mode = (mode or os.getenv("NIE_ENGINEERING_RUNNER") or default_mode).strip().casefold()
     if mode == "docker":
@@ -718,7 +737,7 @@ def build_command_runner(mode: str | None = None) -> CommandRunner:
         from app.services.vercel_sandbox_runner import VercelSandboxRunner
 
         try:
-            return VercelSandboxRunner()
+            return VercelSandboxRunner(storage=storage)
         except ToolExecutionError as exc:
             return UnavailableCommandRunner(exc.code)
     if mode == "local" and not is_production():
@@ -749,10 +768,74 @@ def validate_engineering_runner_configuration() -> None:
 
 
 class ToolExecutionService:
-    def __init__(self, repository: EngineeringWorkspaceRepository, runner: CommandRunner | None = None):
+    _MUTATING_FILE_TOOLS = {
+        "filesystem.create",
+        "filesystem.patch",
+        "filesystem.mkdir",
+        "filesystem.rename",
+        "filesystem.delete",
+    }
+
+    def __init__(
+        self,
+        repository: EngineeringWorkspaceRepository,
+        runner: CommandRunner | None = None,
+        storage: WorkspaceStorageBackend | None = None,
+    ):
         self.repository = repository
         self.policy = ToolPolicyEngine()
-        self.runner = runner or engineering_command_runner
+        try:
+            self.storage = storage or build_workspace_storage(repository)
+        except WorkspaceStorageError as exc:
+            raise ToolExecutionError(exc.code) from exc
+        self.runner = runner or build_command_runner(storage=self.storage)
+
+    async def _execute_file_tool(
+        self,
+        *,
+        definition: ToolDefinition,
+        validated: BaseModel,
+        workspace: Any,
+        owner_id: str,
+        execution_id: str,
+        tool_name: str,
+    ) -> FileOperationResult:
+        if not getattr(self.storage, "is_async", False):
+            runtime = ToolRuntime(execution_id, workspace.workspace_id, owner_id, workspace.root_path, self.repository)
+            return await definition.handler(validated, runtime)
+
+        snapshot = await capture_workspace(self.storage, workspace)
+        with tempfile.TemporaryDirectory(prefix="nie-engineering-operation-") as temp_root:
+            resolver = WorkspacePathResolver(temp_root)
+            for path, stored in snapshot.files.items():
+                target, _ = resolver.resolve(path)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(stored.content)
+            runtime = ToolRuntime(execution_id, workspace.workspace_id, owner_id, temp_root, self.repository)
+            result = await definition.handler(validated, runtime)
+            if tool_name not in self._MUTATING_FILE_TOOLS:
+                return result
+            local_snapshot = LocalDurableWorkspaceStorage().capture(temp_root)
+            synchronized = await reconcile_workspace(
+                self.storage,
+                workspace,
+                execution_id,
+                snapshot.revision,
+                {path: item.content for path, item in local_snapshot.files.items()},
+            )
+            result.changed_files = [str(change["path"]) for change in synchronized.changes]
+            result.changes = list(synchronized.changes)
+            result.change = None
+            result.changes_persisted = True
+            result.provider_metadata.update(
+                {
+                    "storage_backend": "supabase",
+                    "synchronization_status": "COMMITTED",
+                    "workspace_revision_before": synchronized.revision_before,
+                    "workspace_revision_after": synchronized.revision_after,
+                }
+            )
+            return result
 
     @staticmethod
     def _sanitize(arguments: dict[str, Any]) -> dict[str, Any]:
@@ -840,15 +923,20 @@ class ToolExecutionService:
                             policy.reason or "EXPLICIT_APPROVAL_REQUIRED", status="APPROVAL_REQUIRED"
                         )
                     raise ToolExecutionError(policy.reason or "COMMAND_POLICY_REJECTED")
-                result = await self.runner.run(execution_id, workspace.root_path, validated, policy)
+                runner_target = workspace if getattr(self.storage, "is_async", False) else workspace.root_path
+                result = await self.runner.run(execution_id, runner_target, validated, policy)
                 exit_code = getattr(result, "exit_code", 0)
             else:
                 definition = engineering_tool_registry.require(tool_name)
                 validated = definition.input_model.model_validate(arguments)
-                runtime = ToolRuntime(
-                    execution_id, workspace.workspace_id, owner_id, workspace.root_path, self.repository
+                result = await self._execute_file_tool(
+                    definition=definition,
+                    validated=validated,
+                    workspace=workspace,
+                    owner_id=owner_id,
+                    execution_id=execution_id,
+                    tool_name=tool_name,
                 )
-                result = await definition.handler(validated, runtime)
             status = "SUCCEEDED"
         except ValidationError:
             error_type = "TOOL_ARGUMENT_VALIDATION_FAILED"
@@ -893,15 +981,16 @@ class ToolExecutionService:
         if result.change and not changes:
             changes.append(result.change)
         for change in changes:
-            await self.repository.add_file_change(
-                execution_id=execution_id,
-                workspace_id=workspace.workspace_id,
-                relative_path=change["path"],
-                operation=change["operation"],
-                bytes_before=change["bytes_before"],
-                bytes_after=change["bytes_after"],
-                content_sha256=change.get("sha256"),
-            )
+            if not result.changes_persisted:
+                await self.repository.add_file_change(
+                    execution_id=execution_id,
+                    workspace_id=workspace.workspace_id,
+                    relative_path=change["path"],
+                    operation=change["operation"],
+                    bytes_before=change["bytes_before"],
+                    bytes_after=change["bytes_after"],
+                    content_sha256=change.get("sha256"),
+                )
             file_event = "file.created" if change["operation"] == "CREATED" else "file.updated"
             await self.repository.add_event(
                 execution_id,

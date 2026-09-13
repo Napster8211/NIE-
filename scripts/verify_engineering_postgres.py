@@ -14,7 +14,7 @@ from urllib.parse import urlparse
 
 import asyncpg
 
-MIGRATION_PATH = Path(__file__).resolve().parents[1] / "database" / "migrations" / "001_engineering_workspace.sql"
+MIGRATION_DIRECTORY = Path(__file__).resolve().parents[1] / "database" / "migrations"
 EXPECTED_TABLES = {
     "engineering_workspaces",
     "workspace_conversations",
@@ -22,6 +22,8 @@ EXPECTED_TABLES = {
     "execution_events",
     "workspace_file_changes",
     "workspace_processes",
+    "engineering_workspace_files",
+    "engineering_workspace_staged_objects",
 }
 EXPECTED_COLUMNS = {
     "engineering_workspaces": {
@@ -33,6 +35,9 @@ EXPECTED_COLUMNS = {
         "status",
         "runtime_type",
         "metadata",
+        "storage_backend",
+        "storage_revision",
+        "storage_manifest_sha256",
     },
     "workspace_conversations": {"workspace_id", "conversation_id", "owner_id"},
     "tool_executions": {
@@ -47,6 +52,23 @@ EXPECTED_COLUMNS = {
     "execution_events": {"execution_id", "sequence", "event_type", "payload"},
     "workspace_file_changes": {"execution_id", "workspace_id", "relative_path", "operation"},
     "workspace_processes": {"workspace_id", "owner_id", "execution_id", "status", "health_status"},
+    "engineering_workspace_files": {
+        "workspace_id",
+        "owner_id",
+        "logical_path",
+        "storage_object_key",
+        "content_sha256",
+        "size_bytes",
+        "revision",
+        "execution_id",
+    },
+    "engineering_workspace_staged_objects": {
+        "workspace_id",
+        "owner_id",
+        "execution_id",
+        "storage_object_key",
+        "status",
+    },
 }
 EXPECTED_INDEXES = {
     "ix_engineering_workspaces_owner_id",
@@ -67,6 +89,10 @@ EXPECTED_INDEXES = {
     "ix_workspace_processes_workspace_id",
     "ix_workspace_processes_owner_id",
     "ix_workspace_processes_status",
+    "ix_engineering_workspaces_owner_storage",
+    "ix_engineering_workspace_files_owner_workspace",
+    "ix_engineering_workspace_files_workspace_revision",
+    "ix_engineering_staged_objects_workspace_status",
 }
 EXPECTED_NAMED_CONSTRAINTS = {
     "uq_engineering_workspace_owner_slug",
@@ -82,6 +108,16 @@ EXPECTED_NAMED_CONSTRAINTS = {
     "ck_workspace_process_status",
     "ck_workspace_process_health_status",
     "ck_workspace_process_port",
+    "ck_engineering_workspace_storage_backend",
+    "ck_engineering_workspace_storage_revision",
+    "ck_engineering_workspace_manifest_sha256",
+    "uq_engineering_workspace_file_path",
+    "ck_engineering_workspace_file_size",
+    "ck_engineering_workspace_file_revision",
+    "ck_engineering_workspace_file_sha256",
+    "ck_engineering_staged_object_size",
+    "ck_engineering_staged_object_sha256",
+    "ck_engineering_staged_object_status",
 }
 
 
@@ -106,17 +142,22 @@ def _validate_disposable_url(database_url: str) -> None:
 
 async def verify(database_url: str) -> dict[str, int]:
     schema = f"nie_engineering_verify_{uuid.uuid4().hex}"
-    sql = MIGRATION_PATH.read_text(encoding="utf-8")
+    migrations = [path.read_text(encoding="utf-8") for path in sorted(MIGRATION_DIRECTORY.glob("*_engineering_*.sql"))]
+    if not migrations:
+        raise RuntimeError("ENGINEERING_MIGRATIONS_NOT_FOUND")
     connection = await asyncpg.connect(_asyncpg_url(database_url), timeout=30)
     try:
         await connection.execute(f'CREATE SCHEMA "{schema}"')
         await connection.execute(f'SET search_path TO "{schema}"')
-        await connection.execute(sql)
-        await connection.execute(sql)
+        for sql in migrations:
+            await connection.execute(sql)
+        for sql in migrations:
+            await connection.execute(sql)
         # Confirm the legacy-message extension remains safe both when the
         # table is absent and when it exists in an established deployment.
         await connection.execute("CREATE TABLE messages (message_id VARCHAR PRIMARY KEY)")
-        await connection.execute(sql)
+        for sql in migrations:
+            await connection.execute(sql)
         tables = set(
             await connection.fetchval(
                 "SELECT array_agg(table_name) FROM information_schema.tables WHERE table_schema = $1",
@@ -178,14 +219,18 @@ async def verify(database_url: str) -> dict[str, int]:
             """,
             schema,
         )
-        if int(foreign_key_count) != 7:
+        if int(foreign_key_count) != 11:
             raise RuntimeError(f"ENGINEERING_MIGRATION_FOREIGN_KEY_COUNT_INVALID:{foreign_key_count}")
 
         await connection.execute(
             """
             INSERT INTO engineering_workspaces
-                (workspace_id, owner_id, name, slug, root_path)
-            VALUES ('ews_verify', 'firebase:test-owner', 'verify', 'verify', '/disposable/verify');
+                (workspace_id, owner_id, name, slug, root_path, storage_backend, storage_manifest_sha256)
+            VALUES (
+                'ews_verify', 'firebase:test-owner', 'verify', 'verify',
+                'supabase://engineering-workspaces/ews_verify', 'SUPABASE',
+                'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
+            );
             INSERT INTO workspace_conversations
                 (link_id, workspace_id, conversation_id, owner_id)
             VALUES ('wcl_verify', 'ews_verify', 'conversation-verify', 'firebase:test-owner');
@@ -200,6 +245,22 @@ async def verify(database_url: str) -> dict[str, int]:
             INSERT INTO workspace_file_changes
                 (change_id, execution_id, workspace_id, relative_path, operation)
             VALUES ('wfc_verify', 'tex_verify', 'ews_verify', 'health_check.py', 'CREATED');
+            INSERT INTO engineering_workspace_files
+                (file_id, workspace_id, owner_id, logical_path, storage_object_key,
+                 content_sha256, size_bytes, revision, execution_id)
+            VALUES (
+                'ewf_verify', 'ews_verify', 'firebase:test-owner', 'health_check.py',
+                'users/test/workspaces/ews_verify/executions/tex_verify/staged/hash',
+                'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 24, 1, 'tex_verify'
+            );
+            INSERT INTO engineering_workspace_staged_objects
+                (staging_id, workspace_id, owner_id, execution_id, storage_object_key,
+                 content_sha256, size_bytes, status)
+            VALUES (
+                'ewsobj_verify', 'ews_verify', 'firebase:test-owner', 'tex_verify',
+                'users/test/workspaces/ews_verify/executions/tex_verify/staged/hash',
+                'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 24, 'COMMITTED'
+            );
             INSERT INTO workspace_processes
                 (process_id, workspace_id, owner_id, execution_id, sanitized_command, permitted_port)
             VALUES (

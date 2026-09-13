@@ -151,6 +151,7 @@ class VercelSandboxRunnerTests(unittest.IsolatedAsyncioTestCase):
                 "NIE_ENGINEERING_MAX_CONCURRENT_EXECUTIONS": "1",
                 "NIE_ENGINEERING_MAX_OUTPUT_BYTES": "1000",
                 "TEST_SECRET_TOKEN": "never-return-this-value",
+                "DATABASE_URL": "postgresql://test-user:test-password@db.invalid/test_database",
             },
             clear=False,
         )
@@ -215,10 +216,12 @@ class VercelSandboxRunnerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_stdout_stderr_are_bounded_and_secrets_redacted(self):
         secret = os.environ["TEST_SECRET_TOKEN"]
-        session = FakeSandboxSession(result=SandboxCommandResult(secret + "x" * 3000, "token=unsafe", 0))
+        database_url = os.environ["DATABASE_URL"]
+        session = FakeSandboxSession(result=SandboxCommandResult(secret + database_url + "x" * 3000, "token=unsafe", 0))
         runner, _ = self.runner(session)
         result = await self.run_command(runner, max_output_bytes=1000)
         self.assertNotIn(secret, result.stdout)
+        self.assertNotIn(database_url, result.stdout)
         self.assertIn("[REDACTED]", result.stdout)
         self.assertIn("OUTPUT TRUNCATED", result.stdout)
         self.assertEqual("token=[REDACTED]", result.stderr)
@@ -455,7 +458,7 @@ class VercelSandboxRunnerTests(unittest.IsolatedAsyncioTestCase):
         )
         events = repository.events[result.execution_id]
         terminal = [event.event_type for event in events if event.event_type in {"tool.completed", "tool.failed"}]
-        self.assertTrue(result.evidence_verified)
+        self.assertTrue(result.evidence_verified, result.model_dump())
         self.assertEqual(["tool.completed"], terminal)
         self.assertEqual("vercel_sandbox", repository.executions[result.execution_id].provider_metadata["provider"])
         self.assertEqual(1, len(repository.file_changes))

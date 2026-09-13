@@ -35,6 +35,7 @@ class FileOperationResult:
     stdout: str = ""
     stderr: str = ""
     exit_code: int | None = None
+    changes_persisted: bool = False
 
 
 def utc_now() -> datetime:
@@ -57,6 +58,11 @@ def workspace_storage_root() -> Path:
     return root
 
 
+def configured_workspace_storage_backend() -> str:
+    configured = os.getenv("NIE_ENGINEERING_STORAGE_BACKEND", "").strip().casefold()
+    return configured or ("supabase" if is_production() else "local")
+
+
 class WorkspaceManager:
     def __init__(self, repository: EngineeringWorkspaceRepository):
         self.repository = repository
@@ -66,8 +72,6 @@ class WorkspaceManager:
             request.conversation_id, owner_id
         ):
             raise WorkspaceError("CONVERSATION_NOT_FOUND", 404)
-        root = workspace_storage_root()
-        owner_bucket = hashlib.sha256(owner_id.encode("utf-8")).hexdigest()[:20]
         workspace_id = f"ews_{uuid.uuid4().hex}"
         slug = _slugify(request.name)
         configured_runner = (
@@ -77,23 +81,40 @@ class WorkspaceManager:
             "docker": "DOCKER",
             "vercel_sandbox": "VERCEL_SANDBOX",
         }.get(configured_runner, "LOCAL_DEVELOPMENT")
-        workspace_root = (root / owner_bucket / workspace_id).resolve()
-        if root not in workspace_root.parents:
-            raise WorkspaceError("WORKSPACE_PATH_INVALID")
-        workspace_root.mkdir(parents=True, exist_ok=False)
+        storage_backend = configured_workspace_storage_backend()
+        workspace_root: Path | None = None
+        if storage_backend == "local":
+            root = workspace_storage_root()
+            owner_bucket = hashlib.sha256(owner_id.encode("utf-8")).hexdigest()[:20]
+            workspace_root = (root / owner_bucket / workspace_id).resolve()
+            if root not in workspace_root.parents:
+                raise WorkspaceError("WORKSPACE_PATH_INVALID")
+            workspace_root.mkdir(parents=True, exist_ok=False)
+            storage_locator = str(workspace_root)
+            model_storage_backend = "LOCAL"
+        elif storage_backend == "supabase":
+            bucket = os.getenv("NIE_ENGINEERING_STORAGE_BUCKET", "engineering-workspaces").strip()
+            storage_locator = f"supabase://{bucket}/{workspace_id}"
+            model_storage_backend = "SUPABASE"
+        else:
+            raise WorkspaceError("WORKSPACE_STORAGE_BACKEND_INVALID", 503)
         record = EngineeringWorkspace(
             workspace_id=workspace_id,
             owner_id=owner_id,
             name=request.name.strip(),
             slug=slug,
-            root_path=str(workspace_root),
+            root_path=storage_locator,
+            storage_backend=model_storage_backend,
+            storage_revision=0,
+            storage_manifest_sha256=hashlib.sha256(b"").hexdigest(),
             runtime_type=runtime_type,
             metadata_json=request.metadata,
         )
         try:
             await self.repository.create_workspace(record, request.conversation_id)
         except Exception:
-            shutil.rmtree(workspace_root, ignore_errors=True)
+            if workspace_root is not None:
+                shutil.rmtree(workspace_root, ignore_errors=True)
             raise
         return await self.response(record)
 
@@ -103,12 +124,19 @@ class WorkspaceManager:
             raise WorkspaceError("WORKSPACE_NOT_FOUND", 404)
         if active and workspace.status != "ACTIVE":
             raise WorkspaceError("WORKSPACE_NOT_ACTIVE", 409)
-        root = Path(workspace.root_path).resolve()
-        storage_root = workspace_storage_root()
-        if storage_root != root and storage_root not in root.parents:
-            raise WorkspaceError("WORKSPACE_ROOT_INVALID", 500)
-        if not root.is_dir():
-            raise WorkspaceError("WORKSPACE_ROOT_UNAVAILABLE", 503)
+        storage_backend = str(getattr(workspace, "storage_backend", "LOCAL") or "LOCAL").upper()
+        if storage_backend == "LOCAL":
+            root = Path(workspace.root_path).resolve()
+            storage_root = workspace_storage_root()
+            if storage_root != root and storage_root not in root.parents:
+                raise WorkspaceError("WORKSPACE_ROOT_INVALID", 500)
+            if not root.is_dir():
+                raise WorkspaceError("WORKSPACE_ROOT_UNAVAILABLE", 503)
+        elif storage_backend == "SUPABASE":
+            if configured_workspace_storage_backend() != "supabase":
+                raise WorkspaceError("WORKSPACE_STORAGE_BACKEND_UNAVAILABLE", 503)
+        else:
+            raise WorkspaceError("WORKSPACE_STORAGE_BACKEND_INVALID", 503)
         return workspace
 
     async def list(self, owner_id: str, include_archived: bool = False) -> list[WorkspaceResponse]:

@@ -12,17 +12,11 @@ services:
     startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT --workers 1
     healthCheckPath: /health
     maxShutdownDelaySeconds: 60
-    disk:
-      name: napstertec-engineering-staging-storage
-      mountPath: /opt/render/project/src/storage
-      sizeGB: 1
     envVars:
       - key: NIE_ENV
         value: staging
       - key: DATABASE_URL
-        fromDatabase:
-          name: napstertec-engine-staging-db
-          property: connectionString
+        sync: false
       - key: NIE_TRUSTED_FRONTEND_ORIGINS
         sync: false
       - key: FIREBASE_PROJECT_ID
@@ -39,8 +33,18 @@ services:
         value: "false"
       - key: NIE_ENGINEERING_OWNER_ONLY
         value: "true"
-      - key: NIE_ENGINEERING_WORKSPACE_ROOT
-        value: /opt/render/project/src/storage/engineering_workspaces
+      - key: NIE_ENGINEERING_ALLOWED_FIREBASE_UIDS
+        sync: false
+      - key: NIE_ENGINEERING_STORAGE_BACKEND
+        value: supabase
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: NIE_ENGINEERING_STORAGE_BUCKET
+        value: engineering-workspaces
+      - key: NIE_ENGINEERING_STORAGE_TIMEOUT_SECONDS
+        value: "30"
       - key: NIE_ENGINEERING_RUNNER
         value: vercel_sandbox
       - key: VERCEL_TOKEN
@@ -79,17 +83,3 @@ services:
         value: "1"
       - key: NIE_ENGINEERING_MAX_CONCURRENT_EXECUTIONS
         value: "1"
-      - key: NIE_ENGINEERING_CPU_LIMIT
-        value: "1"
-      - key: NIE_ENGINEERING_MEMORY_LIMIT
-        value: 512m
-      - key: NIE_ENGINEERING_PROCESS_LIMIT
-        value: "64"
-
-databases:
-  - name: napstertec-engine-staging-db
-    plan: free
-    region: oregon
-    databaseName: napstertec_engine_staging
-    user: napstertec_engine_staging
-    ipAllowList: []

@@ -2,11 +2,48 @@ import os
 import unittest
 from unittest.mock import patch
 
+from app.models.engineering_workspace import WorkspaceFileChange, WorkspaceStagedObject
 from scripts.validate_engineering_staging import validate as validate_staging
 from scripts.verify_engineering_postgres import _validate_disposable_url
 
 
 class EngineeringPostgresVerifierTests(unittest.TestCase):
+    def test_orm_metadata_keeps_file_change_and_staged_object_schemas_separate(self):
+        self.assertEqual(
+            {
+                "change_id",
+                "execution_id",
+                "workspace_id",
+                "relative_path",
+                "operation",
+                "bytes_before",
+                "bytes_after",
+                "content_sha256",
+                "created_at",
+            },
+            set(WorkspaceFileChange.__table__.columns.keys()),
+        )
+        self.assertEqual(
+            {
+                "staging_id",
+                "workspace_id",
+                "owner_id",
+                "execution_id",
+                "storage_object_key",
+                "content_sha256",
+                "size_bytes",
+                "status",
+                "created_at",
+                "updated_at",
+                "cleaned_at",
+            },
+            set(WorkspaceStagedObject.__table__.columns.keys()),
+        )
+        self.assertIn(
+            "ck_engineering_staged_object_status",
+            {constraint.name for constraint in WorkspaceStagedObject.__table__.constraints},
+        )
+
     def test_staging_files_have_fail_closed_required_configuration(self):
         validate_staging()
 

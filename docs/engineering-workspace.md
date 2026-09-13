@@ -1,6 +1,6 @@
 # Engineering Workspace
 
-Engineering mode is an authenticated, user-scoped execution control plane for Standard Chat. A Firebase ID token is verified by NIE for browser calls and the resulting UID becomes the server-controlled workspace owner ID. Existing Director sessions remain compatible, but Engineering mode does not require Executive OS and never accepts a client-supplied owner ID. It stores ownership and execution evidence in PostgreSQL and stores project files beneath `NIE_ENGINEERING_WORKSPACE_ROOT`.
+Engineering mode is an authenticated, user-scoped execution control plane for Standard Chat. A Firebase ID token is verified by NIE for browser calls and the resulting UID becomes the server-controlled workspace owner ID. Existing Director sessions remain compatible, but Engineering mode does not require Executive OS and never accepts a client-supplied owner ID. PostgreSQL is authoritative for ownership, revisions, manifests, and execution evidence. Render deployments store immutable file objects in a private Supabase Storage bucket; `NIE_ENGINEERING_WORKSPACE_ROOT` is development-only.
 
 When Standard Chat has a Firebase identity, its memory requests use the same verified UID. A conversation can be linked to a workspace only when the persisted conversation owner matches the authenticated workspace owner. Legacy anonymous chat remains isolated under the non-execution `local_user` profile; it cannot authorize Engineering APIs or be attached to an authenticated user's workspace.
 
@@ -17,11 +17,13 @@ Authorization is controlled by `NIE_ENGINEERING_MODE_ENABLED`. `NIE_ENGINEERING_
 ## Staging and production
 
 Staging uses the official Vercel Sandbox Python SDK through
-`VercelSandboxRunner`. A staging-only mounted Render disk remains the durable
-file source. Each command synchronizes a bounded content manifest into a fresh
-microVM and back under an optimistic content revision. Network is deny-all by
-default. See `docs/engineering-staging.md` for exact resource setup and
-activation order.
+`VercelSandboxRunner` and private Supabase Storage through
+`SupabaseWorkspaceStorage`. Each command downloads the PostgreSQL-authorized
+manifest into a fresh microVM, uploads changed content under immutable keys,
+and switches the manifest in one locked PostgreSQL transaction only when the
+original revision is current. Network is deny-all by default. Render's
+ephemeral filesystem is never authoritative. See `docs/engineering-staging.md`
+for exact setup and activation order.
 
 The Docker runner remains available for a future self-hosted production runner.
 Build the image with:
@@ -32,11 +34,11 @@ docker build -f docker/engineering-runner.Dockerfile -t napstertec-engineering-r
 
 On a trusted Docker host, configure `NIE_ENGINEERING_RUNNER=docker`. The runner uses a non-root user, a read-only base filesystem, no network by default, bounded CPU/memory/PIDs, a disposable container, and only the selected workspace bind-mounted at `/workspace`. Never mount the Docker socket into the runner container.
 
-Sandbox-local and serverless filesystems are not authoritative workspace
-storage. A horizontally scaled production control plane additionally requires
-shared object storage (or equivalent), a distributed workspace lock, and shared
-execution admission control. Staging is intentionally one API worker because
-its file lock is process-local.
+Sandbox-local, Render-local, and serverless filesystems are not authoritative
+workspace storage. PostgreSQL row locking supplies cross-process optimistic
+revision protection; Supabase Storage supplies durable bytes. Shared execution
+admission control is still required before horizontally scaling API workers, so
+staging remains one worker.
 
 Dependency installation is separately classified, requires an explicit authenticated owner approval, and is audited. Remote Git operations, shell interpreters, system administration, broad deletion, and host paths are forbidden.
 

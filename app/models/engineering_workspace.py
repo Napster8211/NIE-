@@ -3,7 +3,19 @@
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import JSON, CheckConstraint, Column, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import (
+    JSON,
+    BigInteger,
+    CheckConstraint,
+    Column,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import relationship
 
 from app.database import Base
@@ -25,6 +37,11 @@ class EngineeringWorkspace(Base):
     name = Column(String(160), nullable=False)
     slug = Column(String(180), nullable=False)
     root_path = Column(Text, nullable=False, unique=True)
+    storage_backend = Column(String(32), nullable=False, default="LOCAL")
+    storage_revision = Column(BigInteger, nullable=False, default=0)
+    storage_manifest_sha256 = Column(
+        String(64), nullable=False, default="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    )
     status = Column(String(32), nullable=False, default="ACTIVE", index=True)
     runtime_type = Column(String(32), nullable=False, default="LOCAL_DEVELOPMENT")
     created_at = Column(DateTime(timezone=True), nullable=False, default=_now)
@@ -42,6 +59,12 @@ class EngineeringWorkspace(Base):
         CheckConstraint(
             "runtime_type IN ('LOCAL_DEVELOPMENT', 'DOCKER', 'VERCEL_SANDBOX')",
             name="ck_engineering_workspace_runtime_type",
+        ),
+        CheckConstraint("storage_backend IN ('LOCAL', 'SUPABASE')", name="ck_engineering_workspace_storage_backend"),
+        CheckConstraint("storage_revision >= 0", name="ck_engineering_workspace_storage_revision"),
+        CheckConstraint(
+            "length(storage_manifest_sha256) = 64",
+            name="ck_engineering_workspace_manifest_sha256",
         ),
     )
 
@@ -135,6 +158,65 @@ class WorkspaceFileChange(Base):
     __table_args__ = (
         CheckConstraint("bytes_before >= 0", name="ck_workspace_file_change_bytes_before"),
         CheckConstraint("bytes_after >= 0", name="ck_workspace_file_change_bytes_after"),
+    )
+
+
+class WorkspaceFileObject(Base):
+    """Authoritative logical-path to immutable-object mapping for one workspace."""
+
+    __tablename__ = "engineering_workspace_files"
+
+    file_id = Column(String, primary_key=True, default=lambda: _id("ewf"))
+    workspace_id = Column(
+        String, ForeignKey("engineering_workspaces.workspace_id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    owner_id = Column(String, nullable=False, index=True)
+    logical_path = Column(Text, nullable=False)
+    storage_object_key = Column(Text, nullable=False)
+    content_sha256 = Column(String(64), nullable=False)
+    size_bytes = Column(BigInteger, nullable=False)
+    revision = Column(BigInteger, nullable=False)
+    execution_id = Column(String, ForeignKey("tool_executions.execution_id", ondelete="SET NULL"), nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=_now)
+    updated_at = Column(DateTime(timezone=True), nullable=False, default=_now, onupdate=_now)
+
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "logical_path", name="uq_engineering_workspace_file_path"),
+        CheckConstraint("size_bytes >= 0", name="ck_engineering_workspace_file_size"),
+        CheckConstraint("revision >= 0", name="ck_engineering_workspace_file_revision"),
+        CheckConstraint("length(content_sha256) = 64", name="ck_engineering_workspace_file_sha256"),
+        Index("ix_engineering_workspace_files_owner_workspace", "owner_id", "workspace_id"),
+        Index("ix_engineering_workspace_files_workspace_revision", "workspace_id", "revision"),
+    )
+
+
+class WorkspaceStagedObject(Base):
+    """Tracks uploaded objects that need safe commit or explicit garbage collection."""
+
+    __tablename__ = "engineering_workspace_staged_objects"
+
+    staging_id = Column(String, primary_key=True, default=lambda: _id("ewsobj"))
+    workspace_id = Column(
+        String, ForeignKey("engineering_workspaces.workspace_id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    owner_id = Column(String, nullable=False, index=True)
+    execution_id = Column(String, ForeignKey("tool_executions.execution_id", ondelete="SET NULL"), nullable=True)
+    storage_object_key = Column(Text, nullable=False, unique=True)
+    content_sha256 = Column(String(64), nullable=False)
+    size_bytes = Column(BigInteger, nullable=False)
+    status = Column(String(32), nullable=False, default="PENDING", index=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=_now)
+    updated_at = Column(DateTime(timezone=True), nullable=False, default=_now, onupdate=_now)
+    cleaned_at = Column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        CheckConstraint("size_bytes >= 0", name="ck_engineering_staged_object_size"),
+        CheckConstraint("length(content_sha256) = 64", name="ck_engineering_staged_object_sha256"),
+        CheckConstraint(
+            "status IN ('PENDING', 'COMMITTED', 'CLEANED', 'CLEANUP_FAILED')",
+            name="ck_engineering_staged_object_status",
+        ),
+        Index("ix_engineering_staged_objects_workspace_status", "workspace_id", "status"),
     )
 
 

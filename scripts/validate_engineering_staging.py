@@ -14,7 +14,11 @@ REQUIRED_NAMES = {
     "NIE_TRUSTED_FRONTEND_ORIGINS",
     "NIE_ENGINEERING_MODE_ENABLED",
     "NIE_ENGINEERING_OWNER_ONLY",
-    "NIE_ENGINEERING_WORKSPACE_ROOT",
+    "NIE_ENGINEERING_STORAGE_BACKEND",
+    "SUPABASE_URL",
+    "SUPABASE_SERVICE_ROLE_KEY",
+    "NIE_ENGINEERING_STORAGE_BUCKET",
+    "NIE_ENGINEERING_STORAGE_TIMEOUT_SECONDS",
     "NIE_ENGINEERING_RUNNER",
     "NIE_ENGINEERING_MAX_CONCURRENT_EXECUTIONS",
     "NIE_ENGINEERING_MAX_PROCESSES",
@@ -57,6 +61,7 @@ def validate() -> None:
         "NIE_ENGINEERING_RUNNER=vercel_sandbox": template,
         "NIE_ENGINEERING_MODE_ENABLED=false": template,
         "NIE_ENGINEERING_OWNER_ONLY=true": template,
+        "NIE_ENGINEERING_STORAGE_BACKEND=supabase": template,
         "NIE_ENGINEERING_NETWORK_POLICY=deny_all": template,
         "startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT --workers 1": blueprint,
         "healthCheckPath: /health": blueprint,
@@ -67,6 +72,10 @@ def validate() -> None:
         raise RuntimeError(f"STAGING_SAFETY_CONFIGURATION_MISSING:{','.join(missing_safety)}")
     if "NIE_ENGINEERING_MODE_ENABLED=true" in template or "NIE_ENGINEERING_OWNER_ONLY=false" in template:
         raise RuntimeError("STAGING_UNSAFE_DEFAULT")
+    if "NIE_ENGINEERING_WORKSPACE_ROOT" in template or "NIE_ENGINEERING_WORKSPACE_ROOT" in blueprint:
+        raise RuntimeError("STAGING_EPHEMERAL_WORKSPACE_ROOT_FORBIDDEN")
+    if "disk:" in blueprint:
+        raise RuntimeError("STAGING_RENDER_DISK_MUST_NOT_BE_REQUIRED")
 
 
 if __name__ == "__main__":

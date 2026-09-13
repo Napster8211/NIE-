@@ -24,8 +24,10 @@ from app.services.engineering_workspace_service import FileOperationResult
 from app.services.engineering_workspace_storage import (
     LocalDurableWorkspaceStorage,
     WorkspaceSnapshot,
-    WorkspaceStorage,
+    WorkspaceStorageBackend,
     WorkspaceStorageError,
+    capture_workspace,
+    reconcile_workspace,
 )
 
 SANDBOX_ROOT = "/vercel/sandbox/workspace"
@@ -316,7 +318,7 @@ class VercelSandboxRunner(CommandRunner):
         self,
         *,
         client: SandboxClient | None = None,
-        storage: WorkspaceStorage | None = None,
+        storage: WorkspaceStorageBackend | None = None,
         settings: VercelSandboxSettings | None = None,
     ):
         self.settings = settings or VercelSandboxSettings.from_environment()
@@ -365,16 +367,16 @@ class VercelSandboxRunner(CommandRunner):
         return selected, truncated
 
     async def run(
-        self, execution_id: str, root_path: str, command: CommandInput, policy: PolicyDecision
+        self, execution_id: str, workspace: Any, command: CommandInput, policy: PolicyDecision
     ) -> FileOperationResult:
         async with self._slots:
-            return await self._run_one(execution_id, root_path, command, policy)
+            return await self._run_one(execution_id, workspace, command, policy)
 
     async def _run_one(
-        self, execution_id: str, root_path: str, command: CommandInput, policy: PolicyDecision
+        self, execution_id: str, workspace: Any, command: CommandInput, policy: PolicyDecision
     ) -> FileOperationResult:
         snapshot = await asyncio.wait_for(
-            asyncio.to_thread(self.storage.capture, root_path),
+            capture_workspace(self.storage, workspace),
             timeout=self.settings.synchronization_timeout_seconds,
         )
         request = SandboxCreateRequest(
@@ -418,7 +420,7 @@ class VercelSandboxRunner(CommandRunner):
             returned = await asyncio.wait_for(session.download(), timeout=self.settings.synchronization_timeout_seconds)
             stage = "synchronize"
             synchronized = await asyncio.wait_for(
-                asyncio.to_thread(self.storage.reconcile, root_path, snapshot.revision, returned),
+                reconcile_workspace(self.storage, workspace, execution_id, snapshot.revision, returned),
                 timeout=self.settings.synchronization_timeout_seconds,
             )
             stdout, stdout_truncated = self._bounded_output(command_result.stdout, command.max_output_bytes)
@@ -426,7 +428,6 @@ class VercelSandboxRunner(CommandRunner):
             reference = hashlib.sha256(session.identifier.encode("utf-8")).hexdigest()[:20]
             provider_metadata = {
                 "provider": "vercel_sandbox",
-                "sandbox_name": session.identifier,
                 "sandbox_reference": reference,
                 "network_enabled": bool(request.network_allowed_hosts),
                 "network_policy": "allowlist" if request.network_allowed_hosts else "deny_all",
@@ -450,6 +451,7 @@ class VercelSandboxRunner(CommandRunner):
                 stdout=stdout,
                 stderr=stderr,
                 exit_code=command_result.exit_code,
+                changes_persisted=bool(getattr(self.storage, "is_async", False)),
             )
             if command_result.exit_code != 0:
                 raise ToolExecutionError(
@@ -480,7 +482,7 @@ class VercelSandboxRunner(CommandRunner):
             try:
                 await asyncio.wait_for(session.close(), timeout=self.settings.cleanup_timeout_seconds)
             except BaseException as exc:
-                raise ToolExecutionError("VERCEL_SANDBOX_CLEANUP_FAILED") from exc
+                raise ToolExecutionError("VERCEL_SANDBOX_CLEANUP_FAILED", result=result) from exc
             session = None
             return result
         finally:

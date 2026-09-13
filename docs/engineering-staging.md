@@ -2,18 +2,18 @@
 
 ## Safety boundary
 
-`render.staging.yaml` is a proposal only and disables Engineering mode. It uses a separate PostgreSQL database, a staging-only disk, explicit trusted-origin input, one API worker, and conservative quotas. Do not connect it to production data, OAuth redirects, webhooks, workspaces, or secrets.
+`render.staging.yaml` is a proposal only and disables Engineering mode. It references the owner's existing Supabase PostgreSQL database, a private Supabase Storage bucket, explicit trusted-origin input, one API worker, and conservative quotas. It does not declare a new database. Render's filesystem is temporary only. Do not apply this proposal to the current production service without a separately approved deployment and migration window.
 
 The selected staging runner is the official Python `vercel==0.10.0` SDK behind
 `VercelSandboxRunner`. Render's API process does not run user commands directly
-and is not assumed to provide Docker. The staging-only Render disk is the
-authoritative workspace-file store; PostgreSQL is authoritative for ownership,
+and is not assumed to provide Docker. Supabase Storage is the durable byte store;
+PostgreSQL is authoritative for ownership, logical paths, manifest revisions,
 conversation links, execution evidence, events, and file-change metadata.
 
 Each approved command receives a fresh, non-persistent Vercel Sandbox. A content
 revision and bounded manifest are captured, uploaded to
 `/vercel/sandbox/workspace`, executed as structured argv, downloaded, validated,
-and atomically reconciled only if the durable revision is unchanged. The Sandbox
+and reconciled by atomically switching the PostgreSQL manifest only if the durable revision is unchanged. The Sandbox
 is destroyed after success, failure, or cancellation. Vercel credentials stay in
 the Render control plane and never enter the browser or command environment.
 
@@ -23,12 +23,11 @@ separately reviewed persistent-Sandbox process adapter exists.
 
 ## Pre-deploy checklist
 
-1. Create a separate Vercel staging frontend project, a Vercel project/team for
-   Sandbox access, and a separate Render Blueprint from `render.staging.yaml`.
+1. Select only owner-approved existing Vercel and Render targets. `render.staging.yaml` is configuration input; this work does not create a new Vercel project, Render service, database, Firebase identity, or Supabase project.
 2. Use a separate Firebase project or staging-authorized OAuth configuration. Do not use production redirect URLs.
 3. Enter all `sync: false` values in Render; never commit them.
 4. Set the exact staging Vercel origin in `NIE_TRUSTED_FRONTEND_ORIGINS`.
-5. Confirm the staging database and disk names before Blueprint creation.
+5. Create the private `engineering-workspaces` bucket in the existing Supabase project and configure the existing Supabase PostgreSQL `DATABASE_URL`; the Blueprint deliberately does not create another database or Supabase project.
 6. Validate the Blueprint with Render CLI 2.7 or later.
 7. Run `python scripts/verify_engineering_postgres.py` against a disposable
    database before the first staging migration. Set
@@ -39,6 +38,15 @@ separately reviewed persistent-Sandbox process adapter exists.
    `NIE_RUN_VERCEL_SANDBOX_SMOKE=YES`. Confirm network-off default, limits,
    cancellation, secret isolation, synchronization, and Sandbox destruction.
 10. Enable Engineering mode for `NIE_OWNER_FIREBASE_UIDS` only; do not populate the general-user allowlist.
+
+## Private Supabase Storage setup
+
+1. In the existing Supabase project, create a bucket named `engineering-workspaces`.
+2. Keep **Public bucket** disabled. Do not create public URLs or browser upload policies.
+3. Set a bucket file-size ceiling at or below `NIE_ENGINEERING_MAX_FILE_BYTES`; allow `application/octet-stream` because workspace content types vary.
+4. Configure `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` only on Render. The service-role key bypasses Storage RLS and must never be placed in Vite, Vercel frontend variables, Sandbox environments, logs, or responses.
+5. Set `NIE_ENGINEERING_STORAGE_BACKEND=supabase` and `NIE_ENGINEERING_STORAGE_BUCKET=engineering-workspaces`. Do not set `NIE_ENGINEERING_WORKSPACE_ROOT` on Render.
+6. Use `python scripts/cleanup_engineering_staged_objects.py` for database-recorded `PENDING` or `CLEANUP_FAILED` keys only. It requires `NIE_ENGINEERING_STAGED_CLEANUP_CONFIRM=YES`; `NIE_ENGINEERING_STAGED_CLEANUP_MIN_AGE_SECONDS` defaults to 3600 (and cannot be below 300), while `NIE_ENGINEERING_STAGED_CLEANUP_LIMIT` bounds each run. Recent active executions are excluded, stale abandoned executions become eligible, and the job never performs uncontrolled prefix deletion.
 
 ## Server-side Vercel Sandbox configuration
 
@@ -84,19 +92,19 @@ $env:NIE_TEST_POSTGRES_CONFIRM_DISPOSABLE='YES'
 .\.venv\Scripts\python.exe scripts\verify_engineering_postgres.py
 ```
 
-The verifier applies the migration repeatedly, checks real tables, columns,
-indexes, constraints and foreign keys, writes all six record types, reconnects,
+The verifier applies migrations 001 and 002 repeatedly, checks real tables,
+columns, indexes, constraints and foreign keys, writes all eight record types, reconnects,
 reads the evidence, verifies cascade cleanup, and drops only its unique schema.
 Missing PostgreSQL fails explicitly; SQLite and mocks are not substitutes.
 
 ## Deployment order
 
-1. Create separate staging identity, PostgreSQL, Render disk, Vercel frontend,
-   Vercel Sandbox project/team, and scoped server-side token.
+1. Confirm the existing Firebase identity, existing Supabase PostgreSQL target,
+   Vercel frontend/Sandbox project, private Supabase bucket, and scoped server-side credentials. No new identity, database, or frontend project is required.
 2. Run the disposable PostgreSQL verifier.
 3. Configure Render staging with Engineering mode disabled and deploy the API.
-4. Apply migration 001 through the Render pre-deploy command.
-5. Confirm `/health` reports staging and a configured `vercel_sandbox` runner.
+4. Apply migrations 001 and 002 through the Render pre-deploy command.
+5. Confirm `/health` reports PostgreSQL ready, Supabase configured/reachable, and a configured `vercel_sandbox` runner.
 6. Run the explicitly opted-in one-Sandbox smoke test.
 7. Deploy the separate frontend pointed only to the staging API.
 8. Verify identity, ordinary chat, CORS, cookies, and anonymous/second-user denial.
@@ -119,9 +127,9 @@ Missing PostgreSQL fails explicitly; SQLite and mocks are not substitutes.
 
 1. Set `NIE_ENGINEERING_MODE_ENABLED=false` first and redeploy the staging API.
 2. Stop the isolated staging runner and cancel active staging executions.
-3. Preserve the staging database and disk for forensic review; do not delete data during incident response.
+3. Preserve the staging database and private bucket for forensic review; do not delete data during incident response.
 4. Roll the Vercel staging project and Render staging service back to the last known-good staging deployment.
-5. Restore database state only from a staging backup when a schema rollback has been separately reviewed. Migration 001 has no automatic destructive down migration.
+5. Restore database state only from a staging backup when separately reviewed. Migrations 001 and 002 are forward-only; disabling Engineering mode is the safe rollback.
 
 ## Manual browser verification
 
