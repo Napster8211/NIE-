@@ -1,3 +1,5 @@
+import os
+
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import select
@@ -16,13 +18,34 @@ router = APIRouter(prefix="/api/v1/memory", tags=["Memory"])
 _optional_bearer = HTTPBearer(auto_error=False)
 
 
+def _uid_set(name: str) -> set[str]:
+    return {item.strip() for item in os.getenv(name, "").split(",") if item.strip()}
+
+
+def memory_owner_ids(owner_id: str) -> tuple[str, ...]:
+    """Return the verified owner's bounded conversation ownership scope.
+
+    Before browser identity existed, Standard Chat stored the single user's
+    conversations under ``local_user``.  Only a uniquely configured NIE owner
+    may access that legacy namespace; ordinary Firebase users remain isolated
+    to their own server-derived owner ID.
+    """
+    if not owner_id.startswith("firebase:"):
+        return (owner_id,)
+    uid = owner_id.removeprefix("firebase:")
+    owner_uids = _uid_set("NIE_OWNER_FIREBASE_UIDS")
+    if len(owner_uids) == 1 and uid in owner_uids:
+        return (owner_id, "local_user")
+    return (owner_id,)
+
+
 async def resolve_memory_owner(
     request: Request,
     credentials: HTTPAuthorizationCredentials | None = Depends(_optional_bearer),
 ) -> str:
-    """Use verified browser identity when present; preserve legacy anonymous chat only."""
+    """Resolve Standard Chat ownership only from a verified Firebase identity."""
     if credentials is None:
-        return "local_user"
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="CHAT_AUTH_REQUIRED")
     try:
         validate_trusted_origin(request)
         identity = await verify_firebase_identity(credentials.credentials, error_prefix="CHAT")
@@ -50,7 +73,9 @@ async def list_conversations(
     owner_id: str = Depends(resolve_memory_owner),
 ):
     result = await db.execute(
-        select(Conversation).where(Conversation.user_id == owner_id).order_by(Conversation.updated_at.desc())
+        select(Conversation)
+        .where(Conversation.user_id.in_(memory_owner_ids(owner_id)))
+        .order_by(Conversation.updated_at.desc())
     )
     return result.scalars().all()
 
@@ -66,7 +91,7 @@ async def add_message(
     result = await db.execute(
         select(Conversation).where(
             Conversation.id == conversation_id,
-            Conversation.user_id == owner_id,
+            Conversation.user_id.in_(memory_owner_ids(owner_id)),
         )
     )
     conversation = result.scalars().first()
@@ -105,7 +130,7 @@ async def get_messages(
     conversation = await db.execute(
         select(Conversation.id).where(
             Conversation.id == conversation_id,
-            Conversation.user_id == owner_id,
+            Conversation.user_id.in_(memory_owner_ids(owner_id)),
         )
     )
     if conversation.scalar_one_or_none() is None:

@@ -574,8 +574,11 @@ class EngineeringAuthorizationTests(unittest.IsolatedAsyncioTestCase):
             owner_id = await resolve_memory_owner(self.request(), credentials)
         self.assertEqual("firebase:standard-user", owner_id)
 
-    async def test_anonymous_memory_stays_legacy_but_has_no_engineering_access(self):
-        self.assertEqual("local_user", await resolve_memory_owner(self.request(), None))
+    async def test_anonymous_memory_and_engineering_access_are_rejected(self):
+        with self.assertRaises(HTTPException) as memory_error:
+            await resolve_memory_owner(self.request(), None)
+        self.assertEqual(401, memory_error.exception.status_code)
+        self.assertEqual("CHAT_AUTH_REQUIRED", memory_error.exception.detail)
         with patch.dict(
             os.environ,
             {
