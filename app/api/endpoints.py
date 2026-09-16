@@ -720,19 +720,10 @@ class AgentExecutionRequest(BaseModel):
     goal: str = Field(..., description="The objective for the autonomous agent to achieve.")
     session_id: str = Field(default_factory=lambda: str(uuid.uuid4()), description="Unique session identifier.")
 
-class UpdateConversationRequest(BaseModel):
-    title: Optional[str] = None
-    metadata: Optional[Dict[str, Any]] = None
-
 # --- Endpoints ---
 @router.get("/health")
 async def health_check() -> Dict[str, str]:
     return {"status": "online", "engine": "NapsterTec Intelligence Engine (NIE) Active"}
-
-@router.put("/memory/conversations/{conversation_id}")
-async def update_conversation_memory(conversation_id: str, request: Optional[UpdateConversationRequest] = None):
-    logger.info(f"[Memory API] Syncing metadata for conversation: {conversation_id}")
-    return {"status": "success", "conversation_id": conversation_id, "message": "Conversation state synchronized."}
 
 @router.post("/chat")
 async def chat_endpoint(request: ChatRequest, db: AsyncSession = Depends(get_db_session)):

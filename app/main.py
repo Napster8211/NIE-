@@ -16,6 +16,19 @@ if sys.platform == "win32":
 
 logger = logging.getLogger(__name__)
 
+
+class ApplicationCORSMiddleware(CORSMiddleware):
+    """Global CORS wrapper that preserves FastAPI inspection attributes.
+
+    Starlette's server-error middleware sits outside middleware registered with
+    ``add_middleware``. Wrapping the complete FastAPI application ensures even
+    unexpected error responses retain CORS headers for approved origins.
+    """
+
+    def __getattr__(self, name: str):
+        return getattr(self.app, name)
+
+
 # Database and Memory Models
 from sqlalchemy import text
 
@@ -90,15 +103,6 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Configure CORS Middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=list(trusted_frontend_origins()),
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["Accept", "Authorization", "Content-Type", "X-CSRF-Token"],
-)
-
 # Register routers
 app.include_router(api_router, prefix="/api/v1")
 app.include_router(memory_router)
@@ -129,6 +133,17 @@ async def health_check():
         "director_stt": director_speech_service.readiness(),
         "engineering": {**runner_readiness, "storage": await probe_workspace_storage()},
     }
+
+
+# Wrap the complete application so approved-origin CORS headers are also
+# present on errors produced by Starlette's outer server-error boundary.
+app = ApplicationCORSMiddleware(
+    app,
+    allow_origins=list(trusted_frontend_origins()),
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Accept", "Authorization", "Content-Type", "X-CSRF-Token"],
+)
 
 
 if __name__ == "__main__":

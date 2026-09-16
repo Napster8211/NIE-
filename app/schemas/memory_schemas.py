@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 
 # --- Message Schemas ---
@@ -11,7 +11,11 @@ class MessageBase(BaseModel):
     tokens_used: int = 0
     status: str = "COMPLETED"
     correlation_id: str | None = None
-    message_metadata: dict[str, Any] = Field(default_factory=dict, alias="metadata")
+    message_metadata: dict[str, Any] = Field(
+        default_factory=dict,
+        validation_alias=AliasChoices("message_metadata", "metadata"),
+        serialization_alias="metadata",
+    )
 
 
 class MessageCreate(MessageBase):
@@ -32,6 +36,12 @@ class ConversationBase(BaseModel):
 
 
 class ConversationCreate(ConversationBase):
+    model_config = ConfigDict(extra="forbid")
+
+
+class ConversationUpdate(BaseModel):
+    title: str = Field(min_length=1, max_length=255)
+
     model_config = ConfigDict(extra="forbid")
 
 

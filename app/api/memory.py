@@ -7,7 +7,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db_session
 from app.models.memory_models import Conversation, Message
-from app.schemas.memory_schemas import ConversationCreate, ConversationResponse, MessageCreate, MessageResponse
+from app.schemas.memory_schemas import (
+    ConversationCreate,
+    ConversationResponse,
+    ConversationUpdate,
+    MessageCreate,
+    MessageResponse,
+)
 from app.services.director_auth_service import (
     DirectorAuthError,
     validate_trusted_origin,
@@ -78,6 +84,29 @@ async def list_conversations(
         .order_by(Conversation.updated_at.desc())
     )
     return result.scalars().all()
+
+
+@router.put("/conversations/{conversation_id}", response_model=ConversationResponse)
+async def update_conversation(
+    conversation_id: str,
+    update: ConversationUpdate,
+    db: AsyncSession = Depends(get_db_session),
+    owner_id: str = Depends(resolve_memory_owner),
+):
+    result = await db.execute(
+        select(Conversation).where(
+            Conversation.id == conversation_id,
+            Conversation.user_id.in_(memory_owner_ids(owner_id)),
+        )
+    )
+    conversation = result.scalars().first()
+    if conversation is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
+
+    conversation.title = update.title
+    await db.commit()
+    await db.refresh(conversation)
+    return conversation
 
 
 @router.post("/conversations/{conversation_id}/messages", response_model=MessageResponse)
