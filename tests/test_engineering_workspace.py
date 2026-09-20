@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import re
 import tempfile
@@ -127,6 +128,17 @@ class MemoryEngineeringRepository:
         event = SimpleNamespace(sequence=len(items) + 1, event_type=event_type, payload=payload)
         items.append(event)
         return event
+
+    async def get_execution(self, execution_id, workspace_id, owner_id):
+        execution = self.executions.get(execution_id)
+        if execution is None:
+            return None
+        if execution.workspace_id != workspace_id or execution.owner_id != owner_id:
+            return None
+        return execution
+
+    async def list_events(self, execution_id):
+        return list(self.events.get(execution_id, []))
 
     async def add_file_change(self, **values):
         self.file_changes.append(values)
@@ -510,6 +522,216 @@ class EngineeringWorkspaceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1, len(terminals))
         self.assertEqual("message.completed", terminals[0][0])
         self.assertEqual(1, len(terminals[0][1]["evidence_execution_ids"]))
+
+    async def test_empty_workspace_hello_maps_tool_call_to_durable_list_evidence(self):
+        prompts = []
+
+        async def model(prompt):
+            prompts.append(prompt)
+            if len(prompts) == 1:
+                return (
+                    '{"type":"tool_calls","calls":[{"call_id":"list_workspace","name":"filesystem.list",'
+                    '"arguments":{"path":""}}]}',
+                    {"provider": "fake"},
+                )
+            match = re.search(r'"evidence_execution_id":"(tex_[a-f0-9]+)"', prompt)
+            self.assertIsNotNone(match)
+            self.assertIn('"call_id":"list_workspace"', prompt)
+            return (
+                '{"type":"final","content":"Hello. The empty workspace is ready.",'
+                f'"evidence_execution_ids":["{match.group(1)}"]' + "}",
+                {"provider": "fake"},
+            )
+
+        events = []
+        async for event in EngineeringChatService(self.execution, model).run(
+            workspace=self.record,
+            owner_id="owner-a",
+            prompt="hello",
+            conversation_id="conversation-a",
+            max_iterations=3,
+            correlation_id="cor_empty_hello",
+        ):
+            events.append(event)
+
+        completed_tool = next(payload for event, payload in events if event == "tool.completed")
+        completed_message = next(payload for event, payload in events if event == "message.completed")
+        self.assertEqual("filesystem.list", completed_tool["tool_name"])
+        self.assertEqual([], completed_tool["data"]["entries"])
+        self.assertEqual([completed_tool["execution_id"]], completed_message["evidence_execution_ids"])
+
+    async def test_several_successful_tool_calls_are_durable_evidence(self):
+        calls = 0
+
+        async def model(prompt):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return (
+                    '{"type":"tool_calls","calls":['
+                    '{"call_id":"list","name":"filesystem.list","arguments":{"path":""}},'
+                    '{"call_id":"search","name":"search.files","arguments":{"query":"missing","path":""}}]}',
+                    {"provider": "fake"},
+                )
+            evidence_ids = re.findall(r'"evidence_execution_id":"(tex_[a-f0-9]+)"', prompt)
+            self.assertEqual(2, len(evidence_ids))
+            return (
+                '{"type":"final","content":"The workspace inspection completed.","evidence_execution_ids":'
+                + json.dumps(evidence_ids)
+                + "}",
+                {"provider": "fake"},
+            )
+
+        events = []
+        async for event in EngineeringChatService(self.execution, model).run(
+            workspace=self.record,
+            owner_id="owner-a",
+            prompt="Inspect the workspace",
+            conversation_id="conversation-a",
+            max_iterations=3,
+            correlation_id="cor_multiple",
+        ):
+            events.append(event)
+        self.assertEqual(2, sum(event == "tool.completed" for event, _ in events))
+        terminal = next(payload for event, payload in events if event == "message.completed")
+        self.assertEqual(2, len(terminal["evidence_execution_ids"]))
+
+    async def test_failed_tool_is_not_eligible_evidence(self):
+        calls = 0
+
+        async def model(_prompt):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return (
+                    '{"type":"tool_calls","calls":[{"call_id":"missing","name":"filesystem.read",'
+                    '"arguments":{"path":"missing.txt"}}]}',
+                    {"provider": "fake"},
+                )
+            return (
+                '{"type":"final","content":"The requested file is unavailable.","evidence_execution_ids":[]}',
+                {"provider": "fake"},
+            )
+
+        events = []
+        async for event in EngineeringChatService(self.execution, model).run(
+            workspace=self.record,
+            owner_id="owner-a",
+            prompt="Read missing.txt",
+            conversation_id="conversation-a",
+            max_iterations=3,
+            correlation_id="cor_failed",
+        ):
+            events.append(event)
+        self.assertEqual(1, sum(event == "tool.failed" for event, _ in events))
+        terminal = next(payload for event, payload in events if event == "message.completed")
+        self.assertEqual([], terminal["evidence_execution_ids"])
+
+    async def test_tool_call_id_is_not_an_evidence_execution_id(self):
+        replies = [
+            '{"type":"tool_calls","calls":[{"call_id":"list_workspace","name":"filesystem.list",'
+            '"arguments":{"path":""}}]}',
+            '{"type":"final","content":"Workspace inspected.","evidence_execution_ids":["list_workspace"]}',
+        ]
+
+        async def model(_prompt):
+            return replies.pop(0), {"provider": "fake"}
+
+        with self.assertRaisesRegex(EngineeringChatError, "ENGINEERING_EVIDENCE_REFERENCE_INVALID"):
+            async for _ in EngineeringChatService(self.execution, model).run(
+                workspace=self.record,
+                owner_id="owner-a",
+                prompt="hello",
+                conversation_id="conversation-a",
+                max_iterations=3,
+                correlation_id="cor_wrong_identifier_type",
+            ):
+                pass
+
+    async def test_duplicate_and_nonexistent_evidence_references_fail_closed(self):
+        result = await self.execute("filesystem.list", {})
+        service = EngineeringChatService(self.execution, AsyncMock())
+        for references, successful in (
+            ([result.execution_id, result.execution_id], {result.execution_id}),
+            (["tex_does_not_exist"], {"tex_does_not_exist"}),
+        ):
+            with self.subTest(references=references):
+                with self.assertRaisesRegex(EngineeringChatError, "ENGINEERING_EVIDENCE_REFERENCE_INVALID"):
+                    await service._validate_evidence_references(
+                        execution_ids=references,
+                        successful_ids=successful,
+                        workspace_id=self.record.workspace_id,
+                        owner_id="owner-a",
+                        conversation_id="conversation-a",
+                        correlation_id="cor_test",
+                    )
+
+    async def test_cross_execution_owner_and_workspace_evidence_fail_closed(self):
+        result = await self.execute("filesystem.list", {})
+        service = EngineeringChatService(self.execution, AsyncMock())
+        cases = (
+            {"workspace_id": self.record.workspace_id, "owner_id": "owner-a", "correlation_id": "cor_other"},
+            {"workspace_id": self.record.workspace_id, "owner_id": "owner-b", "correlation_id": "cor_test"},
+            {"workspace_id": "ws_other", "owner_id": "owner-a", "correlation_id": "cor_test"},
+        )
+        for case in cases:
+            with self.subTest(case=case):
+                with self.assertRaisesRegex(EngineeringChatError, "ENGINEERING_EVIDENCE_REFERENCE_INVALID"):
+                    await service._validate_evidence_references(
+                        execution_ids=[result.execution_id],
+                        successful_ids={result.execution_id},
+                        conversation_id="conversation-a",
+                        **case,
+                    )
+
+    async def test_lost_database_commit_acknowledgement_never_emits_completed_evidence(self):
+        calls = 0
+
+        async def model(_prompt):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return (
+                    '{"type":"tool_calls","calls":[{"call_id":"list","name":"filesystem.list",'
+                    '"arguments":{"path":""}}]}',
+                    {"provider": "fake"},
+                )
+            return (
+                '{"type":"final","content":"Evidence persistence could not be confirmed.","evidence_execution_ids":[]}',
+                {"provider": "fake"},
+            )
+
+        with patch.object(self.repository, "get_execution", AsyncMock(return_value=None)):
+            events = []
+            async for event in EngineeringChatService(self.execution, model).run(
+                workspace=self.record,
+                owner_id="owner-a",
+                prompt="hello",
+                conversation_id="conversation-a",
+                max_iterations=3,
+                correlation_id="cor_lost_ack",
+            ):
+                events.append(event)
+        failed = next(payload for event, payload in events if event == "tool.failed")
+        self.assertEqual("SYNC_FAILED", failed["status"])
+        self.assertEqual("ENGINEERING_EVIDENCE_PERSISTENCE_UNCONFIRMED", failed["error_type"])
+        self.assertFalse(failed["evidence_verified"])
+        self.assertFalse(any(event == "tool.completed" for event, _ in events))
+
+    async def test_valid_terminal_completion_occurs_after_durable_execution_and_event(self):
+        result = await self.execute("filesystem.list", {})
+        service = EngineeringChatService(self.execution, AsyncMock())
+        references = await service._validate_evidence_references(
+            execution_ids=[result.execution_id],
+            successful_ids={result.execution_id},
+            workspace_id=self.record.workspace_id,
+            owner_id="owner-a",
+            conversation_id="conversation-a",
+            correlation_id="cor_test",
+        )
+        self.assertEqual({result.execution_id}, references)
+        self.assertEqual("SUCCEEDED", self.repository.executions[result.execution_id].status)
+        self.assertEqual("tool.completed", self.repository.events[result.execution_id][-1].event_type)
 
     async def test_sse_framing_is_typed_and_terminates_blocks(self):
         block = sse_event("message.completed", {"correlation_id": "cor_1", "ok": True}, "cor_1")

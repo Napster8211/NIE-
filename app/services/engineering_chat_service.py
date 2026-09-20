@@ -103,6 +103,8 @@ class EngineeringChatService:
             'Use {"type":"tool_calls","calls":[{"call_id":"...","name":"...","arguments":{...}}]} '
             'when evidence-producing work is required. Use {"type":"final","content":"...",'
             '"evidence_execution_ids":["tex_..."]} only after reviewing tool results. '
+            "Each prior tool result maps the model call_id to a durable evidence_execution_id. "
+            "In final, copy non-null evidence_execution_id values exactly; never use call_id as evidence. "
             "Never claim a file or command succeeded without a successful execution ID. "
             "Request at most four independent tool calls at once. Do not request unknown tools.\n\n"
             f"Workspace ID: {workspace_id}\n"
@@ -110,6 +112,62 @@ class EngineeringChatService:
             f"Prior tool results: {json.dumps(prior_results, separators=(',', ':'), default=str)}\n"
             f"User request: {user_prompt}"
         )
+
+    async def _persisted_execution_is_valid(
+        self,
+        *,
+        execution_id: str,
+        workspace_id: str,
+        owner_id: str,
+        conversation_id: str | None,
+        correlation_id: str,
+    ) -> bool:
+        """Confirm that an execution and its terminal audit event are durable and in scope."""
+
+        try:
+            execution = await self.execution_service.repository.get_execution(
+                execution_id,
+                workspace_id,
+                owner_id,
+            )
+            if execution is None:
+                return False
+            if (
+                execution.status != "SUCCEEDED"
+                or execution.correlation_id != correlation_id
+                or execution.conversation_id != conversation_id
+            ):
+                return False
+            events = await self.execution_service.repository.list_events(execution_id)
+        except Exception:
+            return False
+        return any(event.event_type == "tool.completed" for event in events)
+
+    async def _validate_evidence_references(
+        self,
+        *,
+        execution_ids: list[str],
+        successful_ids: set[str],
+        workspace_id: str,
+        owner_id: str,
+        conversation_id: str | None,
+        correlation_id: str,
+    ) -> set[str]:
+        """Validate final evidence against this stream and durable, owner-scoped records."""
+
+        referenced = set(execution_ids)
+        if len(referenced) != len(execution_ids) or not referenced.issubset(successful_ids):
+            raise EngineeringChatError("ENGINEERING_EVIDENCE_REFERENCE_INVALID")
+        for execution_id in referenced:
+            if not await self._persisted_execution_is_valid(
+                execution_id=execution_id,
+                workspace_id=workspace_id,
+                owner_id=owner_id,
+                conversation_id=conversation_id,
+                correlation_id=correlation_id,
+            ):
+                raise EngineeringChatError("ENGINEERING_EVIDENCE_REFERENCE_INVALID")
+        return referenced
 
     async def run(
         self,
@@ -135,9 +193,14 @@ class EngineeringChatService:
             )
             envelope = self._parse_envelope(raw)
             if envelope.type == "final":
-                referenced = set(envelope.evidence_execution_ids)
-                if not referenced.issubset(successful_ids):
-                    raise EngineeringChatError("ENGINEERING_EVIDENCE_REFERENCE_INVALID")
+                referenced = await self._validate_evidence_references(
+                    execution_ids=envelope.evidence_execution_ids,
+                    successful_ids=successful_ids,
+                    workspace_id=workspace.workspace_id,
+                    owner_id=owner_id,
+                    conversation_id=conversation_id,
+                    correlation_id=correlation,
+                )
                 if self.CLAIM_PATTERN.search(envelope.content) and not referenced:
                     raise EngineeringChatError("ENGINEERING_SUCCESS_CLAIM_UNVERIFIED")
                 yield "message.delta", {"correlation_id": correlation, "content": envelope.content}
@@ -193,13 +256,37 @@ class EngineeringChatService:
                 else:
                     started_task.cancel()
                 result: StructuredToolResult = await execution_task
+                if result.success:
+                    persisted = await self._persisted_execution_is_valid(
+                        execution_id=result.execution_id,
+                        workspace_id=workspace.workspace_id,
+                        owner_id=owner_id,
+                        conversation_id=conversation_id,
+                        correlation_id=correlation,
+                    )
+                    if not persisted:
+                        result = result.model_copy(
+                            update={
+                                "status": "SYNC_FAILED",
+                                "success": False,
+                                "error_type": "ENGINEERING_EVIDENCE_PERSISTENCE_UNCONFIRMED",
+                                "evidence_verified": False,
+                            }
+                        )
+                    else:
+                        successful_ids.add(result.execution_id)
                 event_type = (
                     "tool.completed"
                     if result.success
                     else ("tool.approval_required" if result.status == "APPROVAL_REQUIRED" else "tool.failed")
                 )
-                yield event_type, result.model_dump(mode="json")
-                prior_results.append(result.model_dump(mode="json"))
-                if result.success:
-                    successful_ids.add(result.execution_id)
+                result_payload = result.model_dump(mode="json")
+                yield event_type, result_payload
+                prior_results.append(
+                    {
+                        "call_id": call.call_id,
+                        "evidence_execution_id": result.execution_id if result.success else None,
+                        "result": result_payload,
+                    }
+                )
         raise EngineeringChatError("ENGINEERING_TOOL_ITERATION_LIMIT")
