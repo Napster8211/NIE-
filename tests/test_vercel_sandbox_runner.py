@@ -15,10 +15,15 @@ from app.services.engineering_execution_service import (
     UnavailableCommandRunner,
     build_command_runner,
 )
-from app.services.engineering_workspace_storage import LocalDurableWorkspaceStorage
+from app.services.engineering_workspace_storage import (
+    LocalDurableWorkspaceStorage,
+    WorkspaceSnapshot,
+    WorkspaceStoredFile,
+)
 from app.services.vercel_sandbox_runner import (
     SandboxCommandResult,
     SandboxCreateRequest,
+    VercelPythonPreviewClient,
     VercelPythonSandboxSession,
     VercelSandboxRunner,
     VercelSandboxSettings,
@@ -213,6 +218,22 @@ class VercelSandboxRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(session.closed)
         self.assertNotIn(session.identifier, str(result.data))
         self.assertRegex(result.data["sandbox_reference"], r"^[0-9a-f]{20}$")
+
+    async def test_node_health_check_runs_as_structured_one_shot_command(self):
+        (self.root / "health-check.js").write_text("console.log('HEALTH_CHECK_OK')\n", encoding="utf-8")
+        session = FakeSandboxSession(result=SandboxCommandResult("HEALTH_CHECK_OK\n", "", 0))
+        runner, _ = self.runner(session)
+
+        result = await runner.run(
+            "tex_node_health",
+            str(self.root),
+            CommandInput(argv=["node", "health-check.js"], timeout_seconds=10),
+            PolicyDecision("PROJECT_EXECUTION", True),
+        )
+
+        self.assertEqual(["node", "health-check.js"], session.executed[0])
+        self.assertEqual("HEALTH_CHECK_OK", result.stdout.strip())
+        self.assertEqual(0, result.exit_code)
 
     async def test_stdout_stderr_are_bounded_and_secrets_redacted(self):
         secret = os.environ["TEST_SECRET_TOKEN"]
@@ -427,6 +448,73 @@ class VercelSandboxRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(["stopped", "destroyed", "session_closed"], calls)
         box.stop.assert_awaited_once()
         box.destroy.assert_awaited_once()
+
+    async def test_official_preview_adapter_uses_detached_process_and_declared_port(self):
+        calls = []
+
+        class FakeApiSession:
+            async def __aexit__(self, *_args):
+                calls.append("session_closed")
+
+        class FakeFileSystem:
+            async def mkdir(self, path, recursive=False):
+                calls.append(("mkdir", path, recursive))
+
+            async def write_bytes(self, path, content):
+                calls.append(("write", path, content))
+
+        process = SimpleNamespace(id="process_test")
+        box = SimpleNamespace(
+            name="sandbox_test",
+            routes=[SimpleNamespace(port=5173, system=False, url="https://preview.example.test")],
+            fs=FakeFileSystem(),
+            create_process=AsyncMock(return_value=process),
+            stop=AsyncMock(),
+            destroy=AsyncMock(),
+        )
+        client = VercelPythonPreviewClient(settings())
+        request = SandboxCreateRequest(60, 5, "image", None, (), 1024, 4096, 20, ports=(5173,))
+        content = b"console.log('ready')\n"
+        snapshot = WorkspaceSnapshot(
+            "revision-0",
+            {"src/main.js": WorkspaceStoredFile("src/main.js", content, "a" * 64)},
+            len(content),
+        )
+        with (
+            patch.object(client, "_open_api_session", new=AsyncMock(return_value=FakeApiSession())),
+            patch("vercel.sandbox.create_sandbox", new=AsyncMock(return_value=box)) as create,
+        ):
+            handle = await client.start(
+                request,
+                snapshot,
+                ["npm", "run", "dev"],
+                "",
+                5173,
+                60,
+            )
+
+        self.assertEqual("sandbox_test", handle.sandbox_identifier)
+        self.assertEqual("process_test", handle.process_id)
+        self.assertEqual("https://preview.example.test", handle.preview_url)
+        create.assert_awaited_once()
+        self.assertEqual([5173], create.await_args.kwargs["ports"])
+        box.create_process.assert_awaited_once_with(
+            "npm",
+            ["run", "dev"],
+            cwd="/vercel/sandbox/workspace",
+            env={
+                "HOME": "/vercel/sandbox",
+                "TMPDIR": "/tmp",
+                "PYTHONDONTWRITEBYTECODE": "1",
+                "CI": "1",
+                "PORT": "5173",
+            },
+            kill_after=60,
+        )
+        self.assertIn(("write", "/vercel/sandbox/workspace/src/main.js", content), calls)
+        self.assertEqual("session_closed", calls[-1])
+        box.stop.assert_not_awaited()
+        box.destroy.assert_not_awaited()
 
     async def test_nonzero_exit_preserves_evidence_and_cleanup(self):
         session = FakeSandboxSession(result=SandboxCommandResult("partial", "failed", 7))

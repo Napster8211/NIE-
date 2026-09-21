@@ -34,7 +34,7 @@ from app.services.engineering_execution_service import (
     ToolExecutionService,
     engineering_tool_schemas,
 )
-from app.services.engineering_process_service import ProcessManager
+from app.services.engineering_process_service import build_process_manager
 from app.services.engineering_workspace_service import WorkspaceError, WorkspaceManager
 from app.services.stream_events import sse_event
 
@@ -450,7 +450,7 @@ async def start_workspace_process(
     manager = WorkspaceManager(repository)
     try:
         workspace = await manager.require(workspace_id, _owner(principal))
-        return await ProcessManager(repository).start(workspace, _owner(principal), body)
+        return await build_process_manager(repository).start(workspace, _owner(principal), body)
     except Exception as error:
         raise _http_error(error) from error
 
@@ -463,7 +463,7 @@ async def inspect_workspace_process(
     db: AsyncSession = Depends(get_db_session),
 ):
     try:
-        return await ProcessManager(EngineeringWorkspaceRepository(db)).inspect(
+        return await build_process_manager(EngineeringWorkspaceRepository(db)).inspect(
             workspace_id, _owner(principal), process_id
         )
     except Exception as error:
@@ -478,7 +478,7 @@ async def stop_workspace_process(
     db: AsyncSession = Depends(get_db_session),
 ):
     try:
-        return await ProcessManager(EngineeringWorkspaceRepository(db)).stop(
+        return await build_process_manager(EngineeringWorkspaceRepository(db)).stop(
             workspace_id, _owner(principal), process_id
         )
     except Exception as error:

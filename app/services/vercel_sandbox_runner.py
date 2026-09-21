@@ -38,6 +38,24 @@ SAFE_SANDBOX_ENVIRONMENT = {
     "CI": "1",
 }
 
+_LIVE_CAPABILITY_STATE: dict[str, object] = {
+    "command_execution_verified": False,
+    "preview_execution_verified": False,
+    "last_error": None,
+}
+
+
+def mark_vercel_sandbox_capability_verified(capability: str) -> None:
+    if capability == "command":
+        _LIVE_CAPABILITY_STATE["command_execution_verified"] = True
+    elif capability == "preview":
+        _LIVE_CAPABILITY_STATE["preview_execution_verified"] = True
+    _LIVE_CAPABILITY_STATE["last_error"] = None
+
+
+def mark_vercel_sandbox_capability_failed(code: str) -> None:
+    _LIVE_CAPABILITY_STATE["last_error"] = code
+
 
 @dataclass(frozen=True)
 class VercelSandboxSettings:
@@ -143,6 +161,7 @@ class SandboxCreateRequest:
     max_file_count: int
     vcpus: int = 1
     memory_mb: int = 2_048
+    ports: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -150,6 +169,23 @@ class SandboxCommandResult:
     stdout: str
     stderr: str
     exit_code: int
+
+
+@dataclass(frozen=True)
+class SandboxPreviewHandle:
+    sandbox_identifier: str
+    process_id: str
+    preview_url: str
+
+
+@dataclass(frozen=True)
+class SandboxPreviewState:
+    status: str
+    returncode: int | None
+    preview_url: str
+    stdout: str = ""
+    stderr: str = ""
+    files: Mapping[str, bytes] | None = None
 
 
 class SandboxSession(Protocol):
@@ -169,6 +205,30 @@ class SandboxSession(Protocol):
 
 class SandboxClient(Protocol):
     async def create(self, request: SandboxCreateRequest) -> SandboxSession: ...
+
+
+class SandboxPreviewClient(Protocol):
+    async def start(
+        self,
+        request: SandboxCreateRequest,
+        snapshot: WorkspaceSnapshot,
+        argv: list[str],
+        cwd: str,
+        port: int,
+        timeout_seconds: int,
+    ) -> SandboxPreviewHandle: ...
+
+    async def inspect(self, sandbox_identifier: str, process_id: str, port: int) -> SandboxPreviewState: ...
+
+    async def stop_and_collect(
+        self,
+        sandbox_identifier: str,
+        process_id: str,
+        port: int,
+        request: SandboxCreateRequest,
+    ) -> SandboxPreviewState: ...
+
+    async def destroy(self, sandbox_identifier: str) -> None: ...
 
 
 class VercelPythonSandboxSession:
@@ -299,6 +359,8 @@ class VercelPythonSandboxClient:
             "env": SAFE_SANDBOX_ENVIRONMENT,
             "tags": {"service": "nie-engineering", "environment": os.getenv("NIE_ENV", "unknown")[:64]},
         }
+        if request.ports:
+            kwargs["ports"] = list(request.ports)
         if request.snapshot_id:
             kwargs["source"] = SnapshotSource(snapshot_id=request.snapshot_id)
         else:
@@ -309,6 +371,182 @@ class VercelPythonSandboxClient:
             await api_session.__aexit__(None, None, None)
             raise
         return VercelPythonSandboxSession(box, api_session, request)
+
+
+class VercelPythonPreviewClient:
+    """Official-SDK bridge for bounded, reconnectable preview processes."""
+
+    def __init__(self, settings: VercelSandboxSettings):
+        self.settings = settings
+
+    async def _open_api_session(self, timeout_seconds: int):
+        from vercel.api import session
+        from vercel.sandbox import SandboxCredentials, SandboxServiceOptions
+
+        async def resolve_credentials() -> SandboxCredentials:
+            return SandboxCredentials(
+                token=self.settings.token,
+                team_id=self.settings.team_id,
+                project_id=self.settings.project_id,
+            )
+
+        service_options = SandboxServiceOptions(
+            credentials_factory=resolve_credentials,
+            file_transfer_timeout=timedelta(seconds=timeout_seconds),
+        )
+        api_session = session(service_options=[service_options])
+        await api_session.__aenter__()
+        return api_session
+
+    @staticmethod
+    def _preview_url(box: Any, port: int) -> str:
+        route = next((item for item in box.routes if int(item.port) == port and not item.system), None)
+        if route is None or not str(route.url).startswith("https://"):
+            raise ToolExecutionError("VERCEL_SANDBOX_PREVIEW_ROUTE_UNAVAILABLE")
+        return str(route.url)
+
+    @staticmethod
+    async def _upload(box: Any, snapshot: WorkspaceSnapshot) -> None:
+        await box.fs.mkdir(SANDBOX_ROOT, recursive=True)
+        for path in sorted(snapshot.files):
+            target = PurePosixPath(SANDBOX_ROOT) / PurePosixPath(path)
+            if target.parent != PurePosixPath(SANDBOX_ROOT):
+                await box.fs.mkdir(target.parent.as_posix(), recursive=True)
+            await box.fs.write_bytes(target.as_posix(), snapshot.files[path].content)
+
+    def _create_kwargs(self, request: SandboxCreateRequest) -> dict[str, Any]:
+        from vercel.sandbox import NetworkPolicy, SandboxResources, SnapshotSource
+
+        kwargs: dict[str, Any] = {
+            "project_id": self.settings.project_id,
+            "persistent": False,
+            "ports": list(request.ports),
+            "execution_time_limit": timedelta(seconds=request.execution_time_limit_seconds),
+            "resources": SandboxResources(vcpus=request.vcpus, memory=request.memory_mb),
+            "network_policy": NetworkPolicy.deny_all(),
+            "env": SAFE_SANDBOX_ENVIRONMENT,
+            "tags": {"service": "nie-engineering-preview", "environment": os.getenv("NIE_ENV", "unknown")[:64]},
+        }
+        if request.snapshot_id:
+            kwargs["source"] = SnapshotSource(snapshot_id=request.snapshot_id)
+        else:
+            kwargs["image"] = request.image
+        return kwargs
+
+    async def start(
+        self,
+        request: SandboxCreateRequest,
+        snapshot: WorkspaceSnapshot,
+        argv: list[str],
+        cwd: str,
+        port: int,
+        timeout_seconds: int,
+    ) -> SandboxPreviewHandle:
+        from vercel import sandbox
+
+        api_session = await self._open_api_session(request.synchronization_timeout_seconds)
+        box = None
+        try:
+            box = await sandbox.create_sandbox(**self._create_kwargs(request))
+            await self._upload(box, snapshot)
+            remote_cwd = (PurePosixPath(SANDBOX_ROOT) / PurePosixPath(cwd or ".")).as_posix()
+            process = await box.create_process(
+                argv[0],
+                argv[1:],
+                cwd=remote_cwd,
+                env={**SAFE_SANDBOX_ENVIRONMENT, "PORT": str(port)},
+                kill_after=timeout_seconds,
+            )
+            return SandboxPreviewHandle(str(box.name), str(process.id), self._preview_url(box, port))
+        except BaseException:
+            if box is not None:
+                try:
+                    await box.stop()
+                except BaseException:
+                    pass
+                try:
+                    await box.destroy()
+                except BaseException:
+                    pass
+            raise
+        finally:
+            await api_session.__aexit__(None, None, None)
+
+    async def _connect(self, sandbox_identifier: str):
+        from vercel import sandbox
+
+        api_session = await self._open_api_session(self.settings.synchronization_timeout_seconds)
+        try:
+            box = await sandbox.get_sandbox(
+                name=sandbox_identifier,
+                project_id=self.settings.project_id,
+                include_system_routes=False,
+            )
+        except BaseException:
+            await api_session.__aexit__(None, None, None)
+            raise
+        return api_session, box
+
+    async def inspect(self, sandbox_identifier: str, process_id: str, port: int) -> SandboxPreviewState:
+        api_session, box = await self._connect(sandbox_identifier)
+        try:
+            process = await box.get_process(process_id)
+            await process.refresh()
+            status = "RUNNING" if process.returncode is None else ("STOPPED" if process.returncode == 0 else "FAILED")
+            return SandboxPreviewState(status, process.returncode, self._preview_url(box, port))
+        finally:
+            await api_session.__aexit__(None, None, None)
+
+    async def stop_and_collect(
+        self,
+        sandbox_identifier: str,
+        process_id: str,
+        port: int,
+        request: SandboxCreateRequest,
+    ) -> SandboxPreviewState:
+        api_session, box = await self._connect(sandbox_identifier)
+        adapter = VercelPythonSandboxSession(box, api_session, request)
+        closed = False
+        try:
+            process = await box.get_process(process_id)
+            await process.refresh()
+            if process.returncode is None:
+                await process.terminate()
+                try:
+                    await asyncio.wait_for(process.wait(), timeout=5)
+                except asyncio.TimeoutError:
+                    await process.kill()
+                    await process.wait()
+            stdout = "" if process.stdout is None else await process.stdout.read()
+            stderr = "" if process.stderr is None else await process.stderr.read()
+            files = await adapter.download()
+            state = SandboxPreviewState(
+                "STOPPED" if process.returncode in {None, 0, -15} else "FAILED",
+                process.returncode,
+                self._preview_url(box, port),
+                stdout or "",
+                stderr or "",
+                files,
+            )
+            await adapter.close()
+            closed = True
+            return state
+        finally:
+            if not closed:
+                try:
+                    await adapter.close()
+                except BaseException:
+                    pass
+
+    async def destroy(self, sandbox_identifier: str) -> None:
+        api_session, box = await self._connect(sandbox_identifier)
+        try:
+            try:
+                await box.stop()
+            finally:
+                await box.destroy()
+        finally:
+            await api_session.__aexit__(None, None, None)
 
 
 class VercelSandboxRunner(CommandRunner):
@@ -484,6 +722,7 @@ class VercelSandboxRunner(CommandRunner):
             except BaseException as exc:
                 raise ToolExecutionError("VERCEL_SANDBOX_CLEANUP_FAILED", result=result) from exc
             session = None
+            mark_vercel_sandbox_capability_verified("command")
             return result
         finally:
             async with self._lock:
@@ -514,12 +753,33 @@ def vercel_sandbox_readiness() -> dict[str, object]:
     except ToolExecutionError as exc:
         return {"provider": "vercel_sandbox", "configured": False, "reason": exc.code}
     try:
-        import vercel  # noqa: F401
+        from vercel import sandbox
+        from vercel.sandbox import Sandbox
     except ImportError:
         return {"provider": "vercel_sandbox", "configured": False, "reason": "VERCEL_SDK_NOT_INSTALLED"}
+    command_supported = hasattr(Sandbox, "run_process") and hasattr(sandbox, "create_sandbox")
+    preview_supported = all(
+        (
+            hasattr(Sandbox, "create_process"),
+            hasattr(Sandbox, "get_process"),
+            hasattr(Sandbox, "routes"),
+            hasattr(sandbox, "get_sandbox"),
+        )
+    )
+    command_verified = bool(_LIVE_CAPABILITY_STATE["command_execution_verified"])
+    preview_verified = bool(_LIVE_CAPABILITY_STATE["preview_execution_verified"])
+    ready = command_supported and command_verified
     return {
         "provider": "vercel_sandbox",
         "configured": True,
+        "ready": ready,
+        "readiness_classification": "READY" if ready else "CONFIGURED_UNVERIFIED",
+        "command_execution_supported": command_supported,
+        "command_execution_verified": command_verified,
+        "process_execution_ready": preview_verified,
+        "preview_execution_supported": preview_supported,
+        "preview_execution_verified": preview_verified,
+        "last_error": _LIVE_CAPABILITY_STATE["last_error"],
         "image": "snapshot" if settings.snapshot_id else settings.image,
         "network_policy": settings.network_policy,
         "sandbox_timeout_seconds": settings.sandbox_timeout_seconds,
@@ -527,3 +787,43 @@ def vercel_sandbox_readiness() -> dict[str, object]:
         "vcpus": settings.sandbox_vcpus,
         "memory_mb": settings.sandbox_memory_mb,
     }
+
+
+async def probe_vercel_sandbox_execution() -> dict[str, object]:
+    """Run one bounded, no-network provider probe and cache only safe state."""
+
+    settings = VercelSandboxSettings.from_environment()
+    client = VercelPythonSandboxClient(settings)
+    request = SandboxCreateRequest(
+        execution_time_limit_seconds=60,
+        synchronization_timeout_seconds=settings.synchronization_timeout_seconds,
+        image=settings.image,
+        snapshot_id=settings.snapshot_id,
+        network_allowed_hosts=(),
+        max_file_bytes=1_000,
+        max_workspace_bytes=1_000,
+        max_file_count=1,
+        vcpus=settings.sandbox_vcpus,
+        memory_mb=settings.sandbox_memory_mb,
+    )
+    session = None
+    try:
+        session = await asyncio.wait_for(client.create(request), timeout=settings.synchronization_timeout_seconds)
+        await session.upload(WorkspaceSnapshot("probe", {}, 0))
+        result = await asyncio.wait_for(
+            session.execute(["python3", "-c", "print('NIE_ENGINEERING_RUNNER_READY')"], "", 10),
+            timeout=15,
+        )
+        if result.exit_code != 0 or result.stdout.strip() != "NIE_ENGINEERING_RUNNER_READY":
+            raise ToolExecutionError("VERCEL_SANDBOX_LIVE_PROBE_FAILED")
+        mark_vercel_sandbox_capability_verified("command")
+    except BaseException as exc:
+        code = exc.code if isinstance(exc, ToolExecutionError) else VercelSandboxRunner._provider_error(exc)
+        mark_vercel_sandbox_capability_failed(code)
+    finally:
+        if session is not None:
+            try:
+                await asyncio.wait_for(session.close(), timeout=settings.cleanup_timeout_seconds)
+            except BaseException:
+                mark_vercel_sandbox_capability_failed("VERCEL_SANDBOX_CLEANUP_FAILED")
+    return vercel_sandbox_readiness()

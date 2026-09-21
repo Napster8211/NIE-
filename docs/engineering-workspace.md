@@ -34,6 +34,13 @@ docker build -f docker/engineering-runner.Dockerfile -t napstertec-engineering-r
 
 On a trusted Docker host, configure `NIE_ENGINEERING_RUNNER=docker`. The runner uses a non-root user, a read-only base filesystem, no network by default, bounded CPU/memory/PIDs, a disposable container, and only the selected workspace bind-mounted at `/workspace`. Never mount the Docker socket into the runner container.
 
+For deployed control planes, `NIE_ENGINEERING_RUNNER=vercel_sandbox` routes
+one-shot commands and approved development previews through the official Python
+Vercel Sandbox SDK. Preview commands are not one-shot commands: the API persists
+their remote handle, verifies the routed port, reconnects across API restarts,
+and explicitly stops, reconciles, and destroys the Sandbox. Production never
+falls back to the Render-local process manager.
+
 Sandbox-local, Render-local, and serverless filesystems are not authoritative
 workspace storage. PostgreSQL row locking supplies cross-process optimistic
 revision protection; Supabase Storage supplies durable bytes. Shared execution

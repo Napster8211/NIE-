@@ -559,6 +559,8 @@ class EngineeringWorkspaceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("filesystem.list", completed_tool["tool_name"])
         self.assertEqual([], completed_tool["data"]["entries"])
         self.assertEqual([completed_tool["execution_id"]], completed_message["evidence_execution_ids"])
+        self.assertIn("authenticated Engineering workspace", prompts[0])
+        self.assertIn("Never describe this session as Standard Chat", prompts[0])
 
     async def test_several_successful_tool_calls_are_durable_evidence(self):
         calls = 0
