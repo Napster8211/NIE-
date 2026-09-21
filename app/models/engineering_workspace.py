@@ -230,10 +230,17 @@ class WorkspaceProcess(Base):
     owner_id = Column(String, nullable=False, index=True)
     execution_id = Column(String, ForeignKey("tool_executions.execution_id", ondelete="SET NULL"), nullable=True)
     sanitized_command = Column(JSON, nullable=False, default=list)
+    runner_provider = Column(String(64), nullable=False, default="local")
+    sandbox_identifier = Column(String(255), nullable=True)
     runner_process_id = Column(String, nullable=True)
     permitted_port = Column(Integer, nullable=True)
+    preview_url = Column(Text, nullable=True)
+    workspace_revision = Column(String(160), nullable=True)
+    provider_metadata = Column(JSON, nullable=False, default=dict)
     status = Column(String(32), nullable=False, default="STARTING", index=True)
     started_at = Column(DateTime(timezone=True), nullable=False, default=_now)
+    last_checked_at = Column(DateTime(timezone=True), nullable=True)
+    expires_at = Column(DateTime(timezone=True), nullable=True)
     stopped_at = Column(DateTime(timezone=True), nullable=True)
     health_status = Column(String(32), nullable=False, default="UNKNOWN")
     log_excerpt = Column(Text, nullable=False, default="")
@@ -251,4 +258,5 @@ class WorkspaceProcess(Base):
             "permitted_port IS NULL OR (permitted_port >= 1024 AND permitted_port <= 65535)",
             name="ck_workspace_process_port",
         ),
+        Index("ix_workspace_processes_owner_status", "owner_id", "status"),
     )

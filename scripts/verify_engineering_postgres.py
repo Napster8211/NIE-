@@ -51,7 +51,20 @@ EXPECTED_COLUMNS = {
     },
     "execution_events": {"execution_id", "sequence", "event_type", "payload"},
     "workspace_file_changes": {"execution_id", "workspace_id", "relative_path", "operation"},
-    "workspace_processes": {"workspace_id", "owner_id", "execution_id", "status", "health_status"},
+    "workspace_processes": {
+        "workspace_id",
+        "owner_id",
+        "execution_id",
+        "status",
+        "health_status",
+        "runner_provider",
+        "sandbox_identifier",
+        "preview_url",
+        "workspace_revision",
+        "provider_metadata",
+        "last_checked_at",
+        "expires_at",
+    },
     "engineering_workspace_files": {
         "workspace_id",
         "owner_id",
@@ -89,6 +102,8 @@ EXPECTED_INDEXES = {
     "ix_workspace_processes_workspace_id",
     "ix_workspace_processes_owner_id",
     "ix_workspace_processes_status",
+    "ix_workspace_processes_owner_status",
+    "uq_workspace_processes_active_workspace",
     "ix_engineering_workspaces_owner_storage",
     "ix_engineering_workspace_files_owner_workspace",
     "ix_engineering_workspace_files_workspace_revision",
@@ -262,10 +277,14 @@ async def verify(database_url: str) -> dict[str, int]:
                 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 24, 'COMMITTED'
             );
             INSERT INTO workspace_processes
-                (process_id, workspace_id, owner_id, execution_id, sanitized_command, permitted_port)
+                (process_id, workspace_id, owner_id, execution_id, sanitized_command,
+                 permitted_port, runner_provider, sandbox_identifier, preview_url,
+                 workspace_revision, provider_metadata)
             VALUES (
                 'wpr_verify', 'ews_verify', 'firebase:test-owner', 'tex_verify',
-                '["python","-m","http.server"]', 8000
+                '["python","-m","http.server"]', 8000, 'vercel_sandbox',
+                'sbx_verify', 'https://preview.invalid', 'revision-verify',
+                '{"network_policy":"deny_all"}'
             );
             """
         )

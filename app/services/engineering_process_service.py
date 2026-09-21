@@ -4,16 +4,34 @@ import asyncio
 import os
 import shutil
 import sys
+import time
 import uuid
-from datetime import datetime, timezone
-from pathlib import Path
+from datetime import datetime, timedelta, timezone
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
-from app.models.engineering_workspace import WorkspaceProcess
+import httpx
+
+from app.models.engineering_workspace import ToolExecution, WorkspaceProcess
 from app.repositories.engineering_workspace_repository import EngineeringWorkspaceRepository
 from app.schemas.engineering_workspace import ProcessResponse, ProcessStartInput
-from app.services.engineering_execution_service import ToolExecutionError
+from app.services.engineering_execution_service import SecretRedactor, ToolExecutionError
+from app.services.engineering_workspace_storage import (
+    WorkspaceStorageError,
+    build_workspace_storage,
+    capture_workspace,
+    reconcile_workspace,
+)
 from app.services.runtime_environment import runtime_environment
+from app.services.vercel_sandbox_runner import (
+    SandboxCreateRequest,
+    SandboxPreviewClient,
+    SandboxPreviewState,
+    VercelPythonPreviewClient,
+    VercelSandboxRunner,
+    VercelSandboxSettings,
+    mark_vercel_sandbox_capability_verified,
+)
 
 
 class ProcessManager:
@@ -238,8 +256,454 @@ class ProcessManager:
         return ProcessResponse(
             process_id=record.process_id,
             workspace_id=record.workspace_id,
+            execution_id=getattr(record, "execution_id", None),
             status=record.status,
             port=record.permitted_port,
             health_status=record.health_status,
             log_excerpt=record.log_excerpt or "",
+            preview_url=getattr(record, "preview_url", None),
+            runner=getattr(record, "runner_provider", None) or "local",
         )
+
+
+class VercelSandboxProcessManager:
+    """Reconnectable remote preview manager backed by Vercel Sandbox."""
+
+    def __init__(
+        self,
+        repository: EngineeringWorkspaceRepository,
+        *,
+        client: SandboxPreviewClient | None = None,
+        settings: VercelSandboxSettings | None = None,
+        storage=None,
+        readiness_probe=None,
+    ):
+        self.repository = repository
+        self.settings = settings or VercelSandboxSettings.from_environment()
+        self.client = client or VercelPythonPreviewClient(self.settings)
+        self.storage = storage or build_workspace_storage(repository)
+        self.readiness_probe = readiness_probe or self._probe_url
+        self._redactor = SecretRedactor()
+
+    @staticmethod
+    def _positive_setting(name: str, default: int, minimum: int, maximum: int) -> int:
+        try:
+            value = int(os.getenv(name, str(default)))
+        except ValueError as exc:
+            raise ToolExecutionError(f"{name}_INVALID") from exc
+        if value < minimum or value > maximum:
+            raise ToolExecutionError(f"{name}_INVALID")
+        return value
+
+    @staticmethod
+    def _validate(request: ProcessStartInput) -> list[str]:
+        executable = PureWindowsPath(request.argv[0]).name.casefold()
+        args = list(request.argv[1:])
+        is_npm = (
+            executable in {"npm", "npm.cmd"}
+            and len(args) == 2
+            and args[0] == "run"
+            and args[1]
+            in {
+                "dev",
+                "start",
+                "preview",
+            }
+        )
+        is_python = executable in {"python", "python3", "python.exe", "py"} and args == [
+            "-m",
+            "http.server",
+            str(request.port),
+        ]
+        if not (is_npm or is_python):
+            raise ToolExecutionError("PROCESS_COMMAND_REJECTED")
+        for item in args:
+            posix = PurePosixPath(item.replace("\\", "/"))
+            windows = PureWindowsPath(item)
+            if windows.is_absolute() or windows.drive or posix.is_absolute() or ".." in posix.parts:
+                raise ToolExecutionError("PROCESS_PATH_REJECTED")
+        if is_python:
+            return ["python3", "-m", "http.server", str(request.port), "--bind", "0.0.0.0"]
+        if args[1] in {"dev", "preview"}:
+            return ["npm", "run", args[1], "--", "--host", "0.0.0.0", "--port", str(request.port)]
+        return ["npm", "run", "start"]
+
+    @staticmethod
+    def _validate_cwd(cwd: str) -> str:
+        normalized = cwd.replace("\\", "/").strip("/")
+        posix = PurePosixPath(normalized or ".")
+        windows = PureWindowsPath(cwd)
+        if windows.is_absolute() or windows.drive or posix.is_absolute() or ".." in posix.parts:
+            raise ToolExecutionError("PROCESS_CWD_ESCAPE_REJECTED")
+        return "" if posix == PurePosixPath(".") else posix.as_posix()
+
+    async def _probe_url(self, url: str) -> bool:
+        try:
+            async with httpx.AsyncClient(follow_redirects=True, timeout=2.0) as client:
+                response = await client.get(url)
+            return response.status_code < 500
+        except httpx.HTTPError:
+            return False
+
+    def _request(self, port: int, timeout_seconds: int) -> SandboxCreateRequest:
+        return SandboxCreateRequest(
+            execution_time_limit_seconds=min(self.settings.sandbox_timeout_seconds, timeout_seconds + 30),
+            synchronization_timeout_seconds=self.settings.synchronization_timeout_seconds,
+            image=self.settings.image,
+            snapshot_id=self.settings.snapshot_id,
+            network_allowed_hosts=(),
+            max_file_bytes=self.storage.max_file_bytes,
+            max_workspace_bytes=self.storage.max_workspace_bytes,
+            max_file_count=self.storage.max_file_count,
+            vcpus=self.settings.sandbox_vcpus,
+            memory_mb=self.settings.sandbox_memory_mb,
+            ports=(port,),
+        )
+
+    async def _finish_execution(
+        self,
+        record: WorkspaceProcess,
+        *,
+        status: str,
+        error_type: str | None,
+        stdout: str,
+        stderr: str,
+        changes: tuple[dict[str, object], ...] = (),
+    ) -> None:
+        if not record.execution_id:
+            return
+        execution = await self.repository.get_execution(record.execution_id, record.workspace_id, record.owner_id)
+        if execution is None or execution.status != "RUNNING":
+            return
+        maximum = self._positive_setting("NIE_ENGINEERING_MAX_OUTPUT_BYTES", 100_000, 1_000, 1_000_000)
+        stdout = self._redactor.redact(
+            stdout.encode("utf-8", errors="replace")[:maximum].decode("utf-8", errors="replace")
+        )
+        stderr = self._redactor.redact(
+            stderr.encode("utf-8", errors="replace")[:maximum].decode("utf-8", errors="replace")
+        )
+        duration_ms = max(0, int((datetime.now(timezone.utc) - execution.started_at).total_seconds() * 1000))
+        await self.repository.finish_execution(
+            execution,
+            status=status,
+            exit_code=0 if status == "SUCCEEDED" else None,
+            duration_ms=duration_ms,
+            stdout=stdout,
+            stderr=stderr,
+            error_type=error_type,
+            changed_files=[str(change["path"]) for change in changes],
+            provider_metadata={
+                "provider": "vercel_sandbox",
+                "process_type": "preview",
+                "network_policy": "deny_all",
+                "synchronization_status": "SUCCEEDED" if status == "SUCCEEDED" else "FAILED",
+            },
+        )
+        if stdout:
+            await self.repository.add_event(record.execution_id, "tool.stdout", {"content": stdout})
+        if stderr:
+            await self.repository.add_event(record.execution_id, "tool.stderr", {"content": stderr})
+        for change in changes:
+            event_type = "file.created" if change["operation"] == "CREATED" else "file.updated"
+            await self.repository.add_event(
+                record.execution_id,
+                event_type,
+                {"path": change["path"], "operation": change["operation"]},
+            )
+        await self.repository.add_event(
+            record.execution_id,
+            "process.stopped",
+            {"process_id": record.process_id, "status": record.status},
+        )
+        await self.repository.add_event(
+            record.execution_id,
+            "tool.completed" if status == "SUCCEEDED" else "tool.failed",
+            {"status": status, "error_type": error_type},
+        )
+
+    async def _mark_start_failed(
+        self, record: WorkspaceProcess, *, code: str, status: str = "FAILED", log_excerpt: str = ""
+    ) -> None:
+        record.status = "FAILED"
+        record.health_status = "FAILED"
+        record.log_excerpt = self._redactor.redact(log_excerpt or code)[:100_000]
+        record.stopped_at = datetime.now(timezone.utc)
+        record.last_checked_at = record.stopped_at
+        await self.repository.update_process(record)
+        await self._finish_execution(record, status=status, error_type=code, stdout="", stderr=record.log_excerpt)
+
+    async def _mark_unpersisted_process_failed(
+        self, execution: ToolExecution, *, code: str, status: str = "FAILED"
+    ) -> None:
+        session = getattr(self.repository, "session", None)
+        if session is not None:
+            await session.rollback()
+        if execution.status != "RUNNING":
+            return
+        duration_ms = max(0, int((datetime.now(timezone.utc) - execution.started_at).total_seconds() * 1000))
+        await self.repository.finish_execution(
+            execution,
+            status=status,
+            exit_code=None,
+            duration_ms=duration_ms,
+            stdout="",
+            stderr=code,
+            error_type=code,
+            changed_files=[],
+            provider_metadata={
+                "provider": "vercel_sandbox",
+                "process_type": "preview",
+                "network_policy": "deny_all",
+            },
+        )
+        await self.repository.add_event(
+            execution.execution_id,
+            "tool.failed",
+            {"status": status, "error_type": code},
+        )
+
+    async def start(self, workspace: Any, owner_id: str, request: ProcessStartInput) -> ProcessResponse:
+        if getattr(workspace, "owner_id", None) != owner_id:
+            raise ToolExecutionError("WORKSPACE_OWNERSHIP_REJECTED")
+        argv = self._validate(request)
+        cwd = self._validate_cwd(request.cwd)
+        maximum_processes = self._positive_setting("NIE_ENGINEERING_MAX_PROCESSES", 1, 1, 10)
+        if await self.repository.count_active_processes(owner_id) >= maximum_processes:
+            raise ToolExecutionError("PROCESS_LIMIT_REACHED")
+        preview_timeout = self._positive_setting("NIE_ENGINEERING_PREVIEW_TIMEOUT_SECONDS", 300, 30, 2_700)
+        readiness_timeout = self._positive_setting("NIE_ENGINEERING_PREVIEW_READINESS_TIMEOUT_SECONDS", 20, 2, 120)
+        execution_id = f"tex_{uuid.uuid4().hex}"
+        correlation_id = f"cor_{uuid.uuid4().hex}"
+        execution = ToolExecution(
+            execution_id=execution_id,
+            workspace_id=workspace.workspace_id,
+            owner_id=owner_id,
+            conversation_id=None,
+            tool_name="process.start",
+            sanitized_arguments={"argv": argv, "cwd": cwd, "port": request.port},
+            approval_status="NOT_REQUIRED",
+            status="RUNNING",
+            correlation_id=correlation_id,
+        )
+        await self.repository.begin_execution(execution)
+        await self.repository.add_event(
+            execution_id,
+            "tool.requested",
+            {"tool_name": "process.start", "arguments": execution.sanitized_arguments},
+        )
+        await self.repository.add_event(execution_id, "tool.started", {"tool_name": "process.start"})
+        now = datetime.now(timezone.utc)
+        record = WorkspaceProcess(
+            process_id=f"wpr_{uuid.uuid4().hex}",
+            workspace_id=workspace.workspace_id,
+            owner_id=owner_id,
+            execution_id=execution_id,
+            sanitized_command=argv,
+            runner_provider="vercel_sandbox",
+            permitted_port=request.port,
+            status="STARTING",
+            health_status="STARTING",
+            provider_metadata={"network_policy": "deny_all"},
+            expires_at=now + timedelta(seconds=preview_timeout),
+        )
+        try:
+            await self.repository.create_process(record)
+        except asyncio.CancelledError:
+            await asyncio.shield(
+                self._mark_unpersisted_process_failed(execution, code="PROCESS_CANCELLED", status="CANCELLED")
+            )
+            raise
+        except Exception as exc:
+            await self._mark_unpersisted_process_failed(execution, code="PROCESS_PERSISTENCE_FAILED")
+            raise ToolExecutionError("PROCESS_PERSISTENCE_FAILED") from exc
+        handle = None
+        try:
+            snapshot = await capture_workspace(self.storage, workspace)
+            record.workspace_revision = snapshot.revision
+            await self.repository.update_process(record)
+            handle = await self.client.start(
+                self._request(request.port, preview_timeout),
+                snapshot,
+                argv,
+                cwd,
+                request.port,
+                preview_timeout,
+            )
+            record.sandbox_identifier = handle.sandbox_identifier
+            record.runner_process_id = handle.process_id
+            record.preview_url = handle.preview_url
+            await self.repository.update_process(record)
+            deadline = time.monotonic() + readiness_timeout
+            while time.monotonic() < deadline:
+                state = await self.client.inspect(handle.sandbox_identifier, handle.process_id, request.port)
+                if state.status != "RUNNING":
+                    raise ToolExecutionError("PREVIEW_PROCESS_EXITED_BEFORE_READY")
+                if await self.readiness_probe(handle.preview_url):
+                    mark_vercel_sandbox_capability_verified("preview")
+                    record.status = "RUNNING"
+                    record.health_status = "READY"
+                    record.last_checked_at = datetime.now(timezone.utc)
+                    await self.repository.update_process(record)
+                    await self.repository.add_event(
+                        execution_id,
+                        "process.started",
+                        {"process_id": record.process_id, "port": request.port, "health_status": "READY"},
+                    )
+                    return self._response(record)
+                await asyncio.sleep(0.25)
+            raise ToolExecutionError("PREVIEW_READINESS_TIMEOUT", status="TIMED_OUT")
+        except WorkspaceStorageError as exc:
+            if handle is not None:
+                await asyncio.shield(self.client.destroy(handle.sandbox_identifier))
+            await self._mark_start_failed(record, code=exc.code, status="SYNC_FAILED")
+            raise ToolExecutionError(exc.code, status="SYNC_FAILED") from exc
+        except ToolExecutionError as exc:
+            if handle is not None:
+                await asyncio.shield(self.client.destroy(handle.sandbox_identifier))
+            await self._mark_start_failed(record, code=exc.code, status=exc.status)
+            raise
+        except asyncio.CancelledError as exc:
+            if handle is not None:
+                try:
+                    await asyncio.shield(self.client.destroy(handle.sandbox_identifier))
+                except BaseException:
+                    pass
+            await asyncio.shield(self._mark_start_failed(record, code="PROCESS_CANCELLED", status="CANCELLED"))
+            raise exc
+        except BaseException as exc:
+            if handle is not None:
+                try:
+                    await asyncio.shield(self.client.destroy(handle.sandbox_identifier))
+                except BaseException:
+                    pass
+            code = VercelSandboxRunner._provider_error(exc)
+            await self._mark_start_failed(record, code=code)
+            raise ToolExecutionError(code) from exc
+
+    async def _finalize(self, workspace: Any, record: WorkspaceProcess, state: SandboxPreviewState) -> ProcessResponse:
+        if record.status not in {"STARTING", "RUNNING"}:
+            return self._response(record)
+        try:
+            synchronized = await reconcile_workspace(
+                self.storage,
+                workspace,
+                str(record.execution_id),
+                str(record.workspace_revision),
+                state.files or {},
+            )
+            record.status = "STOPPED" if state.status != "FAILED" else "FAILED"
+            record.health_status = "STOPPED" if record.status == "STOPPED" else "FAILED"
+            record.log_excerpt = self._redactor.redact((state.stdout + state.stderr)[:100_000])
+            record.stopped_at = datetime.now(timezone.utc)
+            record.last_checked_at = record.stopped_at
+            await self.repository.update_process(record)
+            await self._finish_execution(
+                record,
+                status="SUCCEEDED" if record.status == "STOPPED" else "FAILED",
+                error_type=None if record.status == "STOPPED" else "PREVIEW_PROCESS_FAILED",
+                stdout=state.stdout,
+                stderr=state.stderr,
+                changes=synchronized.changes,
+            )
+            return self._response(record)
+        except WorkspaceStorageError as exc:
+            record.status = "FAILED"
+            record.health_status = "FAILED"
+            record.stopped_at = datetime.now(timezone.utc)
+            await self.repository.update_process(record)
+            await self._finish_execution(
+                record,
+                status="SYNC_FAILED",
+                error_type=exc.code,
+                stdout=state.stdout,
+                stderr=state.stderr,
+            )
+            raise ToolExecutionError(exc.code, status="SYNC_FAILED") from exc
+
+    async def stop(self, workspace_id: str, owner_id: str, process_id: str) -> ProcessResponse:
+        record = await self.repository.get_process(process_id, workspace_id, owner_id)
+        if record is None:
+            raise ToolExecutionError("PROCESS_NOT_FOUND")
+        if record.status not in {"STARTING", "RUNNING"}:
+            return self._response(record)
+        if not record.sandbox_identifier or not record.runner_process_id or not record.permitted_port:
+            await self._mark_start_failed(record, code="PREVIEW_PROCESS_HANDLE_INVALID")
+            raise ToolExecutionError("PREVIEW_PROCESS_HANDLE_INVALID")
+        try:
+            state = await self.client.stop_and_collect(
+                record.sandbox_identifier,
+                record.runner_process_id,
+                record.permitted_port,
+                self._request(record.permitted_port, self.settings.sandbox_timeout_seconds),
+            )
+        except asyncio.CancelledError:
+            raise
+        except BaseException as exc:
+            code = VercelSandboxRunner._provider_error(exc)
+            await self._mark_start_failed(record, code=code)
+            raise ToolExecutionError(code) from exc
+        workspace = await self.repository.get_workspace(workspace_id, owner_id)
+        if workspace is None:
+            raise ToolExecutionError("WORKSPACE_NOT_FOUND")
+        return await self._finalize(workspace, record, state)
+
+    async def inspect(self, workspace_id: str, owner_id: str, process_id: str) -> ProcessResponse:
+        record = await self.repository.get_process(process_id, workspace_id, owner_id)
+        if record is None:
+            raise ToolExecutionError("PROCESS_NOT_FOUND")
+        if record.status not in {"STARTING", "RUNNING"}:
+            return self._response(record)
+        if not record.sandbox_identifier or not record.runner_process_id or not record.permitted_port:
+            await self._mark_start_failed(record, code="PREVIEW_PROCESS_HANDLE_INVALID")
+            raise ToolExecutionError("PREVIEW_PROCESS_HANDLE_INVALID")
+        try:
+            state = await self.client.inspect(
+                record.sandbox_identifier, record.runner_process_id, record.permitted_port
+            )
+        except BaseException as exc:
+            code = VercelSandboxRunner._provider_error(exc)
+            await self._mark_start_failed(record, code=code)
+            raise ToolExecutionError(code) from exc
+        record.last_checked_at = datetime.now(timezone.utc)
+        if state.status == "RUNNING":
+            record.health_status = "READY" if await self.readiness_probe(state.preview_url) else "STARTING"
+            await self.repository.update_process(record)
+            return self._response(record)
+        try:
+            collected = await self.client.stop_and_collect(
+                record.sandbox_identifier,
+                record.runner_process_id,
+                record.permitted_port,
+                self._request(record.permitted_port, self.settings.sandbox_timeout_seconds),
+            )
+        except asyncio.CancelledError:
+            raise
+        except BaseException as exc:
+            code = VercelSandboxRunner._provider_error(exc)
+            await self._mark_start_failed(record, code=code)
+            raise ToolExecutionError(code) from exc
+        workspace = await self.repository.get_workspace(workspace_id, owner_id)
+        if workspace is None:
+            raise ToolExecutionError("WORKSPACE_NOT_FOUND")
+        return await self._finalize(workspace, record, collected)
+
+    @staticmethod
+    def _response(record: WorkspaceProcess) -> ProcessResponse:
+        return ProcessResponse(
+            process_id=str(record.process_id),
+            workspace_id=str(record.workspace_id),
+            execution_id=str(record.execution_id) if record.execution_id else None,
+            status=str(record.status),
+            port=int(record.permitted_port) if record.permitted_port else None,
+            health_status=str(record.health_status),
+            log_excerpt=str(record.log_excerpt or ""),
+            preview_url=str(record.preview_url) if record.preview_url else None,
+            runner=str(record.runner_provider or "vercel_sandbox"),
+        )
+
+
+def build_process_manager(repository: EngineeringWorkspaceRepository):
+    mode = os.getenv("NIE_ENGINEERING_RUNNER", "local").strip().casefold()
+    if mode == "vercel_sandbox":
+        return VercelSandboxProcessManager(repository)
+    return ProcessManager(repository)

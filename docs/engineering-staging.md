@@ -17,9 +17,13 @@ and reconciled by atomically switching the PostgreSQL manifest only if the durab
 is destroyed after success, failure, or cancellation. Vercel credentials stay in
 the Render control plane and never enter the browser or command environment.
 
-This release deliberately does not expose persistent dev-server previews. The
-managed-process API fails closed outside trusted local development until a
-separately reviewed persistent-Sandbox process adapter exists.
+One-shot commands use a fresh Sandbox and terminate after reconciliation.
+Development previews use a distinct bounded remote-process lifecycle: the API
+hydrates a fresh Sandbox, starts only an approved structured-argv server command,
+waits for the declared HTTPS port route, persists the remote process handle, and
+can reconnect after an API restart. Stopping or expiry downloads validated file
+changes, atomically reconciles the durable manifest, and destroys the Sandbox.
+The Render host never launches the preview command.
 
 ## Pre-deploy checklist
 
@@ -60,6 +64,9 @@ Configure these only in Render staging, never as `VITE_*` variables:
 - `NIE_ENGINEERING_SANDBOX_TIMEOUT_SECONDS`
 - `NIE_ENGINEERING_SANDBOX_VCPUS`
 - `NIE_ENGINEERING_SANDBOX_MEMORY_MB`
+- `NIE_ENGINEERING_RUNNER_LIVE_PROBE`
+- `NIE_ENGINEERING_PREVIEW_TIMEOUT_SECONDS`
+- `NIE_ENGINEERING_PREVIEW_READINESS_TIMEOUT_SECONDS`
 - `NIE_ENGINEERING_SYNCHRONIZATION_TIMEOUT_SECONDS`
 - `NIE_ENGINEERING_CLEANUP_TIMEOUT_SECONDS`
 - `NIE_ENGINEERING_NETWORK_POLICY`
@@ -69,6 +76,13 @@ Keep `NIE_ENGINEERING_NETWORK_POLICY=deny_all` during initial staging. An
 approved dependency installation also requires authenticated user approval and
 `allow_network=true`. Only after a separate network-policy smoke test may the
 owner set the policy to `allowlist`; the model cannot enable networking.
+
+Keep `NIE_ENGINEERING_RUNNER_LIVE_PROBE=false` while Engineering mode is
+disabled. Before the owner enables Engineering mode, set it to `true`; startup
+then creates one bounded, deny-all Sandbox and verifies a real command before
+health can report the command runner ready. Preview readiness remains a separate
+safe health field and becomes verified only after an actual approved preview
+reaches its route.
 
 The adapter requests one vCPU and 2048 MB by default through the SDK's
 `SandboxResources`. These are explicit Sandbox resources; the separate
@@ -92,7 +106,7 @@ $env:NIE_TEST_POSTGRES_CONFIRM_DISPOSABLE='YES'
 .\.venv\Scripts\python.exe scripts\verify_engineering_postgres.py
 ```
 
-The verifier applies migrations 001 and 002 repeatedly, checks real tables,
+The verifier applies migrations 001, 002, and 003 repeatedly, checks real tables,
 columns, indexes, constraints and foreign keys, writes all eight record types, reconnects,
 reads the evidence, verifies cascade cleanup, and drops only its unique schema.
 Missing PostgreSQL fails explicitly; SQLite and mocks are not substitutes.
@@ -103,8 +117,10 @@ Missing PostgreSQL fails explicitly; SQLite and mocks are not substitutes.
    Vercel frontend/Sandbox project, private Supabase bucket, and scoped server-side credentials. No new identity, database, or frontend project is required.
 2. Run the disposable PostgreSQL verifier.
 3. Configure Render staging with Engineering mode disabled and deploy the API.
-4. Apply migrations 001 and 002 through the Render pre-deploy command.
-5. Confirm `/health` reports PostgreSQL ready, Supabase configured/reachable, and a configured `vercel_sandbox` runner.
+4. Apply migrations 001, 002, and 003 through the Render pre-deploy command.
+5. Confirm `/health` reports PostgreSQL ready, Supabase configured/reachable,
+   `command_execution_supported=true`, and `command_execution_verified=false`
+   while Engineering mode remains disabled.
 6. Run the explicitly opted-in one-Sandbox smoke test.
 7. Deploy the separate frontend pointed only to the staging API.
 8. Verify identity, ordinary chat, CORS, cookies, and anonymous/second-user denial.
@@ -129,7 +145,9 @@ Missing PostgreSQL fails explicitly; SQLite and mocks are not substitutes.
 2. Stop the isolated staging runner and cancel active staging executions.
 3. Preserve the staging database and private bucket for forensic review; do not delete data during incident response.
 4. Roll the Vercel staging project and Render staging service back to the last known-good staging deployment.
-5. Restore database state only from a staging backup when separately reviewed. Migrations 001 and 002 are forward-only; disabling Engineering mode is the safe rollback.
+5. Restore database state only from a staging backup when separately reviewed.
+   Migrations 001, 002, and 003 are forward-only; disabling Engineering mode is
+   the safe rollback.
 
 ## Manual browser verification
 

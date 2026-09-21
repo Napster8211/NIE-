@@ -4,7 +4,7 @@ from collections.abc import Iterable
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import delete, exists, select, update
+from sqlalchemy import delete, exists, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.engineering_workspace import (
@@ -491,6 +491,20 @@ class EngineeringWorkspaceRepository:
         await self.session.commit()
         await self.session.refresh(process)
         return process
+
+    async def update_process(self, process: WorkspaceProcess) -> WorkspaceProcess:
+        await self.session.commit()
+        await self.session.refresh(process)
+        return process
+
+    async def count_active_processes(self, owner_id: str) -> int:
+        result = await self.session.execute(
+            select(func.count(WorkspaceProcess.process_id)).where(
+                WorkspaceProcess.owner_id == owner_id,
+                WorkspaceProcess.status.in_(("STARTING", "RUNNING")),
+            )
+        )
+        return int(result.scalar_one())
 
     async def get_process(self, process_id: str, workspace_id: str, owner_id: str) -> WorkspaceProcess | None:
         result = await self.session.execute(

@@ -755,16 +755,33 @@ def engineering_runner_readiness() -> dict[str, object]:
         from app.services.vercel_sandbox_runner import vercel_sandbox_readiness
 
         provider = vercel_sandbox_readiness()
-        return {"enabled": enabled, "runner": mode, "ready": bool(provider.get("configured")), **provider}
+        return {"enabled": enabled, "runner": mode, **provider}
     ready = mode == "local" and not is_production() or mode == "docker" and shutil.which("docker") is not None
     return {"enabled": enabled, "runner": mode, "ready": ready}
 
 
 def validate_engineering_runner_configuration() -> None:
     readiness = engineering_runner_readiness()
-    if readiness["enabled"] and not readiness["ready"]:
+    if not readiness["enabled"]:
+        return
+    if readiness["runner"] == "vercel_sandbox":
+        valid = bool(readiness.get("configured")) and bool(readiness.get("command_execution_supported"))
+    else:
+        valid = bool(readiness.get("ready"))
+    if not valid:
         reason = str(readiness.get("reason") or "ENGINEERING_RUNNER_NOT_READY")
         raise RuntimeError(reason)
+
+
+async def probe_engineering_runner_configuration() -> dict[str, object]:
+    readiness = engineering_runner_readiness()
+    if not readiness["enabled"] or readiness["runner"] != "vercel_sandbox":
+        return readiness
+    if os.getenv("NIE_ENGINEERING_RUNNER_LIVE_PROBE", "false").strip().casefold() not in {"1", "true", "yes", "on"}:
+        raise RuntimeError("VERCEL_SANDBOX_LIVE_PROBE_REQUIRED")
+    from app.services.vercel_sandbox_runner import probe_vercel_sandbox_execution
+
+    return {"enabled": True, "runner": "vercel_sandbox", **(await probe_vercel_sandbox_execution())}
 
 
 class ToolExecutionService:

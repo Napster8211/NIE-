@@ -63,6 +63,12 @@ services:
         value: "1"
       - key: NIE_ENGINEERING_SANDBOX_MEMORY_MB
         value: "2048"
+      - key: NIE_ENGINEERING_RUNNER_LIVE_PROBE
+        value: "false"
+      - key: NIE_ENGINEERING_PREVIEW_TIMEOUT_SECONDS
+        value: "300"
+      - key: NIE_ENGINEERING_PREVIEW_READINESS_TIMEOUT_SECONDS
+        value: "20"
       - key: NIE_ENGINEERING_SYNCHRONIZATION_TIMEOUT_SECONDS
         value: "60"
       - key: NIE_ENGINEERING_CLEANUP_TIMEOUT_SECONDS
@@ -70,7 +76,7 @@ services:
       - key: NIE_ENGINEERING_NETWORK_POLICY
         value: deny_all
       - key: NIE_ENGINEERING_NETWORK_ALLOWLIST
-        value: pypi.org,files.pythonhosted.org,registry.npmjs.org
+        value: ""
       - key: NIE_ENGINEERING_MAX_FILE_COUNT
         value: "2000"
       - key: NIE_ENGINEERING_MAX_FILE_BYTES

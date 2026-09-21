@@ -159,7 +159,10 @@ class ProcessStartInput(StrictModel):
 class ProcessResponse(StrictModel):
     process_id: str
     workspace_id: str
+    execution_id: str | None = None
     status: str
     port: int | None = None
     health_status: str
     log_excerpt: str = ""
+    preview_url: str | None = None
+    runner: str = "local"

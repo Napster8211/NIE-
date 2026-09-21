@@ -100,6 +100,9 @@ class EngineeringChatService:
         return (
             "[System Instruction]\n"
             "You are NapsterTec Engineering mode. Return ONE JSON object and no prose. "
+            "An authenticated Engineering workspace is attached and the listed filesystem and command tools are real. "
+            "Never describe this session as Standard Chat or claim the whole workspace is unavailable. "
+            "If a capability fails, report the exact tool error for that capability without denying unrelated tools. "
             'Use {"type":"tool_calls","calls":[{"call_id":"...","name":"...","arguments":{...}}]} '
             'when evidence-producing work is required. Use {"type":"final","content":"...",'
             '"evidence_execution_ids":["tex_..."]} only after reviewing tool results. '

@@ -59,6 +59,7 @@ from app.services.director_speech_service import director_speech_service
 from app.services.director_voice_service import director_voice_service
 from app.services.engineering_execution_service import (
     engineering_runner_readiness,
+    probe_engineering_runner_configuration,
     validate_engineering_runner_configuration,
 )
 from app.services.engineering_process_service import ProcessManager
@@ -74,6 +75,9 @@ async def lifespan(app: FastAPI):
     # enabled with an unavailable isolated runner.
     validate_engineering_runner_configuration()
     validate_workspace_storage_configuration()
+    runner_probe = await probe_engineering_runner_configuration()
+    if runner_probe.get("enabled") and not runner_probe.get("ready"):
+        raise RuntimeError(str(runner_probe.get("last_error") or "ENGINEERING_RUNNER_LIVE_PROBE_FAILED"))
     # Startup Phase: Connect to PostgreSQL and provision missing tables.
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
