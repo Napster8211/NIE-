@@ -59,9 +59,18 @@ EXPECTED_COLUMNS = {
         "health_status",
         "runner_provider",
         "sandbox_identifier",
-        "preview_url",
+        "provider_preview_url",
         "workspace_revision",
         "provider_metadata",
+        "startup_claim_id",
+        "startup_claimed_at",
+        "cleanup_claim_id",
+        "cleanup_claimed_at",
+        "cancellation_requested_at",
+        "stop_reason",
+        "terminal_reason",
+        "preview_session_token_hash",
+        "preview_session_expires_at",
         "last_checked_at",
         "expires_at",
     },
@@ -104,6 +113,7 @@ EXPECTED_INDEXES = {
     "ix_workspace_processes_status",
     "ix_workspace_processes_owner_status",
     "uq_workspace_processes_active_workspace",
+    "ix_workspace_processes_workspace_expires",
     "ix_engineering_workspaces_owner_storage",
     "ix_engineering_workspace_files_owner_workspace",
     "ix_engineering_workspace_files_workspace_revision",
@@ -123,6 +133,8 @@ EXPECTED_NAMED_CONSTRAINTS = {
     "ck_workspace_process_status",
     "ck_workspace_process_health_status",
     "ck_workspace_process_port",
+    "ck_workspace_process_stop_reason",
+    "ck_workspace_process_preview_token_hash",
     "ck_engineering_workspace_storage_backend",
     "ck_engineering_workspace_storage_revision",
     "ck_engineering_workspace_manifest_sha256",
@@ -236,6 +248,36 @@ async def verify(database_url: str) -> dict[str, int]:
         )
         if int(foreign_key_count) != 11:
             raise RuntimeError(f"ENGINEERING_MIGRATION_FOREIGN_KEY_COUNT_INVALID:{foreign_key_count}")
+        process_status_definition = await connection.fetchval(
+            """
+            SELECT pg_get_constraintdef(oid)
+            FROM pg_constraint
+            WHERE connamespace = $1::regnamespace
+              AND conname = 'ck_workspace_process_status'
+            """,
+            schema,
+        )
+        required_process_statuses = (
+            "STARTING",
+            "RUNNING",
+            "READY",
+            "STOPPING",
+            "STOPPED",
+            "FAILED",
+            "CANCELLED",
+            "EXPIRED",
+        )
+        for required_status in required_process_statuses:
+            if required_status not in str(process_status_definition):
+                raise RuntimeError(f"ENGINEERING_PROCESS_STATUS_CONSTRAINT_INVALID:{required_status}")
+        active_index_definition = await connection.fetchval(
+            "SELECT indexdef FROM pg_indexes WHERE schemaname = $1 AND indexname = $2",
+            schema,
+            "uq_workspace_processes_active_workspace",
+        )
+        for active_status in ("STARTING", "RUNNING", "READY", "STOPPING"):
+            if active_status not in str(active_index_definition):
+                raise RuntimeError(f"ENGINEERING_ACTIVE_PROCESS_INDEX_INVALID:{active_status}")
 
         await connection.execute(
             """
@@ -278,7 +320,7 @@ async def verify(database_url: str) -> dict[str, int]:
             );
             INSERT INTO workspace_processes
                 (process_id, workspace_id, owner_id, execution_id, sanitized_command,
-                 permitted_port, runner_provider, sandbox_identifier, preview_url,
+                 permitted_port, runner_provider, sandbox_identifier, provider_preview_url,
                  workspace_revision, provider_metadata)
             VALUES (
                 'wpr_verify', 'ews_verify', 'firebase:test-owner', 'tex_verify',

@@ -1,7 +1,8 @@
+import asyncio
 import hashlib
 import os
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -85,7 +86,7 @@ class FakeProcessRepository:
 
     async def count_active_processes(self, owner_id):
         return sum(
-            process.owner_id == owner_id and process.status in {"STARTING", "RUNNING"}
+            process.owner_id == owner_id and process.status in {"STARTING", "RUNNING", "READY", "STOPPING"}
             for process in self.processes.values()
         )
 
@@ -99,6 +100,97 @@ class FakeProcessRepository:
         if self.workspace.workspace_id == workspace_id and self.workspace.owner_id == owner_id:
             return self.workspace
         return None
+
+    async def list_active_processes(self, workspace_id, owner_id):
+        return [
+            process
+            for process in self.processes.values()
+            if process.workspace_id == workspace_id
+            and process.owner_id == owner_id
+            and process.status in {"STARTING", "RUNNING", "READY", "STOPPING"}
+        ]
+
+    async def list_expired_processes(self, *, limit, minimum_age_seconds):
+        now = datetime.now(timezone.utc)
+        return [
+            process
+            for process in self.processes.values()
+            if process.status in {"STARTING", "RUNNING", "READY", "STOPPING"} and process.expires_at <= now
+        ][:limit]
+
+    async def claim_process_start(
+        self,
+        process_id,
+        workspace_id,
+        owner_id,
+        claim_id,
+        *,
+        stale_after_seconds=60,
+    ):
+        process = await self.get_process(process_id, workspace_id, owner_id)
+        if process is None or process.status != "STARTING" or process.cancellation_requested_at:
+            return False
+        if process.startup_claim_id:
+            return False
+        process.startup_claim_id = claim_id
+        process.startup_claimed_at = datetime.now(timezone.utc)
+        return True
+
+    async def transition_process(
+        self,
+        *,
+        process_id,
+        workspace_id,
+        owner_id,
+        expected_statuses,
+        status,
+        health_status,
+        values=None,
+    ):
+        process = await self.get_process(process_id, workspace_id, owner_id)
+        if process is None:
+            return None, False
+        if process.status not in expected_statuses:
+            return process, False
+        for key, value in (values or {}).items():
+            setattr(process, key, value)
+        process.status = status
+        process.health_status = health_status
+        process.last_checked_at = datetime.now(timezone.utc)
+        return process, True
+
+    async def claim_process_cleanup(
+        self,
+        process_id,
+        workspace_id,
+        owner_id,
+        claim_id,
+        *,
+        stale_after_seconds=60,
+    ):
+        process = await self.get_process(process_id, workspace_id, owner_id)
+        if process is None or process.status != "STOPPING":
+            return False
+        if process.cleanup_claim_id:
+            return False
+        process.cleanup_claim_id = claim_id
+        process.cleanup_claimed_at = datetime.now(timezone.utc)
+        return True
+
+    async def get_process_for_preview(self, *, process_id, workspace_id, owner_id, token_hash):
+        process = self.processes.get(process_id)
+        if (
+            process
+            and process.workspace_id == workspace_id
+            and process.owner_id == owner_id
+            and process.preview_session_token_hash == token_hash
+            and process.preview_session_expires_at > datetime.now(timezone.utc)
+        ):
+            return process
+        return None
+
+    async def workspace_revision_token(self, workspace_id, owner_id):
+        return self.workspace.storage_revision_token
 
 
 class FakeAsyncStorage:
@@ -184,10 +276,18 @@ class FakePreviewClient:
         self.destroyed.append(sandbox_identifier)
 
 
+class FakeProviderNotFound(RuntimeError):
+    status_code = 404
+
+
 class RemoteProcessManagerTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.workspace = SimpleNamespace(
-            workspace_id="ews_test", owner_id="firebase:owner", root_path="supabase://private/ews_test"
+            workspace_id="ews_test",
+            owner_id="firebase:owner",
+            root_path="supabase://private/ews_test",
+            storage_backend="LOCAL",
+            storage_revision_token="revision-0",
         )
         self.repository = FakeProcessRepository(self.workspace)
         self.storage = FakeAsyncStorage({"README.md": b"# Test\n"})
@@ -222,13 +322,23 @@ class RemoteProcessManagerTests(unittest.IsolatedAsyncioTestCase):
     def request(argv=None, cwd=""):
         return ProcessStartInput(argv=argv or ["npm", "run", "dev"], cwd=cwd, port=5173)
 
-    async def test_preview_hydrates_authoritative_workspace_and_persists_remote_handle(self):
-        response = await self.manager().start(self.workspace, self.workspace.owner_id, self.request())
+    async def start_ready(self, manager=None):
+        manager = manager or self.manager()
+        started = await manager.start(self.workspace, self.workspace.owner_id, self.request())
+        self.assertEqual("STARTING", started.status)
+        return await manager.inspect(self.workspace.workspace_id, self.workspace.owner_id, started.process_id)
 
-        self.assertEqual("RUNNING", response.status)
+    async def test_preview_hydrates_authoritative_workspace_and_persists_remote_handle(self):
+        response = await self.start_ready()
+
+        self.assertEqual("READY", response.status)
         self.assertEqual("READY", response.health_status)
         self.assertEqual("vercel_sandbox", response.runner)
-        self.assertEqual("https://preview.example.test", response.preview_url)
+        self.assertEqual(
+            f"/api/v1/engineering/workspaces/ews_test/processes/{response.process_id}/preview/",
+            response.preview_url,
+        )
+        self.assertNotIn("preview.example.test", response.model_dump_json())
         request, snapshot, argv, cwd, port, timeout = self.client.started[0]
         self.assertEqual({"README.md"}, set(snapshot.files))
         self.assertEqual(["npm", "run", "dev", "--", "--host", "0.0.0.0", "--port", "5173"], argv)
@@ -243,7 +353,7 @@ class RemoteProcessManagerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_stop_reconciles_changes_and_emits_one_durable_terminal_event(self):
         manager = self.manager()
-        response = await manager.start(self.workspace, self.workspace.owner_id, self.request())
+        response = await self.start_ready(manager)
         self.client.returned_files = {"README.md": b"# Updated\n", "src/main.js": b"console.log('ok')\n"}
 
         stopped = await manager.stop(self.workspace.workspace_id, self.workspace.owner_id, response.process_id)
@@ -260,7 +370,7 @@ class RemoteProcessManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1, len(self.client.stopped))
 
     async def test_new_manager_recovers_running_preview_from_persisted_remote_identifiers(self):
-        response = await self.manager().start(self.workspace, self.workspace.owner_id, self.request())
+        response = await self.start_ready()
 
         restarted_manager = self.manager()
         inspected = await restarted_manager.inspect(
@@ -271,8 +381,10 @@ class RemoteProcessManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([("sandbox_test", "process_test", 5173)] * 2, self.client.inspections)
 
     async def test_readiness_timeout_destroys_sandbox_and_fails_execution_once(self):
+        manager = self.manager(ready=False)
+        started = await manager.start(self.workspace, self.workspace.owner_id, self.request())
         with self.assertRaises(ToolExecutionError) as caught:
-            await self.manager(ready=False).start(self.workspace, self.workspace.owner_id, self.request())
+            await manager.inspect(self.workspace.workspace_id, self.workspace.owner_id, started.process_id)
 
         self.assertEqual("PREVIEW_READINESS_TIMEOUT", caught.exception.code)
         process = next(iter(self.repository.processes.values()))
@@ -283,16 +395,20 @@ class RemoteProcessManagerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_sandbox_creation_and_process_execution_failure_is_audited(self):
         self.client.start_error = RuntimeError("provider failed token=must-not-leak")
+        manager = self.manager()
+        started = await manager.start(self.workspace, self.workspace.owner_id, self.request())
         with self.assertRaisesRegex(ToolExecutionError, "VERCEL_SANDBOX_PROVIDER_ERROR"):
-            await self.manager().start(self.workspace, self.workspace.owner_id, self.request())
+            await manager.inspect(self.workspace.workspace_id, self.workspace.owner_id, started.process_id)
         process = next(iter(self.repository.processes.values()))
         self.assertNotIn("must-not-leak", process.log_excerpt)
         self.assertEqual("FAILED", self.repository.executions[process.execution_id].status)
 
     async def test_storage_capture_failure_does_not_leave_running_execution(self):
         self.storage.fail_capture = "SUPABASE_STORAGE_DOWNLOAD_FAILED"
+        manager = self.manager()
+        started = await manager.start(self.workspace, self.workspace.owner_id, self.request())
         with self.assertRaisesRegex(ToolExecutionError, "SUPABASE_STORAGE_DOWNLOAD_FAILED"):
-            await self.manager().start(self.workspace, self.workspace.owner_id, self.request())
+            await manager.inspect(self.workspace.workspace_id, self.workspace.owner_id, started.process_id)
         process = next(iter(self.repository.processes.values()))
         self.assertEqual("SYNC_FAILED", self.repository.executions[process.execution_id].status)
 
@@ -310,7 +426,7 @@ class RemoteProcessManagerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_reconciliation_conflict_fails_closed_without_false_success(self):
         manager = self.manager()
-        response = await manager.start(self.workspace, self.workspace.owner_id, self.request())
+        response = await self.start_ready(manager)
         self.client.returned_files = {"README.md": b"changed"}
         self.storage.fail_reconcile = "WORKSPACE_SYNC_CONFLICT"
         with self.assertRaisesRegex(ToolExecutionError, "WORKSPACE_SYNC_CONFLICT"):
@@ -338,6 +454,170 @@ class RemoteProcessManagerTests(unittest.IsolatedAsyncioTestCase):
         await self.manager().start(self.workspace, self.workspace.owner_id, self.request())
         with self.assertRaisesRegex(ToolExecutionError, "PROCESS_LIMIT_REACHED"):
             await self.manager().start(self.workspace, self.workspace.owner_id, self.request())
+
+    async def test_start_is_durable_before_provider_work_and_can_be_cancelled(self):
+        manager = self.manager()
+        started = await manager.start(self.workspace, self.workspace.owner_id, self.request())
+
+        self.assertEqual("STARTING", started.status)
+        self.assertEqual([], self.client.started)
+        cancelled = await manager.stop(self.workspace.workspace_id, self.workspace.owner_id, started.process_id)
+        repeated = await manager.stop(self.workspace.workspace_id, self.workspace.owner_id, started.process_id)
+
+        self.assertEqual("CANCELLED", cancelled.status)
+        self.assertEqual("CANCELLED", repeated.status)
+        self.assertEqual([], self.client.started)
+        events = self.repository.events[started.execution_id]
+        self.assertEqual(1, sum(event.event_type == "tool.failed" for event in events))
+
+    async def test_expiry_before_start_is_terminal_and_idempotent(self):
+        manager = self.manager()
+        started = await manager.start(self.workspace, self.workspace.owner_id, self.request())
+        process = self.repository.processes[started.process_id]
+        process.expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+
+        expired = await manager.inspect(self.workspace.workspace_id, self.workspace.owner_id, started.process_id)
+        repeated = await manager.inspect(self.workspace.workspace_id, self.workspace.owner_id, started.process_id)
+
+        self.assertEqual("EXPIRED", expired.status)
+        self.assertEqual("EXPIRED", repeated.status)
+        self.assertEqual([], self.client.started)
+        self.assertEqual("TIMED_OUT", self.repository.executions[started.execution_id].status)
+
+    async def test_ready_process_expiry_reconciles_and_destroys_sandbox(self):
+        manager = self.manager()
+        ready = await self.start_ready(manager)
+        self.client.returned_files = {"README.md": b"# expired but saved\n"}
+        self.repository.processes[ready.process_id].expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+
+        expired = await manager.inspect(self.workspace.workspace_id, self.workspace.owner_id, ready.process_id)
+
+        self.assertEqual("EXPIRED", expired.status)
+        self.assertEqual(b"# expired but saved\n", self.storage.files["README.md"])
+        self.assertEqual(1, len(self.client.stopped))
+
+    async def test_provider_already_missing_is_successful_expiry_cleanup(self):
+        manager = self.manager()
+        ready = await self.start_ready(manager)
+        process = self.repository.processes[ready.process_id]
+        process.expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+        self.client.stop_error = FakeProviderNotFound("gone")
+
+        expired = await manager.inspect(self.workspace.workspace_id, self.workspace.owner_id, ready.process_id)
+
+        self.assertEqual("EXPIRED", expired.status)
+        self.assertEqual("PROCESS_EXPIRED_PROVIDER_ALREADY_MISSING", process.terminal_reason)
+
+    async def test_provider_cleanup_failure_is_preserved_on_expiry(self):
+        manager = self.manager()
+        ready = await self.start_ready(manager)
+        process = self.repository.processes[ready.process_id]
+        process.expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+        self.client.stop_error = RuntimeError("provider cleanup failed token=never-log")
+
+        expired = await manager.inspect(self.workspace.workspace_id, self.workspace.owner_id, ready.process_id)
+
+        self.assertEqual("EXPIRED", expired.status)
+        self.assertEqual("PROCESS_EXPIRED_CLEANUP_FAILED", process.terminal_reason)
+        self.assertNotIn("never-log", self.repository.executions[ready.execution_id].stderr)
+
+    async def test_active_process_list_is_workspace_and_owner_isolated(self):
+        manager = self.manager()
+        started = await manager.start(self.workspace, self.workspace.owner_id, self.request())
+
+        restored = await manager.list_active(self.workspace.workspace_id, self.workspace.owner_id)
+
+        self.assertEqual([started.process_id], [item.process_id for item in restored])
+        with self.assertRaisesRegex(ToolExecutionError, "WORKSPACE_NOT_FOUND"):
+            await manager.list_active(self.workspace.workspace_id, "firebase:attacker")
+
+    async def test_backend_restart_resumes_unclaimed_startup_from_database(self):
+        started = await self.manager().start(self.workspace, self.workspace.owner_id, self.request())
+
+        ready = await self.manager().inspect(
+            self.workspace.workspace_id,
+            self.workspace.owner_id,
+            started.process_id,
+        )
+
+        self.assertEqual("READY", ready.status)
+        self.assertEqual(1, len(self.client.started))
+
+    async def test_preview_session_is_short_lived_and_provider_url_is_not_returned(self):
+        configured = {
+            "NIE_ENGINEERING_MODE_ENABLED": "true",
+            "NIE_ENGINEERING_OWNER_ONLY": "true",
+            "NIE_OWNER_FIREBASE_UIDS": "owner",
+        }
+        with patch.dict(os.environ, configured, clear=False):
+            manager = self.manager()
+            ready = await self.start_ready(manager)
+            preview, token = await manager.issue_preview_session(
+                self.workspace.workspace_id,
+                self.workspace.owner_id,
+                ready.process_id,
+            )
+            authorized = await manager.authorize_preview(
+                self.workspace.workspace_id,
+                self.workspace.owner_id,
+                ready.process_id,
+                token,
+            )
+
+        self.assertIs(authorized, self.repository.processes[ready.process_id])
+        self.assertTrue(preview.preview_url.startswith("/api/v1/engineering/"))
+        self.assertNotIn("preview.example.test", preview.model_dump_json())
+
+    async def test_preview_session_rejects_unauthenticated_cross_workspace_and_revoked_owner(self):
+        configured = {
+            "NIE_ENGINEERING_MODE_ENABLED": "true",
+            "NIE_ENGINEERING_OWNER_ONLY": "true",
+            "NIE_OWNER_FIREBASE_UIDS": "owner",
+        }
+        with patch.dict(os.environ, configured, clear=False):
+            manager = self.manager()
+            ready = await self.start_ready(manager)
+            _, token = await manager.issue_preview_session(
+                self.workspace.workspace_id,
+                self.workspace.owner_id,
+                ready.process_id,
+            )
+            for workspace_id, supplied_token in (
+                (self.workspace.workspace_id, ""),
+                ("ews_other", token),
+            ):
+                with self.subTest(workspace_id=workspace_id):
+                    with self.assertRaisesRegex(ToolExecutionError, "PROCESS_NOT_FOUND"):
+                        await manager.authorize_preview(
+                            workspace_id,
+                            self.workspace.owner_id,
+                            ready.process_id,
+                            supplied_token,
+                        )
+            with patch.dict(os.environ, {"NIE_OWNER_FIREBASE_UIDS": "different-owner"}, clear=False):
+                with self.assertRaisesRegex(ToolExecutionError, "PROCESS_NOT_FOUND"):
+                    await manager.authorize_preview(
+                        self.workspace.workspace_id,
+                        "firebase:other-owner",
+                        ready.process_id,
+                        token,
+                    )
+
+    async def test_stop_and_expiry_race_has_one_terminal_execution_event(self):
+        manager = self.manager()
+        ready = await self.start_ready(manager)
+        process = self.repository.processes[ready.process_id]
+        process.expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+
+        outcomes = await asyncio.gather(
+            manager.stop(self.workspace.workspace_id, self.workspace.owner_id, ready.process_id),
+            manager.inspect(self.workspace.workspace_id, self.workspace.owner_id, ready.process_id),
+        )
+
+        self.assertTrue(all(item.status == "EXPIRED" for item in outcomes))
+        events = self.repository.events[ready.execution_id]
+        self.assertEqual(1, sum(event.event_type == "tool.failed" for event in events))
+        self.assertEqual(1, sum(event.event_type == "process.stopped" for event in events))
 
     async def test_production_vercel_selection_never_falls_back_to_local_processes(self):
         sentinel = object()
@@ -418,6 +698,9 @@ class RemoteProcessManagerTests(unittest.IsolatedAsyncioTestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("ADD COLUMN IF NOT EXISTS sandbox_identifier", migration)
         self.assertIn("ADD COLUMN IF NOT EXISTS workspace_revision", migration)
+        self.assertIn("ADD COLUMN IF NOT EXISTS cancellation_requested_at", migration)
+        self.assertIn("'EXPIRED'", migration)
+        self.assertIn("ENGINEERING_ACTIVE_PROCESS_DUPLICATES_DETECTED", migration)
         self.assertIn("uq_workspace_processes_active_workspace", migration)
         self.assertNotIn("DROP TABLE", migration.upper())
 

@@ -4,7 +4,7 @@ from collections.abc import Iterable
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import delete, exists, func, select, update
+from sqlalchemy import delete, exists, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.engineering_workspace import (
@@ -22,6 +22,10 @@ from app.models.memory_models import Conversation
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+ACTIVE_PROCESS_STATUSES = ("STARTING", "RUNNING", "READY", "STOPPING")
+TERMINAL_PROCESS_STATUSES = ("STOPPED", "FAILED", "CANCELLED", "EXPIRED")
 
 
 class EngineeringWorkspaceRepository:
@@ -501,17 +505,171 @@ class EngineeringWorkspaceRepository:
         result = await self.session.execute(
             select(func.count(WorkspaceProcess.process_id)).where(
                 WorkspaceProcess.owner_id == owner_id,
-                WorkspaceProcess.status.in_(("STARTING", "RUNNING")),
+                WorkspaceProcess.status.in_(ACTIVE_PROCESS_STATUSES),
             )
         )
         return int(result.scalar_one())
 
     async def get_process(self, process_id: str, workspace_id: str, owner_id: str) -> WorkspaceProcess | None:
         result = await self.session.execute(
-            select(WorkspaceProcess).where(
+            select(WorkspaceProcess)
+            .where(
                 WorkspaceProcess.process_id == process_id,
                 WorkspaceProcess.workspace_id == workspace_id,
                 WorkspaceProcess.owner_id == owner_id,
             )
+            .execution_options(populate_existing=True)
         )
         return result.scalar_one_or_none()
+
+    async def list_active_processes(self, workspace_id: str, owner_id: str) -> list[WorkspaceProcess]:
+        result = await self.session.execute(
+            select(WorkspaceProcess)
+            .where(
+                WorkspaceProcess.workspace_id == workspace_id,
+                WorkspaceProcess.owner_id == owner_id,
+                WorkspaceProcess.status.in_(ACTIVE_PROCESS_STATUSES),
+            )
+            .order_by(WorkspaceProcess.started_at.desc())
+            .execution_options(populate_existing=True)
+        )
+        return list(result.scalars().all())
+
+    async def list_expired_processes(
+        self,
+        *,
+        limit: int,
+        minimum_age_seconds: int,
+    ) -> list[WorkspaceProcess]:
+        now = utc_now()
+        oldest_started_at = now - timedelta(seconds=max(0, minimum_age_seconds))
+        result = await self.session.execute(
+            select(WorkspaceProcess)
+            .where(
+                WorkspaceProcess.status.in_(ACTIVE_PROCESS_STATUSES),
+                WorkspaceProcess.expires_at.is_not(None),
+                WorkspaceProcess.expires_at <= now,
+                WorkspaceProcess.started_at <= oldest_started_at,
+            )
+            .order_by(WorkspaceProcess.expires_at.asc())
+            .limit(max(1, min(limit, 100)))
+            .execution_options(populate_existing=True)
+        )
+        return list(result.scalars().all())
+
+    async def claim_process_start(
+        self,
+        process_id: str,
+        workspace_id: str,
+        owner_id: str,
+        claim_id: str,
+        *,
+        stale_after_seconds: int = 60,
+    ) -> bool:
+        stale_before = utc_now() - timedelta(seconds=max(5, stale_after_seconds))
+        result = await self.session.execute(
+            update(WorkspaceProcess)
+            .where(
+                WorkspaceProcess.process_id == process_id,
+                WorkspaceProcess.workspace_id == workspace_id,
+                WorkspaceProcess.owner_id == owner_id,
+                WorkspaceProcess.status == "STARTING",
+                WorkspaceProcess.cancellation_requested_at.is_(None),
+                or_(
+                    WorkspaceProcess.startup_claim_id.is_(None),
+                    WorkspaceProcess.startup_claimed_at.is_(None),
+                    WorkspaceProcess.startup_claimed_at <= stale_before,
+                ),
+            )
+            .values(startup_claim_id=claim_id, startup_claimed_at=utc_now())
+            .execution_options(synchronize_session=False)
+        )
+        await self.session.commit()
+        return result.rowcount == 1
+
+    async def claim_process_cleanup(
+        self,
+        process_id: str,
+        workspace_id: str,
+        owner_id: str,
+        claim_id: str,
+        *,
+        stale_after_seconds: int = 60,
+    ) -> bool:
+        stale_before = utc_now() - timedelta(seconds=max(5, stale_after_seconds))
+        result = await self.session.execute(
+            update(WorkspaceProcess)
+            .where(
+                WorkspaceProcess.process_id == process_id,
+                WorkspaceProcess.workspace_id == workspace_id,
+                WorkspaceProcess.owner_id == owner_id,
+                WorkspaceProcess.status == "STOPPING",
+                or_(
+                    WorkspaceProcess.cleanup_claim_id.is_(None),
+                    WorkspaceProcess.cleanup_claimed_at.is_(None),
+                    WorkspaceProcess.cleanup_claimed_at <= stale_before,
+                ),
+            )
+            .values(cleanup_claim_id=claim_id, cleanup_claimed_at=utc_now())
+            .execution_options(synchronize_session=False)
+        )
+        await self.session.commit()
+        return result.rowcount == 1
+
+    async def transition_process(
+        self,
+        *,
+        process_id: str,
+        workspace_id: str,
+        owner_id: str,
+        expected_statuses: Iterable[str],
+        status: str,
+        health_status: str,
+        values: dict[str, Any] | None = None,
+    ) -> tuple[WorkspaceProcess | None, bool]:
+        update_values = dict(values or {})
+        update_values.update(
+            {
+                "status": status,
+                "health_status": health_status,
+                "last_checked_at": utc_now(),
+            }
+        )
+        result = await self.session.execute(
+            update(WorkspaceProcess)
+            .where(
+                WorkspaceProcess.process_id == process_id,
+                WorkspaceProcess.workspace_id == workspace_id,
+                WorkspaceProcess.owner_id == owner_id,
+                WorkspaceProcess.status.in_(tuple(expected_statuses)),
+            )
+            .values(**update_values)
+            .execution_options(synchronize_session=False)
+        )
+        await self.session.commit()
+        return await self.get_process(process_id, workspace_id, owner_id), result.rowcount == 1
+
+    async def get_process_for_preview(
+        self,
+        *,
+        process_id: str,
+        workspace_id: str,
+        owner_id: str,
+        token_hash: str,
+    ) -> WorkspaceProcess | None:
+        result = await self.session.execute(
+            select(WorkspaceProcess)
+            .where(
+                WorkspaceProcess.process_id == process_id,
+                WorkspaceProcess.workspace_id == workspace_id,
+                WorkspaceProcess.owner_id == owner_id,
+                WorkspaceProcess.preview_session_token_hash == token_hash,
+                WorkspaceProcess.preview_session_expires_at > utc_now(),
+            )
+            .execution_options(populate_existing=True)
+        )
+        return result.scalar_one_or_none()
+
+    async def workspace_revision_token(self, workspace_id: str, owner_id: str) -> str:
+        revision, manifest_sha256, _ = await self.workspace_storage_state(workspace_id, owner_id)
+        return f"{revision}:{manifest_sha256}"

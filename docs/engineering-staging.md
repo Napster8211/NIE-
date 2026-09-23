@@ -19,11 +19,24 @@ the Render control plane and never enter the browser or command environment.
 
 One-shot commands use a fresh Sandbox and terminate after reconciliation.
 Development previews use a distinct bounded remote-process lifecycle: the API
-hydrates a fresh Sandbox, starts only an approved structured-argv server command,
-waits for the declared HTTPS port route, persists the remote process handle, and
-can reconnect after an API restart. Stopping or expiry downloads validated file
+first persists a durable `STARTING` record and returns its opaque process ID.
+The first authenticated status poll claims a bounded startup lease, hydrates a
+fresh Sandbox, starts only an approved structured-argv server command, waits for
+the declared HTTPS port route, and persists the remote process handle. A later
+poll can reclaim a stale lease after an API restart. Stopping or expiry downloads validated file
 changes, atomically reconciles the durable manifest, and destroys the Sandbox.
 The Render host never launches the preview command.
+
+The provider route is infrastructure-only. The browser obtains a short-lived,
+path-scoped HttpOnly preview session after Firebase-authenticated authorization,
+then opens only the NIE gateway path. NIE revalidates mode/allowlist policy,
+workspace ownership, process ownership/status/expiry, and workspace revision
+before proxying GET/HEAD traffic. It strips credentials, cookies, forwarded
+headers, provider cookies and redirects; validates the persisted upstream as an
+HTTPS `*.vercel.run` route; and applies response/time limits and no-store/CSP
+headers. The first secure version supports relative HTTP asset paths. Root-
+relative SPA assets, client-side history fallback, WebSockets and Vite HMR are
+not supported; use a production-style preview command for reliable viewing.
 
 ## Pre-deploy checklist
 
@@ -67,6 +80,17 @@ Configure these only in Render staging, never as `VITE_*` variables:
 - `NIE_ENGINEERING_RUNNER_LIVE_PROBE`
 - `NIE_ENGINEERING_PREVIEW_TIMEOUT_SECONDS`
 - `NIE_ENGINEERING_PREVIEW_READINESS_TIMEOUT_SECONDS`
+- `NIE_ENGINEERING_STARTUP_LEASE_SECONDS`
+- `NIE_ENGINEERING_CLEANUP_LEASE_SECONDS`
+- `NIE_ENGINEERING_PREVIEW_SESSION_TTL_SECONDS`
+- `NIE_ENGINEERING_PREVIEW_COOKIE_SECURE`
+- `NIE_ENGINEERING_PREVIEW_COOKIE_SAMESITE`
+- `NIE_ENGINEERING_PREVIEW_MAX_RESPONSE_BYTES`
+- `NIE_ENGINEERING_PREVIEW_CONNECT_TIMEOUT_SECONDS`
+- `NIE_ENGINEERING_PREVIEW_READ_TIMEOUT_SECONDS`
+- `NIE_ENGINEERING_PREVIEW_TOTAL_TIMEOUT_SECONDS`
+- `NIE_ENGINEERING_PROCESS_CLEANUP_LIMIT`
+- `NIE_ENGINEERING_PROCESS_CLEANUP_MIN_AGE_SECONDS`
 - `NIE_ENGINEERING_SYNCHRONIZATION_TIMEOUT_SECONDS`
 - `NIE_ENGINEERING_CLEANUP_TIMEOUT_SECONDS`
 - `NIE_ENGINEERING_NETWORK_POLICY`

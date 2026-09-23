@@ -1,8 +1,9 @@
 import os
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from app.models.engineering_workspace import WorkspaceFileChange, WorkspaceStagedObject
+from scripts.apply_engineering_migration import assert_no_duplicate_active_processes
 from scripts.validate_engineering_staging import validate as validate_staging
 from scripts.verify_engineering_postgres import _validate_disposable_url
 
@@ -65,6 +66,28 @@ class EngineeringPostgresVerifierTests(unittest.TestCase):
         with patch.dict(os.environ, {"NIE_TEST_POSTGRES_ALLOW_UNLABELED": "yes"}, clear=False):
             with self.assertRaises(SystemExit):
                 _validate_disposable_url("postgresql://user:password@127.0.0.1:5432/postgres")
+
+
+class EngineeringMigrationPreflightTests(unittest.IsolatedAsyncioTestCase):
+    async def test_duplicate_active_rows_fail_before_remote_process_ddl(self):
+        connection = AsyncMock()
+        connection.fetchval = AsyncMock(side_effect=[True, True])
+
+        with self.assertRaisesRegex(RuntimeError, "ENGINEERING_ACTIVE_PROCESS_DUPLICATES_DETECTED"):
+            await assert_no_duplicate_active_processes(connection)
+
+        self.assertEqual(2, connection.fetchval.await_count)
+
+    async def test_clean_or_absent_process_table_passes_preflight(self):
+        absent = AsyncMock()
+        absent.fetchval = AsyncMock(return_value=False)
+        await assert_no_duplicate_active_processes(absent)
+        self.assertEqual(1, absent.fetchval.await_count)
+
+        clean = AsyncMock()
+        clean.fetchval = AsyncMock(side_effect=[True, False])
+        await assert_no_duplicate_active_processes(clean)
+        self.assertEqual(2, clean.fetchval.await_count)
 
 
 if __name__ == "__main__":
