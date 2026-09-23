@@ -166,3 +166,11 @@ class ProcessResponse(StrictModel):
     log_excerpt: str = ""
     preview_url: str | None = None
     runner: str = "local"
+    expires_at: datetime | None = None
+    cancellation_requested_at: datetime | None = None
+
+
+class PreviewSessionResponse(StrictModel):
+    process_id: str
+    preview_url: str
+    expires_at: datetime

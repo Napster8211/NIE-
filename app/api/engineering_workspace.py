@@ -1,6 +1,9 @@
 """Authenticated Standard Chat APIs for persistent engineering workspaces."""
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from datetime import datetime, timezone
+
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
+from fastapi.responses import Response as ContentResponse
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -10,6 +13,7 @@ from app.schemas.engineering_workspace import (
     EngineeringChatRequest,
     FileCreateInput,
     FilePatchInput,
+    PreviewSessionResponse,
     ProcessResponse,
     ProcessStartInput,
     StructuredToolResult,
@@ -33,6 +37,13 @@ from app.services.engineering_execution_service import (
     ToolExecutionError,
     ToolExecutionService,
     engineering_tool_schemas,
+)
+from app.services.engineering_preview_gateway import (
+    EngineeringPreviewGateway,
+    preview_cookie_name,
+    preview_cookie_samesite,
+    preview_cookie_secure,
+    preview_gateway_path,
 )
 from app.services.engineering_process_service import build_process_manager
 from app.services.engineering_workspace_service import WorkspaceError, WorkspaceManager
@@ -455,6 +466,21 @@ async def start_workspace_process(
         raise _http_error(error) from error
 
 
+@router.get("/workspaces/{workspace_id}/processes", response_model=list[ProcessResponse])
+async def list_workspace_processes(
+    workspace_id: str,
+    principal: DirectorPrincipal = Depends(require_director_session),
+    db: AsyncSession = Depends(get_db_session),
+):
+    try:
+        return await build_process_manager(EngineeringWorkspaceRepository(db)).list_active(
+            workspace_id,
+            _owner(principal),
+        )
+    except Exception as error:
+        raise _http_error(error) from error
+
+
 @router.get("/workspaces/{workspace_id}/processes/{process_id}", response_model=ProcessResponse)
 async def inspect_workspace_process(
     workspace_id: str,
@@ -483,3 +509,104 @@ async def stop_workspace_process(
         )
     except Exception as error:
         raise _http_error(error) from error
+
+
+@router.post(
+    "/workspaces/{workspace_id}/processes/{process_id}/preview-session",
+    response_model=PreviewSessionResponse,
+)
+async def create_workspace_preview_session(
+    workspace_id: str,
+    process_id: str,
+    response: Response,
+    principal: DirectorPrincipal = Depends(require_browser_mutation),
+    db: AsyncSession = Depends(get_db_session),
+):
+    manager = build_process_manager(EngineeringWorkspaceRepository(db))
+    try:
+        preview, token = await manager.issue_preview_session(
+            workspace_id,
+            _owner(principal),
+            process_id,
+        )
+    except Exception as error:
+        raise _http_error(error) from error
+    maximum_age = max(1, int((preview.expires_at - datetime.now(timezone.utc)).total_seconds()))
+    response.set_cookie(
+        key=preview_cookie_name(process_id),
+        value=token,
+        max_age=maximum_age,
+        httponly=True,
+        secure=preview_cookie_secure(),
+        samesite=preview_cookie_samesite(),
+        path=preview_gateway_path(workspace_id, process_id).rstrip("/"),
+    )
+    return preview
+
+
+async def _proxy_workspace_preview(
+    workspace_id: str,
+    process_id: str,
+    preview_path: str,
+    owner_id: str,
+    request: Request,
+    db: AsyncSession,
+) -> ContentResponse:
+    manager = build_process_manager(EngineeringWorkspaceRepository(db))
+    token = request.cookies.get(preview_cookie_name(process_id), "")
+    try:
+        record = await manager.authorize_preview(workspace_id, owner_id, process_id, token)
+        proxied = await EngineeringPreviewGateway().fetch(
+            provider_url=str(record.provider_preview_url),
+            public_gateway_path=preview_gateway_path(workspace_id, process_id),
+            preview_path=preview_path,
+            query_items=list(request.query_params.multi_items()),
+            request_headers=dict(request.headers),
+            method=request.method,
+        )
+    except ToolExecutionError as error:
+        if error.code in {"PROCESS_NOT_FOUND", "PROCESS_EXPIRED"}:
+            status_code = status.HTTP_404_NOT_FOUND
+        elif error.code == "PREVIEW_RESPONSE_TOO_LARGE":
+            status_code = status.HTTP_502_BAD_GATEWAY
+        elif error.code == "PREVIEW_UPSTREAM_TIMEOUT":
+            status_code = status.HTTP_504_GATEWAY_TIMEOUT
+        else:
+            status_code = status.HTTP_502_BAD_GATEWAY
+        raise HTTPException(status_code=status_code, detail=error.code) from error
+    return ContentResponse(
+        content=proxied.content,
+        status_code=proxied.status_code,
+        headers=proxied.headers,
+    )
+
+
+@router.api_route(
+    "/workspaces/{workspace_id}/processes/{process_id}/preview",
+    methods=["GET", "HEAD"],
+    include_in_schema=False,
+)
+async def proxy_workspace_preview_root(
+    workspace_id: str,
+    process_id: str,
+    request: Request,
+    principal: DirectorPrincipal = Depends(require_director_session),
+    db: AsyncSession = Depends(get_db_session),
+):
+    return await _proxy_workspace_preview(workspace_id, process_id, "", _owner(principal), request, db)
+
+
+@router.api_route(
+    "/workspaces/{workspace_id}/processes/{process_id}/preview/{preview_path:path}",
+    methods=["GET", "HEAD"],
+    include_in_schema=False,
+)
+async def proxy_workspace_preview_path(
+    workspace_id: str,
+    process_id: str,
+    preview_path: str,
+    request: Request,
+    principal: DirectorPrincipal = Depends(require_director_session),
+    db: AsyncSession = Depends(get_db_session),
+):
+    return await _proxy_workspace_preview(workspace_id, process_id, preview_path, _owner(principal), request, db)

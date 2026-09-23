@@ -234,9 +234,20 @@ class WorkspaceProcess(Base):
     sandbox_identifier = Column(String(255), nullable=True)
     runner_process_id = Column(String, nullable=True)
     permitted_port = Column(Integer, nullable=True)
-    preview_url = Column(Text, nullable=True)
+    # Provider routing is infrastructure-only. Browsers receive only an NIE
+    # gateway path computed from workspace_id/process_id.
+    provider_preview_url = Column(Text, nullable=True)
     workspace_revision = Column(String(160), nullable=True)
     provider_metadata = Column(JSON, nullable=False, default=dict)
+    startup_claim_id = Column(String(96), nullable=True)
+    startup_claimed_at = Column(DateTime(timezone=True), nullable=True)
+    cleanup_claim_id = Column(String(96), nullable=True)
+    cleanup_claimed_at = Column(DateTime(timezone=True), nullable=True)
+    cancellation_requested_at = Column(DateTime(timezone=True), nullable=True)
+    stop_reason = Column(String(32), nullable=True)
+    terminal_reason = Column(String(120), nullable=True)
+    preview_session_token_hash = Column(String(64), nullable=True)
+    preview_session_expires_at = Column(DateTime(timezone=True), nullable=True)
     status = Column(String(32), nullable=False, default="STARTING", index=True)
     started_at = Column(DateTime(timezone=True), nullable=False, default=_now)
     last_checked_at = Column(DateTime(timezone=True), nullable=True)
@@ -247,12 +258,21 @@ class WorkspaceProcess(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "status IN ('STARTING', 'RUNNING', 'STOPPED', 'FAILED', 'CANCELLED')",
+            "status IN ('STARTING', 'RUNNING', 'READY', 'STOPPING', 'STOPPED', 'FAILED', 'CANCELLED', 'EXPIRED')",
             name="ck_workspace_process_status",
         ),
         CheckConstraint(
-            "health_status IN ('UNKNOWN', 'STARTING', 'READY', 'FAILED', 'STOPPED')",
+            "health_status IN ('UNKNOWN', 'STARTING', 'RUNNING', 'READY', 'STOPPING', 'STOPPED', "
+            "'FAILED', 'CANCELLED', 'EXPIRED')",
             name="ck_workspace_process_health_status",
+        ),
+        CheckConstraint(
+            "stop_reason IS NULL OR stop_reason IN ('STOP', 'CANCEL', 'EXPIRE')",
+            name="ck_workspace_process_stop_reason",
+        ),
+        CheckConstraint(
+            "preview_session_token_hash IS NULL OR length(preview_session_token_hash) = 64",
+            name="ck_workspace_process_preview_token_hash",
         ),
         CheckConstraint(
             "permitted_port IS NULL OR (permitted_port >= 1024 AND permitted_port <= 65535)",
