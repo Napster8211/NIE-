@@ -42,5 +42,7 @@ tool_registry = ToolRegistry()
 try:
     from app.tools.url_reader import UrlReaderTool
     tool_registry.register(UrlReaderTool())
+    from app.tools.plugins.search_engine import WebIntelligenceTool
+    tool_registry.register(WebIntelligenceTool())
 except ImportError as e:
-    logger.error(f"[ToolRegistry] Failed to import UrlReaderTool: {e}")
+    logger.error(f"[ToolRegistry] Failed to import tools: {e}")
