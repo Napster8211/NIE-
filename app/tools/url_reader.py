@@ -4,7 +4,7 @@ import logging
 import importlib.util
 import re
 from typing import List
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 import httpx
 from bs4 import BeautifulSoup
 from app.tools.base_tool import BaseTool
@@ -13,6 +13,14 @@ logger = logging.getLogger(__name__)
 
 class UrlReaderInput(BaseModel):
     url: str = Field(..., description="The URL to scrape.")
+
+    @field_validator("url", mode="before")
+    @classmethod
+    def clean_url_value(cls, value):
+        """Trim common JSON/string delimiters around a pasted URL."""
+        if isinstance(value, str):
+            return value.strip().rstrip(" \t\r\n.,?!();:]}>'\"")
+        return value
 
 class UrlReaderOutput(BaseModel):
     extracted_text: str = Field(..., description="The cleaned text content.")
@@ -71,7 +79,8 @@ class UrlReaderTool(BaseTool):
             return {"extracted_text": f"Scrape failed: {str(e)}"}
 
     async def execute(self, url: str, **kwargs) -> dict:
-        # Check if playwright is available
+        # Also normalize direct calls that bypass ToolExecutor/Pydantic validation.
+        url = UrlReaderInput.clean_url_value(url)
         has_playwright = importlib.util.find_spec("playwright") is not None
 
         if not has_playwright:

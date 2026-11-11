@@ -1,6 +1,12 @@
 import pytest
 import asyncio
-from app.tools.url_reader import UrlReaderTool
+from app.tools.url_reader import UrlReaderInput, UrlReaderTool
+
+
+def test_url_reader_strips_json_delimiters_from_url():
+    parsed = UrlReaderInput(url='https://github.com/"}')
+    assert parsed.url == "https://github.com/"
+
 
 @pytest.mark.asyncio
 async def test_url_reader_fallback():
