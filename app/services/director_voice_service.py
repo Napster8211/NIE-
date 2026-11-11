@@ -5,7 +5,7 @@ Module: app/services/director_voice_service.py
 from dataclasses import dataclass
 import logging
 import os
-from typing import Optional
+from typing import Any, Dict, Optional, Tuple
 
 import httpx
 
@@ -14,23 +14,23 @@ from app.services.executive_briefing_service import executive_briefing_service
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_VOICE_GATEWAY_TIMEOUT_SECONDS = 45.0
-DEFAULT_DIRECTOR_PIPER_SAMPLE_RATE = 16000
+DEFAULT_ELEVENLABS_TIMEOUT_SECONDS = 30.0
 DEFAULT_MAX_DIRECTOR_SPEECH_CHARS = 5000
+DEFAULT_SAMPLE_RATE = 44100
 
 
 @dataclass(frozen=True)
 class DirectorAudioResult:
-    """Audio and playback metadata returned by the internal voice gateway."""
+    """Audio and playback metadata returned by the ElevenLabs voice service."""
 
     audio_bytes: bytes
-    audio_format: str = "wav"
-    sample_rate: int = DEFAULT_DIRECTOR_PIPER_SAMPLE_RATE
+    audio_format: str = "mp3"
+    sample_rate: int = DEFAULT_SAMPLE_RATE
     channels: int = 1
 
 
 class DirectorVoiceService:
-    """Generate Director audio through NapsterTec's internal Piper gateway."""
+    """Generate Director audio through the ElevenLabs Text-to-Speech API."""
 
     def __init__(self) -> None:
         self._http_client: Optional[httpx.AsyncClient] = None
@@ -51,58 +51,73 @@ class DirectorVoiceService:
             await self._http_client.aclose()
 
     @staticmethod
-    def _positive_float_from_env(name: str, default: float) -> float:
+    def _extract_upstream_error(response: httpx.Response) -> Tuple[Optional[str], Optional[str], Optional[str]]:
         try:
-            value = float(os.getenv(name, str(default)))
-        except (TypeError, ValueError):
-            raise ValueError("VOICE_NOT_CONFIGURED")
-        if value <= 0:
-            raise ValueError("VOICE_NOT_CONFIGURED")
-        return value
+            body: Dict[str, Any] = response.json()
+        except Exception:
+            return None, None, None
+
+        detail = body.get("detail")
+        if isinstance(detail, dict):
+            code = detail.get("code") or detail.get("type")
+            message = detail.get("message")
+            request_id = detail.get("request_id")
+            return code, message, request_id
+
+        if isinstance(detail, str):
+            return None, detail, None
+
+        return None, None, None
 
     @staticmethod
-    def _positive_int_from_env(name: str, default: int) -> int:
-        try:
-            value = int(os.getenv(name, str(default)))
-        except (TypeError, ValueError):
-            raise ValueError("VOICE_NOT_CONFIGURED")
-        if value <= 0:
-            raise ValueError("VOICE_NOT_CONFIGURED")
-        return value
+    def _raise_for_upstream_error(response: httpx.Response) -> None:
+        code, _message, _request_id = DirectorVoiceService._extract_upstream_error(response)
 
-    @staticmethod
-    def _raise_for_gateway_error(response: httpx.Response) -> None:
-        status = response.status_code
-        if status in (401, 403):
-            logger.warning("[DirectorVoice] Voice gateway authorization failed status=%s", status)
-            raise ValueError("VOICE_GATEWAY_UNAUTHORIZED")
-        if status == 429:
-            logger.warning("[DirectorVoice] Voice gateway rate limited the request")
-            raise ValueError("VOICE_GATEWAY_RATE_LIMITED")
-        if 500 <= status <= 599:
-            logger.warning("[DirectorVoice] Voice gateway unavailable status=%s", status)
-            raise ValueError("VOICE_GATEWAY_UNAVAILABLE")
+        if response.status_code == 402 or code == "paid_plan_required":
+            logger.warning("[DirectorVoice] ElevenLabs plan restriction status=%s", response.status_code)
+            raise ValueError("ELEVENLABS_PAID_PLAN_REQUIRED")
+
+        if response.status_code in (401, 403):
+            logger.warning("[DirectorVoice] ElevenLabs authorization failure status=%s", response.status_code)
+            raise ValueError("ELEVENLABS_UNAUTHORIZED")
+
+        if response.status_code == 429:
+            logger.warning("[DirectorVoice] ElevenLabs rate limit status=%s", response.status_code)
+            raise ValueError("ELEVENLABS_RATE_LIMITED")
+
+        if 500 <= response.status_code <= 599:
+            logger.warning("[DirectorVoice] ElevenLabs unavailable status=%s", response.status_code)
+            raise ValueError("ELEVENLABS_UNAVAILABLE")
+
         raise ValueError("VOICE_GENERATION_FAILED")
 
     async def synthesize_text(self, text: str) -> DirectorAudioResult:
-        """Synthesize normalized text through the private Piper WAV endpoint."""
-        gateway_url = os.getenv("VOICE_GATEWAY_URL", "").strip()
-        gateway_key = os.getenv("VOICE_GATEWAY_API_KEY", "").strip()
-        if not gateway_url or not gateway_key:
+        """Synthesize normalized text through ElevenLabs Text-to-Speech."""
+        api_key = os.getenv("ELEVENLABS_API_KEY", "").strip()
+        voice_id = os.getenv("ELEVENLABS_VOICE_ID", "").strip()
+        model_id = os.getenv("ELEVENLABS_MODEL_ID", "eleven_multilingual_v2").strip()
+
+        if not api_key or not voice_id:
+            logger.error(
+                "[DirectorVoice] Missing ElevenLabs configuration (API key present: %s, voice ID present: %s)",
+                bool(api_key),
+                bool(voice_id),
+            )
             raise ValueError("VOICE_NOT_CONFIGURED")
 
-        timeout_seconds = self._positive_float_from_env(
-            "VOICE_GATEWAY_TIMEOUT_SECONDS",
-            DEFAULT_VOICE_GATEWAY_TIMEOUT_SECONDS,
-        )
-        fallback_sample_rate = self._positive_int_from_env(
-            "DIRECTOR_PIPER_SAMPLE_RATE",
-            DEFAULT_DIRECTOR_PIPER_SAMPLE_RATE,
-        )
-        max_chars = self._positive_int_from_env(
-            "MAX_DIRECTOR_SPEECH_CHARS",
-            DEFAULT_MAX_DIRECTOR_SPEECH_CHARS,
-        )
+        try:
+            timeout_seconds = float(os.getenv("ELEVENLABS_TIMEOUT_SECONDS", str(DEFAULT_ELEVENLABS_TIMEOUT_SECONDS)))
+            if timeout_seconds <= 0:
+                timeout_seconds = DEFAULT_ELEVENLABS_TIMEOUT_SECONDS
+        except (TypeError, ValueError):
+            timeout_seconds = DEFAULT_ELEVENLABS_TIMEOUT_SECONDS
+
+        try:
+            max_chars = int(os.getenv("MAX_DIRECTOR_SPEECH_CHARS", str(DEFAULT_MAX_DIRECTOR_SPEECH_CHARS)))
+            if max_chars <= 0:
+                max_chars = DEFAULT_MAX_DIRECTOR_SPEECH_CHARS
+        except (TypeError, ValueError):
+            max_chars = DEFAULT_MAX_DIRECTOR_SPEECH_CHARS
 
         speech_text = " ".join((text or "").split())
         if not speech_text:
@@ -110,56 +125,55 @@ class DirectorVoiceService:
         if len(speech_text) > max_chars:
             raise ValueError("SPEECH_TOO_LONG")
 
-        url = f"{gateway_url.rstrip('/')}/api/v1/tts/wav"
+        url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
         headers = {
-            "Accept": "audio/wav",
+            "Accept": "audio/mpeg",
             "Content-Type": "application/json",
-            "X-NapsterTec-Key": gateway_key,
+            "xi-api-key": api_key,
+        }
+        payload = {
+            "text": speech_text,
+            "model_id": model_id,
+            "voice_settings": {
+                "stability": 0.5,
+                "similarity_boost": 0.8,
+                "style": 0.0,
+                "use_speaker_boost": True,
+            },
         }
 
         try:
             response = await self._get_http_client().post(
                 url,
-                json={"text": speech_text},
+                json=payload,
                 headers=headers,
                 timeout=timeout_seconds,
             )
         except httpx.TimeoutException:
-            raise ValueError("VOICE_GATEWAY_TIMEOUT")
+            raise ValueError("ELEVENLABS_TIMEOUT")
         except httpx.RequestError:
-            logger.warning("[DirectorVoice] Voice gateway transport unavailable")
-            raise ValueError("VOICE_GATEWAY_UNAVAILABLE")
+            logger.warning("[DirectorVoice] ElevenLabs network transport unavailable")
+            raise ValueError("ELEVENLABS_UNAVAILABLE")
         except ValueError:
             raise
         except Exception:
-            logger.exception("[DirectorVoice] Unexpected voice gateway transport failure")
-            raise ValueError("VOICE_GATEWAY_UNAVAILABLE")
+            logger.exception("[DirectorVoice] Unexpected ElevenLabs transport failure")
+            raise ValueError("ELEVENLABS_UNAVAILABLE")
 
         if response.status_code != 200:
-            self._raise_for_gateway_error(response)
+            self._raise_for_upstream_error(response)
         if not response.content:
             raise ValueError("VOICE_GENERATION_FAILED")
 
-        sample_rate = fallback_sample_rate
-        sample_rate_header = response.headers.get("X-Sample-Rate")
-        if sample_rate_header:
-            try:
-                parsed_sample_rate = int(sample_rate_header)
-                if parsed_sample_rate > 0:
-                    sample_rate = parsed_sample_rate
-            except (TypeError, ValueError):
-                pass
-
         return DirectorAudioResult(
             audio_bytes=response.content,
-            audio_format="wav",
-            sample_rate=sample_rate,
+            audio_format="mp3",
+            sample_rate=DEFAULT_SAMPLE_RATE,
             channels=1,
         )
 
     async def generate_briefing_audio(self, request: DirectorVoiceRequest) -> bytes:
-        """Resolve a canonical briefing and return its WAV bytes."""
-
+        """Resolve a canonical briefing and return its audio bytes."""
         speech_text = ""
 
         try:
@@ -190,5 +204,6 @@ class DirectorVoiceService:
 
         result = await self.synthesize_text(speech_text)
         return result.audio_bytes
+
 
 director_voice_service = DirectorVoiceService()

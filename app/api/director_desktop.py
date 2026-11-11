@@ -241,7 +241,7 @@ async def speak_briefing(request: DirectorVoiceRequest, principal: DirectorPrinc
         audio_bytes = await director_voice_service.generate_briefing_audio(request)
         return Response(
             content=audio_bytes,
-            media_type="audio/wav",
+            media_type="audio/mpeg",
             headers={"Cache-Control": "no-store"},
         )
     except ValueError as e:
@@ -252,6 +252,11 @@ async def speak_briefing(request: DirectorVoiceRequest, principal: DirectorPrinc
             "BRIEFING_GENERATION_FAILED": 500,
             "EMPTY_SPEECH_TEXT": 422,
             "SPEECH_TOO_LONG": 413,
+            "ELEVENLABS_UNAUTHORIZED": 502,
+            "ELEVENLABS_PAID_PLAN_REQUIRED": 402,
+            "ELEVENLABS_RATE_LIMITED": 429,
+            "ELEVENLABS_TIMEOUT": 504,
+            "ELEVENLABS_UNAVAILABLE": 503,
             "VOICE_GATEWAY_UNAUTHORIZED": 502,
             "VOICE_GATEWAY_RATE_LIMITED": 429,
             "VOICE_GATEWAY_TIMEOUT": 504,
