@@ -1,5 +1,5 @@
 import logging
-from typing import Dict, List, Type, Any
+from typing import List, Type, Any
 from abc import ABC, abstractmethod
 from pydantic import BaseModel
 
@@ -9,7 +9,7 @@ logger = logging.getLogger(__name__)
 
 
 class BaseTool(ABC):
-    """Abstract base class for all tools. Any new tool must implement the required properties."""
+    """Base contract for tools, with optional streaming support."""
 
     name: str = ""
     description: str = ""
@@ -24,10 +24,9 @@ class BaseTool(ABC):
 
     @abstractmethod
     async def execute(self, **kwargs) -> Any:
-        """Execute the tool with keyword arguments and return a result object or dict."""
+        """Execute the tool and return its result."""
         raise NotImplementedError
 
-    @abstractmethod
     async def execute_stream(self, **kwargs):
-        """Optional streaming implementation for tools that stream incremental output."""
-        raise NotImplementedError
+        """Optional streaming interface; non-streaming tools need not override it."""
+        raise NotImplementedError(f"Streaming is not supported by {self.name}.")
