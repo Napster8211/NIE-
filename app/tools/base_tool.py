@@ -1,74 +1,33 @@
+import logging
+from typing import Dict, List, Type, Any
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Type, AsyncGenerator
 from pydantic import BaseModel
+
 from app.tools.tool_models import RetryPolicy
 
+logger = logging.getLogger(__name__)
+
+
 class BaseTool(ABC):
-    """
-    Enterprise tool contract. Every dynamically registered tool must inherit from this.
-    """
-    
-    @property
-    @abstractmethod
-    def name(self) -> str:
-        """Unique identifier for the tool."""
-        pass
+    """Abstract base class for all tools. Any new tool must implement the required properties."""
 
-    @property
-    @abstractmethod
-    def description(self) -> str:
-        """LLM-friendly description of what the tool does."""
-        pass
-
-    @property
-    @abstractmethod
-    def capabilities(self) -> List[str]:
-        """System tags (e.g., ['network', 'read-only', 'compute'])."""
-        pass
-
-    @property
-    @abstractmethod
-    def permissions(self) -> List[str]:
-        """Required RBAC or security permissions (e.g., ['internet_access'])."""
-        pass
-
-    @property
-    @abstractmethod
-    def input_schema(self) -> Type[BaseModel]:
-        """Pydantic model defining strict input requirements."""
-        pass
-
-    @property
-    @abstractmethod
-    def output_schema(self) -> Type[BaseModel]:
-        """Pydantic model defining the guaranteed output structure."""
-        pass
-
-    @property
-    def timeout(self) -> float:
-        """Default execution timeout in seconds."""
-        return 15.0
-
-    @property
-    def retry_policy(self) -> RetryPolicy:
-        """Default retry configuration."""
-        return RetryPolicy()
-        
-    @property
-    def approval_required(self) -> bool:
-        """Whether this tool requires an explicit human ApprovalRequest prior to execution."""
-        return False
-        
-    @property
-    def operation_type(self) -> str:
-        """Deterministic action footprint identity (e.g., 'OUTREACH', 'CRM_MUTATION')."""
-        return "GENERAL"
+    name: str = ""
+    description: str = ""
+    capabilities: List[str] = []
+    permissions: List[str] = []
+    input_schema: Type[BaseModel] = BaseModel
+    output_schema: Type[BaseModel] = BaseModel
+    timeout: float = 30.0
+    retry_policy: RetryPolicy = RetryPolicy()
+    approval_required: bool = False
+    operation_type: str = "read"
 
     @abstractmethod
     async def execute(self, **kwargs) -> Any:
-        """Core execution logic. Receives validated input schema fields."""
-        pass
-        
-    async def execute_stream(self, **kwargs) -> AsyncGenerator[Any, None]:
-        """Optional streaming execution logic."""
-        raise NotImplementedError(f"Streaming is not supported by {self.name}.")
+        """Execute the tool with keyword arguments and return a result object or dict."""
+        raise NotImplementedError
+
+    @abstractmethod
+    async def execute_stream(self, **kwargs):
+        """Optional streaming implementation for tools that stream incremental output."""
+        raise NotImplementedError
