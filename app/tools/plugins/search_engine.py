@@ -56,6 +56,10 @@ class WebIntelligenceTool(BaseTool):
         return ["search", "ranking", "data-extraction"]
 
     @property
+    def permissions(self) -> List[str]:
+        return ["internet_access"]
+
+    @property
     def input_schema(self) -> type[BaseModel]:
         return WebSearchInput
 
