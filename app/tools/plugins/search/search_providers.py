@@ -140,7 +140,7 @@ class DuckDuckGoProvider(BaseSearchProvider):
         # Using lite DDG HTML version to avoid JS rendering overhead
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"}
         async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
-            response = await client.post(self.endpoint, data={"q": query}, headers=headers)
+            response = await client.get(self.endpoint, params={"q": query}, headers=headers)
             response.raise_for_status()
             from bs4 import BeautifulSoup
             soup = BeautifulSoup(response.text, "html.parser")
