@@ -18,9 +18,9 @@ class WebsiteEngine:
     async def process_and_save(self, lead_id: str, raw_audit: Dict[str, Any], session_id: str) -> Dict[str, Any]:
         """Converts raw data into an Artifact and persists it."""
         try:
-            # In a real environment, we map dicts to Pydantic models here.
-            # Since our mocked tool already formats exactly to the schema, we can parse it directly.
+            import uuid
             artifact = WebsiteArtifact(
+                artifact_id=f"art_web_{uuid.uuid4().hex[:8]}",
                 agent_run_id=session_id,
                 lead_id=lead_id,
                 target_url=raw_audit.get("target_url"),

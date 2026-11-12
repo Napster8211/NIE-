@@ -39,27 +39,23 @@ class WebsiteContextBuilderTool(BaseTool):
             # We slice from original but keep a lowercased check version
             clean_query = query[clean_query.index(" for ") + 4:].strip().strip('.!?"\'')
 
-        # ULTRA-FAST PATH: Use .lower() to ensure the "mock" check is case-insensitive!
-        if "mock" in clean_query.lower() or "lead #1" in clean_query.lower():
-            context = WebsiteAgentContext(
-                lead_id="lead_001",
-                business_name="Mock Restaurants 1",
-                website="https://example1.com",
-                phone="+1 555-0100",
-                address="123 Main St, Accra, Ghana",
-                category="Restaurant",
-                place_id="ChIJmockplaceid0001",
-                metadata={"provider": "Mock Generation"}
-            )
-            return {"found": True, "isolated_context": context.model_dump()}
-
-        # Regular Database Query
+        # Resolve lead from database, rejecting mock shortcuts
         try:
             async with AsyncSessionLocal() as db:
-                stmt = select(Lead).filter(Lead.business_name.ilike(f"%{clean_query}%")).limit(1)
-                result = await db.execute(stmt)
-                lead = result.scalar_one_or_none()
-                
+                lead = None
+                # If asking for top lead, lead #1, or generic query, resolve the latest genuine lead
+                if any(k in clean_query.lower() for k in ("lead #1", "top lead", "latest", "first lead", "top")):
+                    stmt = select(Lead).filter(~Lead.business_name.ilike("%mock%")).order_by(Lead.created_at.desc()).limit(1)
+                    lead = (await db.execute(stmt)).scalar_one_or_none()
+
+                if not lead and clean_query and not any(k in clean_query.lower() for k in ("lead", "business", "restaurant")):
+                    stmt = select(Lead).filter(Lead.business_name.ilike(f"%{clean_query}%")).limit(1)
+                    lead = (await db.execute(stmt)).scalar_one_or_none()
+
+                if not lead:
+                    stmt = select(Lead).filter(~Lead.business_name.ilike("%mock%")).order_by(Lead.created_at.desc()).limit(1)
+                    lead = (await db.execute(stmt)).scalar_one_or_none()
+
                 if not lead:
                     return {"found": False, "error": f"No lead found for '{clean_query}'"}
                 
@@ -129,25 +125,25 @@ class WebsiteInspectorTool(BaseTool):
                 page_text = soup.get_text()
                 has_booking = bool(re.search(r"reservation|booking|reserve a table|order online|menu", page_text, re.I))
 
-                detected_tech = [{"name": server, "confidence": 1.0, "evidence": {"source": "HTTP Headers", "verification_method": "Header Inspection", "detail": f"Server header: {server}"}}]
+                detected_tech = [{"name": server, "confidence": 1.0, "evidence": {"source": "HTTP Headers", "verification_method": "Header Inspection", "confidence": 1.0, "detail": f"Server header: {server}"}}]
                 if "wp-content" in resp.text:
-                    detected_tech.append({"name": "WordPress CMS", "confidence": 0.99, "evidence": {"source": "HTML Source", "verification_method": "Path Pattern", "detail": "wp-content paths detected."}})
+                    detected_tech.append({"name": "WordPress CMS", "confidence": 0.99, "evidence": {"source": "HTML Source", "verification_method": "Path Pattern", "confidence": 0.99, "detail": "wp-content paths detected."}})
                 elif "react" in resp.text.lower() or "next" in resp.text.lower() or "_next" in resp.text:
-                    detected_tech.append({"name": "React / Next.js", "confidence": 0.95, "evidence": {"source": "DOM Analysis", "verification_method": "Pattern", "detail": "Next.js / React hydration markers."}})
+                    detected_tech.append({"name": "React / Next.js", "confidence": 0.95, "evidence": {"source": "DOM Analysis", "verification_method": "Pattern", "confidence": 0.95, "detail": "Next.js / React hydration markers."}})
                 else:
-                    detected_tech.append({"name": "Modern HTML5 Web Application", "confidence": 0.90, "evidence": {"source": "DOM Analysis", "verification_method": "HTML Parsing", "detail": "Semantic HTML5 structure."}})
+                    detected_tech.append({"name": "Modern HTML5 Web Application", "confidence": 0.90, "evidence": {"source": "DOM Analysis", "verification_method": "HTML Parsing", "confidence": 0.90, "detail": "Semantic HTML5 structure."}})
 
                 return {
                     "target_url": target,
                     "status": "reachable",
                     "technology": detected_tech,
                     "business_signals": [
-                        {"name": "HTTPS Encryption", "present": has_ssl, "evidence": {"source": "TLS Protocol", "verification_method": "Deterministic", "detail": "SSL encryption active." if has_ssl else "Plaintext HTTP."}},
-                        {"name": "Digital Reservation / Menu", "present": has_booking, "evidence": {"source": "Content Analysis", "verification_method": "Keyword Search", "detail": "Direct reservation or digital menu identified." if has_booking else "No online booking flow detected."}}
+                        {"name": "HTTPS Encryption", "present": has_ssl, "evidence": {"source": "TLS Protocol", "verification_method": "Deterministic", "confidence": 1.0, "detail": "SSL encryption active." if has_ssl else "Plaintext HTTP."}},
+                        {"name": "Digital Reservation / Menu", "present": has_booking, "evidence": {"source": "Content Analysis", "verification_method": "Keyword Search", "confidence": 0.9, "detail": "Direct reservation or digital menu identified." if has_booking else "No online booking flow detected."}}
                     ],
                     "recommendations": [
-                        {"category": "SEO", "priority": "High" if not desc_text else "Low", "reason": "Missing Meta Description" if not desc_text else "Meta Description Configured", "evidence": {"source": "HTML <head>", "verification_method": "Deterministic", "detail": "Provide meta description for search snippets." if not desc_text else "Verified meta description."}},
-                        {"category": "Conversion", "priority": "High" if not has_booking else "Low", "reason": "Streamline Online Reservations" if not has_booking else "Reservation Gateway Operational", "evidence": {"source": "User Flow", "verification_method": "Interaction Scan", "detail": "Add instant table reservation widget to capture diners." if not has_booking else "Booking available."}}
+                        {"category": "SEO", "priority": "High" if not desc_text else "Low", "reason": "Missing Meta Description" if not desc_text else "Meta Description Configured", "evidence": {"source": "HTML <head>", "verification_method": "Deterministic", "confidence": 0.9, "detail": "Provide meta description for search snippets." if not desc_text else "Verified meta description."}},
+                        {"category": "Conversion", "priority": "High" if not has_booking else "Low", "reason": "Streamline Online Reservations" if not has_booking else "Reservation Gateway Operational", "evidence": {"source": "User Flow", "verification_method": "Interaction Scan", "confidence": 0.9, "detail": "Add instant table reservation widget to capture diners." if not has_booking else "Booking available."}}
                     ],
                     "seo": {"title": title[:100], "h1_count": h1_count, "description": desc_text[:160]}
                 }
@@ -157,14 +153,14 @@ class WebsiteInspectorTool(BaseTool):
                 "target_url": target,
                 "status": "reachable (domain active)",
                 "technology": [
-                    {"name": "Cloudflare Edge", "confidence": 0.9, "evidence": {"source": "DNS Analysis", "verification_method": "Edge Routing", "detail": f"Domain {domain} active."}}
+                    {"name": "Cloudflare Edge", "confidence": 0.9, "evidence": {"source": "DNS Analysis", "verification_method": "Edge Routing", "confidence": 0.9, "detail": f"Domain {domain} active."}}
                 ],
                 "business_signals": [
-                    {"name": "Registered Digital Footprint", "present": True, "evidence": {"source": "Domain Lookup", "verification_method": "Deterministic", "detail": f"Domain {domain} registered."}},
-                    {"name": "Automated Ordering Flow", "present": False, "evidence": {"source": "Crawler", "verification_method": "Port Scan", "detail": "No automated ordering API detected."}}
+                    {"name": "Registered Digital Footprint", "present": True, "evidence": {"source": "Domain Lookup", "verification_method": "Deterministic", "confidence": 0.9, "detail": f"Domain {domain} registered."}},
+                    {"name": "Automated Ordering Flow", "present": False, "evidence": {"source": "Crawler", "verification_method": "Port Scan", "confidence": 0.8, "detail": "No automated ordering API detected."}}
                 ],
                 "recommendations": [
-                    {"category": "Digital Onboarding", "priority": "High", "reason": "Deploy Modern Restaurant Platform", "evidence": {"source": "Footprint Scan", "verification_method": "Audit", "detail": "Scaffold branded landing page with digital menu and booking."}}
+                    {"category": "Digital Onboarding", "priority": "High", "reason": "Deploy Modern Restaurant Platform", "evidence": {"source": "Footprint Scan", "verification_method": "Audit", "confidence": 0.9, "detail": "Scaffold branded landing page with digital menu and booking."}}
                 ],
                 "seo": {"title": f"{domain.capitalize()} Official Domain", "h1_count": 1, "description": "Active business domain"}
             }

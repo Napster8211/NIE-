@@ -39,19 +39,8 @@ class AcquisitionContextBuilderTool(BaseTool):
         original_query = query.lower()
         clean_query = original_query
         
-        # Check original string for the mock fast-path before any slicing occurs
-        if "mock" in original_query or "lead #1" in original_query:
-            context = AcquisitionAgentContext(
-                lead_id="lead_001",
-                business_name="Mock Restaurants 1",
-                category="Restaurant",
-                phone="+233246952225",
-                verified_issues=["No functional digital presence", "No Reservation System"],
-                solution_type="Restaurant Digital Platform",
-                preview_url="https://mockrestaurants1.demo.napstertec.com",
-                deployment_status="Success"
-            )
-            return {"found": True, "isolated_context": context.model_dump()}
+        # Check if query requests the top/latest lead
+        is_top_lead_query = any(k in original_query for k in ("lead #1", "top lead", "latest lead", "first lead"))
 
         # Simple parsing for actual database queries
         if " for " in clean_query:
@@ -62,8 +51,19 @@ class AcquisitionContextBuilderTool(BaseTool):
 
         async with AsyncSessionLocal() as db:
             try:
-                stmt = select(Lead).filter(Lead.business_name.ilike(f"%{clean_query}%")).limit(1)
-                lead = (await db.execute(stmt)).scalar_one_or_none()
+                lead = None
+                if is_top_lead_query:
+                    stmt = select(Lead).filter(~Lead.business_name.ilike("%mock%")).order_by(Lead.created_at.desc()).limit(1)
+                    lead = (await db.execute(stmt)).scalar_one_or_none()
+
+                if not lead and clean_query:
+                    stmt = select(Lead).filter(Lead.business_name.ilike(f"%{clean_query}%")).limit(1)
+                    lead = (await db.execute(stmt)).scalar_one_or_none()
+
+                if not lead:
+                    stmt = select(Lead).filter(~Lead.business_name.ilike("%mock%")).order_by(Lead.created_at.desc()).limit(1)
+                    lead = (await db.execute(stmt)).scalar_one_or_none()
+
                 if not lead:
                     return {"found": False, "error": f"Lead not found for '{clean_query}'."}
 
