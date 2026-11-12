@@ -225,6 +225,7 @@ class OwnerActionItem(DesktopBaseModel):
     available_actions: List[str] = Field(...)
     source_type: str = Field(...)
     source_id: str = Field(...)
+    context_data: Optional[Dict[str, Any]] = Field(default_factory=dict)
 
 class RiskView(DesktopBaseModel):
     risk_id: str = Field(...)

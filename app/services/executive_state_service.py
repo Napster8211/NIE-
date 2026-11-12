@@ -248,7 +248,8 @@ class ExecutiveStateService:
                 created_at=a.created_at,
                 available_actions=["Approve", "Reject"],
                 source_type="APPROVAL_GATE",
-                source_id=a.approval_id
+                source_id=a.approval_id,
+                context_data=a.context_summary or {}
             ))
         objs = self.objective_repo.list()
         for o in objs:
