@@ -128,7 +128,13 @@ from app.tools.plugins.business_operations_tools import BusinessOperationsContex
 from app.agent.definitions.business_operations_agent import BusinessOperationsIntelligenceAgent
 
 # --- SPRINT 23 IMPORTS (Finance Intelligence) ---
-from app.tools.plugins.finance_tools import FinanceContextBuilderTool, FinanceEvaluatorTool, FinanceSaverTool
+from app.tools.plugins.finance_tools import (
+    FinanceContextBuilderTool,
+    FinanceEvaluatorTool,
+    FinanceSaverTool,
+    GetObjectiveFinancialSummaryTool,
+    AssessAffordabilityTool,
+)
 from app.agent.definitions.finance_agent import FinanceIntelligenceAgent
 
 # --- SPRINT 24 IMPORTS (Director Intelligence) ---
@@ -247,6 +253,8 @@ tool_registry.register(BusinessOperationsSaverTool())
 tool_registry.register(FinanceContextBuilderTool())
 tool_registry.register(FinanceEvaluatorTool())
 tool_registry.register(FinanceSaverTool())
+tool_registry.register(GetObjectiveFinancialSummaryTool())
+tool_registry.register(AssessAffordabilityTool())
 
 tool_registry.register(DirectorContextBuilderTool())
 tool_registry.register(DirectorEvaluatorTool())
