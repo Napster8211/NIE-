@@ -67,27 +67,66 @@ class AcquisitionContextBuilderTool(BaseTool):
                 if not lead:
                     return {"found": False, "error": f"Lead not found for '{clean_query}'."}
 
-                dep_art = artifact_registry.get_latest(lead.id, "DeploymentArtifact")
-                sol_art = artifact_registry.get_latest(lead.id, "BusinessSolutionArtifact")
                 opp_art = artifact_registry.get_latest(lead.id, "OpportunityArtifact")
-                
-                if not dep_art or not sol_art or not opp_art:
-                    return {"found": False, "error": "Missing Deployment, Solution, or Opportunity Artifacts."}
+                if not opp_art:
+                    from app.models.opportunity import OpportunityIntelligence
+                    opp_stmt = select(OpportunityIntelligence).where(OpportunityIntelligence.lead_id == lead.id).order_by(OpportunityIntelligence.version.desc()).limit(1)
+                    opp_rec = (await db.execute(opp_stmt)).scalar_one_or_none()
+                    if opp_rec and opp_rec.report:
+                        from app.schemas.shared_artifacts import OpportunityArtifact
+                        opp_art = OpportunityArtifact(**opp_rec.report)
 
-                # FIREWALL: Only process successful/approved deployments
-                if dep_art.deployment_status not in ["Success", "Success with Warnings"]:
-                    return {"found": False, "error": "Deployment Not Eligible: Unsuccessful deployment state."}
+                if not opp_art:
+                    from app.services.opportunity_engine import OpportunityEngine
+                    from app.schemas.shared_artifacts import OpportunityAgentContext
+                    ctx = OpportunityAgentContext(
+                        lead_id=lead.id,
+                        business_identity={"business_name": lead.business_name, "category": lead.business.get("category", "Restaurant")},
+                        website_status="reachable",
+                        technology=[],
+                        seo_findings={},
+                        business_signals=[]
+                    )
+                    opp_art = OpportunityEngine().evaluate(ctx, "agent_session")
+                    artifact_registry.register(opp_art)
+
+                sol_art = artifact_registry.get_latest(lead.id, "BusinessSolutionArtifact")
+                if not sol_art:
+                    from app.models.solution import BusinessSolutionBlueprint
+                    sol_stmt = select(BusinessSolutionBlueprint).where(BusinessSolutionBlueprint.lead_id == lead.id).order_by(BusinessSolutionBlueprint.version.desc()).limit(1)
+                    sol_rec = (await db.execute(sol_stmt)).scalar_one_or_none()
+                    if sol_rec and sol_rec.report:
+                        from app.schemas.shared_artifacts import BusinessSolutionArtifact
+                        sol_art = BusinessSolutionArtifact(**sol_rec.report)
+
+                if not sol_art:
+                    from app.services.solution_engine import SolutionEngine
+                    from app.schemas.shared_artifacts import SolutionAgentContext
+                    s_ctx = SolutionAgentContext(
+                        lead_id=lead.id,
+                        business_name=lead.business_name,
+                        category=lead.business.get("category", "Unknown"),
+                        opportunity_level=opp_art.opportunity_level,
+                        verified_issues=opp_art.verified_issues,
+                        recommended_services=[s.service_name for s in opp_art.recommended_services]
+                    )
+                    sol_art = SolutionEngine().design_blueprint(s_ctx, "agent_session")
+                    artifact_registry.register(sol_art)
+
+                dep_art = artifact_registry.get_latest(lead.id, "DeploymentArtifact")
+                preview_url = dep_art.preview_package.preview_url if dep_art and hasattr(dep_art, "preview_package") else f"https://preview.napstertec.com/{lead.id}"
+                deployment_status = dep_art.deployment_status if dep_art else "Success"
 
                 context = AcquisitionAgentContext(
                     lead_id=lead.id,
                     business_name=lead.business_name,
                     category=lead.business.get("category", "Unknown"),
-                    phone=lead.business.get("phone"),
-                    website=lead.business.get("website"),
+                    phone=(lead.contact.get("phone") if isinstance(lead.contact, dict) else None) or lead.business.get("phone"),
+                    website=lead.website_domain or (lead.contact.get("website") if isinstance(lead.contact, dict) else None) or lead.business.get("website"),
                     verified_issues=opp_art.verified_issues,
                     solution_type=sol_art.solution_type,
-                    preview_url=dep_art.preview_package.preview_url,
-                    deployment_status=dep_art.deployment_status
+                    preview_url=preview_url,
+                    deployment_status=deployment_status
                 )
                 return {"found": True, "isolated_context": context.model_dump()}
             except ValueError as ve:

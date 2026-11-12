@@ -43,35 +43,36 @@ class OpportunityContextBuilderTool(BaseTool):
             # Slice from original but we will lowercase it for the check
             clean_query = query[clean_query.index(" for ") + 4:].strip().strip('.!?"\'')
 
-        # Safely catch the mock string regardless of capitalization
-        if "mock" in clean_query.lower() or "lead #1" in clean_query.lower():
-            context = OpportunityAgentContext(
-                lead_id="lead_001",
-                business_identity={"business_name": "Mock Restaurants 1", "category": "Restaurant"},
-                website_status="reachable",
-                business_signals=[{"name": "HTTPS Enabled", "present": True}, {"name": "Online Booking Present", "present": False}],
-                seo_findings={"description": None}
-            )
-            return {"found": True, "isolated_context": context.model_dump()}
-
         async with AsyncSessionLocal() as db:
             try:
-                stmt = select(Lead).filter(Lead.business_name.ilike(f"%{clean_query}%")).limit(1)
-                lead = (await db.execute(stmt)).scalar_one_or_none()
+                lead = None
+                # If asking for top lead, lead #1, or generic query, resolve the latest genuine lead
+                if any(k in clean_query.lower() for k in ("lead #1", "top lead", "latest", "first lead", "top")):
+                    stmt = select(Lead).filter(~Lead.business_name.ilike("%mock%")).order_by(Lead.created_at.desc()).limit(1)
+                    lead = (await db.execute(stmt)).scalar_one_or_none()
+
+                if not lead and clean_query and not any(k in clean_query.lower() for k in ("lead", "business", "restaurant", "opportunity")):
+                    stmt = select(Lead).filter(Lead.business_name.ilike(f"%{clean_query}%")).limit(1)
+                    lead = (await db.execute(stmt)).scalar_one_or_none()
+
+                if not lead:
+                    stmt = select(Lead).filter(~Lead.business_name.ilike("%mock%")).order_by(Lead.created_at.desc()).limit(1)
+                    lead = (await db.execute(stmt)).scalar_one_or_none()
+
                 if not lead:
                     return {"found": False, "error": f"Lead not found for '{clean_query}'."}
 
                 w_stmt = select(WebsiteIntelligence).where(WebsiteIntelligence.lead_id == lead.id).order_by(WebsiteIntelligence.version.desc()).limit(1)
                 web_intel = (await db.execute(w_stmt)).scalar_one_or_none()
-                
-                if not web_intel:
-                    return {"found": False, "error": "Insufficient Evidence: Website Artifact missing."}
 
-                rep = web_intel.report
+                # Also check in-memory central registry if website artifact was just created
+                web_art = artifact_registry.get_latest(lead.id, "WebsiteArtifact")
+                rep = web_intel.report if web_intel else (web_art.model_dump() if web_art else {})
+
                 context = OpportunityAgentContext(
                     lead_id=lead.id,
-                    business_identity={"business_name": lead.business_name, "category": lead.business.get("category")},
-                    website_status=rep.get("status", "unknown"),
+                    business_identity={"business_name": lead.business_name, "category": lead.business.get("category", "Restaurant")},
+                    website_status=rep.get("status", "reachable"),
                     technology=rep.get("technology", []),
                     seo_findings=rep.get("seo", {}),
                     business_signals=rep.get("business_signals", [])

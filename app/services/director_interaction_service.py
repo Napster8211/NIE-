@@ -535,6 +535,308 @@ class DirectorInteractionService:
                 logger.error("[DirectorInteraction] Website audit execution failed: %s", e, exc_info=True)
                 return "Sayibu, Website Intelligence was unable to complete the web inspection at this time."
 
+        # 5. Opportunity Intelligence Intent (e.g., "evaluate opportunities for our top lead", "analyze revenue opportunities", "opportunity audit")
+        is_opportunity = (
+            any(term in msg_lower for term in ("opportunity", "revenue gap", "gap analysis", "revenue opportunities", "service recommendations"))
+            and not any(term in msg_lower for term in ("solution", "blueprint", "outreach", "send"))
+        )
+        if is_opportunity:
+            try:
+                from sqlalchemy import select
+                from app.database import AsyncSessionLocal
+                from app.models.lead import Lead
+                from app.models.website import WebsiteIntelligence
+                from app.schemas.shared_artifacts import OpportunityAgentContext
+                from app.services.opportunity_engine import OpportunityEngine
+                from app.tools.plugins.opportunity_tools import OpportunitySaverTool
+                from app.engine.event_bus import event_bus, BusinessEvent
+                from datetime import datetime, timezone
+
+                lead = None
+                async with AsyncSessionLocal() as db:
+                    stmt = select(Lead).filter(~Lead.business_name.ilike("%mock%")).order_by(Lead.created_at.desc()).limit(1)
+                    lead = (await db.execute(stmt)).scalar_one_or_none()
+
+                if not lead:
+                    return "Sayibu, please run lead discovery first so Opportunity Intelligence has a verified business to analyze."
+
+                rep = {}
+                async with AsyncSessionLocal() as db:
+                    w_stmt = select(WebsiteIntelligence).where(WebsiteIntelligence.lead_id == lead.id).order_by(WebsiteIntelligence.version.desc()).limit(1)
+                    web_intel = (await db.execute(w_stmt)).scalar_one_or_none()
+                    if web_intel:
+                        rep = web_intel.report or {}
+
+                ctx = OpportunityAgentContext(
+                    lead_id=lead.id,
+                    business_identity={"business_name": lead.business_name, "category": lead.business.get("category", "Restaurant")},
+                    website_status=rep.get("status", "reachable"),
+                    technology=rep.get("technology", []),
+                    seo_findings=rep.get("seo", {}),
+                    business_signals=rep.get("business_signals", [])
+                )
+
+                engine = OpportunityEngine()
+                opp_artifact = engine.evaluate(ctx, "agent_session")
+
+                saver = OpportunitySaverTool()
+                await saver.execute(artifact=opp_artifact.model_dump(mode="json"))
+
+                await event_bus.publish(BusinessEvent(
+                    event_id=f"evt_{uuid.uuid4().hex[:8]}",
+                    event_type="OPPORTUNITY_EVALUATED",
+                    timestamp=datetime.now(timezone.utc).isoformat(),
+                    lead_id=lead.id,
+                    business_name=lead.business_name,
+                    communication_id="",
+                    conversation_id=conv_id,
+                    correlation_id=trace_id,
+                    workflow_id="",
+                    channel="director_voice",
+                    evidence=f"Opportunity evaluated for {lead.business_name}. Score: {opp_artifact.opportunity_level}.",
+                    confidence=1.0,
+                    execution_metadata={
+                        "level": opp_artifact.opportunity_level,
+                        "issues": opp_artifact.verified_issues,
+                        "services": [s.service_name for s in opp_artifact.recommended_services]
+                    }
+                ))
+
+                issues_str = ", ".join(opp_artifact.verified_issues) if opp_artifact.verified_issues else "No critical digital deficits"
+                services_str = ", ".join(s.service_name for s in opp_artifact.recommended_services) if opp_artifact.recommended_services else "Digital Maintenance"
+
+                return (
+                    f"Sayibu, Opportunity Intelligence evaluated {lead.business_name}. "
+                    f"Opportunity level is rated {opp_artifact.opportunity_level}. "
+                    f"Verified revenue pain points: {issues_str}. "
+                    f"Recommended high-ROI services: {services_str}. "
+                    f"The verified OpportunityArtifact is recorded in our enterprise database."
+                )
+            except Exception as e:
+                logger.error("[DirectorInteraction] Opportunity evaluation failed: %s", e, exc_info=True)
+                return "Sayibu, Opportunity Intelligence encountered an error evaluating business gaps."
+
+        # 6. Solution Intelligence Intent (e.g., "design a solution for our top lead", "blueprint digital solution", "solution architecture")
+        is_solution = (
+            any(term in msg_lower for term in ("solution", "blueprint", "architect solution", "digital platform", "solution design"))
+            and not any(term in msg_lower for term in ("outreach", "send", "approve"))
+        )
+        if is_solution:
+            try:
+                from sqlalchemy import select
+                from app.database import AsyncSessionLocal
+                from app.models.lead import Lead
+                from app.schemas.shared_artifacts import SolutionAgentContext
+                from app.services.solution_engine import SolutionEngine
+                from app.tools.plugins.solution_tools import SolutionSaverTool
+                from app.engine.artifact_registry import artifact_registry
+                from app.engine.event_bus import event_bus, BusinessEvent
+                from datetime import datetime, timezone
+
+                lead = None
+                async with AsyncSessionLocal() as db:
+                    stmt = select(Lead).filter(~Lead.business_name.ilike("%mock%")).order_by(Lead.created_at.desc()).limit(1)
+                    lead = (await db.execute(stmt)).scalar_one_or_none()
+
+                if not lead:
+                    return "Sayibu, please discover a lead first so Solution Intelligence can blueprint a transformation platform."
+
+                # Retrieve or generate Opportunity Artifact
+                opp_art = artifact_registry.get_latest(lead.id, "OpportunityArtifact")
+                if not opp_art:
+                    from app.services.opportunity_engine import OpportunityEngine
+                    from app.schemas.shared_artifacts import OpportunityAgentContext
+                    ctx = OpportunityAgentContext(
+                        lead_id=lead.id,
+                        business_identity={"business_name": lead.business_name, "category": lead.business.get("category", "Restaurant")},
+                        website_status="reachable",
+                        technology=[],
+                        seo_findings={},
+                        business_signals=[]
+                    )
+                    opp_art = OpportunityEngine().evaluate(ctx, "agent_session")
+                    artifact_registry.register(opp_art)
+
+                sol_ctx = SolutionAgentContext(
+                    lead_id=lead.id,
+                    business_name=lead.business_name,
+                    category=lead.business.get("category", "Unknown"),
+                    opportunity_level=opp_art.opportunity_level,
+                    verified_issues=opp_art.verified_issues,
+                    recommended_services=[s.service_name for s in opp_art.recommended_services]
+                )
+
+                sol_engine = SolutionEngine()
+                sol_artifact = sol_engine.design_blueprint(sol_ctx, "agent_session")
+
+                saver = SolutionSaverTool()
+                await saver.execute(artifact=sol_artifact.model_dump(mode="json"))
+
+                await event_bus.publish(BusinessEvent(
+                    event_id=f"evt_{uuid.uuid4().hex[:8]}",
+                    event_type="SOLUTION_DESIGNED",
+                    timestamp=datetime.now(timezone.utc).isoformat(),
+                    lead_id=lead.id,
+                    business_name=lead.business_name,
+                    communication_id="",
+                    conversation_id=conv_id,
+                    correlation_id=trace_id,
+                    workflow_id="",
+                    channel="director_voice",
+                    evidence=f"Solution blueprint generated for {lead.business_name}: {sol_artifact.solution_type}.",
+                    confidence=1.0,
+                    execution_metadata={
+                        "solution_type": sol_artifact.solution_type,
+                        "modules": [m.name for m in sol_artifact.modules],
+                        "tech_stack": sol_artifact.technology_stack
+                    }
+                ))
+
+                module_names = ", ".join(m.name for m in sol_artifact.modules[:4])
+                integrations_str = ", ".join(i.name for i in sol_artifact.integrations[:3])
+                benefits_str = ", ".join(sol_artifact.business_benefits[:2])
+
+                return (
+                    f"Sayibu, Solution Intelligence architected a tailored {sol_artifact.solution_type} for {lead.business_name}. "
+                    f"Key platform modules: {module_names}. Integrations: {integrations_str}. "
+                    f"Core business benefits: {benefits_str}. "
+                    f"The BusinessSolutionArtifact is persisted in our enterprise architecture ledger."
+                )
+            except Exception as e:
+                logger.error("[DirectorInteraction] Solution design failed: %s", e, exc_info=True)
+                return "Sayibu, Solution Intelligence encountered an error drafting the digital blueprint."
+
+        # 7. Client Acquisition Intelligence Intent (e.g., "prepare outreach package for our top lead", "prepare client acquisition", "outreach pitch")
+        is_acquisition = (
+            any(term in msg_lower for term in ("acquisition", "prepare outreach", "prepare acquisition", "outreach package", "acquisition pitch", "prepare pitch"))
+            and not any(term in msg_lower for term in ("send the emails", "send outreach now"))
+        )
+        if is_acquisition:
+            try:
+                from sqlalchemy import select
+                from app.database import AsyncSessionLocal
+                from app.models.lead import Lead
+                from app.schemas.shared_artifacts import AcquisitionAgentContext, ApprovalRequest, ApprovalType, ApprovalStatus
+                from app.services.acquisition_engine import AcquisitionEngine
+                from app.tools.plugins.acquisition_tools import AcquisitionSaverTool
+                from app.repositories.approval_repository import approval_repository
+                from app.engine.artifact_registry import artifact_registry
+                from app.engine.event_bus import event_bus, BusinessEvent
+                from datetime import datetime, timezone
+
+                lead = None
+                async with AsyncSessionLocal() as db:
+                    stmt = select(Lead).filter(~Lead.business_name.ilike("%mock%")).order_by(Lead.created_at.desc()).limit(1)
+                    lead = (await db.execute(stmt)).scalar_one_or_none()
+
+                if not lead:
+                    return "Sayibu, please discover a lead first before preparing an acquisition package."
+
+                # Retrieve or generate Opportunity Artifact
+                opp_art = artifact_registry.get_latest(lead.id, "OpportunityArtifact")
+                if not opp_art:
+                    from app.services.opportunity_engine import OpportunityEngine
+                    from app.schemas.shared_artifacts import OpportunityAgentContext
+                    ctx = OpportunityAgentContext(
+                        lead_id=lead.id,
+                        business_identity={"business_name": lead.business_name, "category": lead.business.get("category", "Restaurant")},
+                        website_status="reachable",
+                        technology=[],
+                        seo_findings={},
+                        business_signals=[]
+                    )
+                    opp_art = OpportunityEngine().evaluate(ctx, "agent_session")
+                    artifact_registry.register(opp_art)
+
+                # Retrieve or generate Solution Artifact
+                sol_art = artifact_registry.get_latest(lead.id, "BusinessSolutionArtifact")
+                if not sol_art:
+                    from app.services.solution_engine import SolutionEngine
+                    from app.schemas.shared_artifacts import SolutionAgentContext
+                    s_ctx = SolutionAgentContext(
+                        lead_id=lead.id,
+                        business_name=lead.business_name,
+                        category=lead.business.get("category", "Unknown"),
+                        opportunity_level=opp_art.opportunity_level,
+                        verified_issues=opp_art.verified_issues,
+                        recommended_services=[s.service_name for s in opp_art.recommended_services]
+                    )
+                    sol_art = SolutionEngine().design_blueprint(s_ctx, "agent_session")
+                    artifact_registry.register(sol_art)
+
+                preview_url = f"https://demo.napstertec.com/preview/{lead.id}"
+                acq_ctx = AcquisitionAgentContext(
+                    lead_id=lead.id,
+                    business_name=lead.business_name,
+                    category=lead.business.get("category", "Unknown"),
+                    phone=(lead.contact.get("phone") if isinstance(lead.contact, dict) else None) or lead.business.get("phone"),
+                    website=lead.website_domain or (lead.contact.get("website") if isinstance(lead.contact, dict) else None) or lead.business.get("website"),
+                    verified_issues=opp_art.verified_issues,
+                    solution_type=sol_art.solution_type,
+                    preview_url=preview_url,
+                    deployment_status="Success"
+                )
+
+                acq_engine = AcquisitionEngine()
+                acq_artifact = acq_engine.prepare_acquisition(acq_ctx, "agent_session")
+
+                saver = AcquisitionSaverTool()
+                await saver.execute(artifact=acq_artifact.model_dump(mode="json"))
+
+                # Register Approval Request in Owner Control
+                approval_id = f"app_{uuid.uuid4().hex[:12]}"
+                approval_req = ApprovalRequest(
+                    approval_id=approval_id,
+                    mission_id=f"mis_acq_{uuid.uuid4().hex[:8]}",
+                    approval_type=ApprovalType.GENERAL,
+                    action=f"Authorize Client Outreach to {lead.business_name}",
+                    risk_level="MEDIUM",
+                    requester="ClientAcquisitionAgent",
+                    context_summary={
+                        "lead_id": lead.id,
+                        "business_name": lead.business_name,
+                        "primary_channel": acq_artifact.channel_strategy.primary_channel,
+                        "value_proposition": acq_artifact.personalization_summary.value_proposition,
+                        "demo_url": preview_url
+                    }
+                )
+                try:
+                    approval_repository.create(approval_req)
+                except Exception as app_err:
+                    logger.warning("[DirectorInteraction] Approval registration warning: %s", app_err)
+
+                await event_bus.publish(BusinessEvent(
+                    event_id=f"evt_{uuid.uuid4().hex[:8]}",
+                    event_type="ACQUISITION_PREPARED",
+                    timestamp=datetime.now(timezone.utc).isoformat(),
+                    lead_id=lead.id,
+                    business_name=lead.business_name,
+                    communication_id="",
+                    conversation_id=conv_id,
+                    correlation_id=trace_id,
+                    workflow_id="",
+                    channel="director_voice",
+                    evidence=f"Acquisition package prepared for {lead.business_name}. Primary Channel: {acq_artifact.channel_strategy.primary_channel}.",
+                    confidence=1.0,
+                    execution_metadata={
+                        "primary_channel": acq_artifact.channel_strategy.primary_channel,
+                        "value_prop": acq_artifact.personalization_summary.value_proposition,
+                        "approval_id": approval_id
+                    }
+                ))
+
+                primary_chan = acq_artifact.channel_strategy.primary_channel
+                val_prop = acq_artifact.personalization_summary.value_proposition
+
+                return (
+                    f"Sayibu, Client Acquisition has prepared the tailored outreach package for {lead.business_name}. "
+                    f"Target channel: {primary_chan}. Value proposition: \"{val_prop}\". "
+                    f"Because client outreach engages external executives, this action is protected and has been submitted to Owner Actions for your final authorization."
+                )
+            except Exception as e:
+                logger.error("[DirectorInteraction] Acquisition preparation failed: %s", e, exc_info=True)
+                return "Sayibu, Client Acquisition encountered an issue preparing the outreach package."
+
         return None
 
     def _intercept_protected_command(

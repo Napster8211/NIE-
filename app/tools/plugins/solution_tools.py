@@ -41,30 +41,49 @@ class SolutionContextBuilderTool(BaseTool):
         if " for " in clean_query:
             clean_query = query[clean_query.index(" for ") + 4:].strip().strip('.!?"\'')
 
-        # ULTRA-FAST PATH (MOCK)
-        if "mock" in clean_query.lower() or "lead #1" in clean_query.lower():
-            context = SolutionAgentContext(
-                lead_id="lead_001",
-                business_name="Mock Restaurants 1",
-                category="Restaurant",
-                opportunity_level="High",
-                verified_issues=["No functional digital presence.", "No Reservation/Ordering System"],
-                recommended_services=["Full Website Build", "Reservation System Integration"]
-            )
-            return {"found": True, "isolated_context": context.model_dump()}
-
-        # Regular Flow via Artifact Registry & Lead Database
+        # Resolve lead and opportunity artifacts from database & central registry
         async with AsyncSessionLocal() as db:
             try:
-                stmt = select(Lead).filter(Lead.business_name.ilike(f"%{clean_query}%")).limit(1)
-                lead = (await db.execute(stmt)).scalar_one_or_none()
+                lead = None
+                if any(k in clean_query.lower() for k in ("lead #1", "top lead", "latest", "first lead", "top")):
+                    stmt = select(Lead).filter(~Lead.business_name.ilike("%mock%")).order_by(Lead.created_at.desc()).limit(1)
+                    lead = (await db.execute(stmt)).scalar_one_or_none()
+
+                if not lead and clean_query and not any(k in clean_query.lower() for k in ("lead", "business", "restaurant", "solution")):
+                    stmt = select(Lead).filter(Lead.business_name.ilike(f"%{clean_query}%")).limit(1)
+                    lead = (await db.execute(stmt)).scalar_one_or_none()
+
+                if not lead:
+                    stmt = select(Lead).filter(~Lead.business_name.ilike("%mock%")).order_by(Lead.created_at.desc()).limit(1)
+                    lead = (await db.execute(stmt)).scalar_one_or_none()
+
                 if not lead:
                     return {"found": False, "error": f"Lead not found for '{clean_query}'."}
 
-                # Retrieve Opportunity Artifact via Central Registry
+                # Retrieve Opportunity Artifact via Central Registry or database
                 opp_artifact = artifact_registry.get_latest(lead.id, "OpportunityArtifact")
                 if not opp_artifact:
-                    return {"found": False, "error": "Insufficient Business Intelligence: Opportunity Artifact missing."}
+                    from app.models.opportunity import OpportunityIntelligence
+                    opp_stmt = select(OpportunityIntelligence).where(OpportunityIntelligence.lead_id == lead.id).order_by(OpportunityIntelligence.version.desc()).limit(1)
+                    opp_rec = (await db.execute(opp_stmt)).scalar_one_or_none()
+                    if opp_rec and opp_rec.report:
+                        from app.schemas.shared_artifacts import OpportunityArtifact
+                        opp_artifact = OpportunityArtifact(**opp_rec.report)
+
+                # If still not found, generate dynamically on demand
+                if not opp_artifact:
+                    from app.services.opportunity_engine import OpportunityEngine
+                    from app.schemas.shared_artifacts import OpportunityAgentContext
+                    ctx = OpportunityAgentContext(
+                        lead_id=lead.id,
+                        business_identity={"business_name": lead.business_name, "category": lead.business.get("category", "Restaurant")},
+                        website_status="reachable",
+                        technology=[],
+                        seo_findings={},
+                        business_signals=[]
+                    )
+                    opp_artifact = OpportunityEngine().evaluate(ctx, "agent_session")
+                    artifact_registry.register(opp_artifact)
 
                 context = SolutionAgentContext(
                     lead_id=lead.id,
