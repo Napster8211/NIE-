@@ -131,6 +131,7 @@ class DirectorVoiceSession:
         self.current_trace: Optional[DirectorVoiceLatencyTrace] = None
         self.active_tasks: list[asyncio.Task] = []
         self.tts_queue: Optional[asyncio.Queue] = None
+        self.last_tts_error: Optional[str] = None
 
     def cancel_active_turn(self):
         """Barge-in cancellation: cleanly halts active LLM and TTS tasks."""
@@ -180,6 +181,7 @@ class DirectorRealtimeVoiceService:
                             turn_id,
                             client_session_id,
                         )
+                        session.last_tts_error = None
                         session.status = "PROCESSING"
 
                         await websocket.send_json({
@@ -309,6 +311,8 @@ class DirectorRealtimeVoiceService:
                     "correlation_id": trace.correlation_id if trace else turn_id,
                     "chunk_count": len(emitted_chunk_indexes),
                     "chunk_indexes": emitted_chunk_indexes,
+                    "speech_available": bool(emitted_chunk_indexes),
+                    "speech_error": session.last_tts_error,
                 })
                 await session.websocket.send_json({
                     "type": "director.text.final",
@@ -392,12 +396,14 @@ class DirectorRealtimeVoiceService:
         try:
             audio = await director_voice_service.synthesize_text(text)
         except ValueError as exc:
+            session.last_tts_error = str(exc)
             logger.warning(
                 "[DirectorRealtimeVoice] Voice gateway synthesis skipped code=%s",
                 str(exc),
             )
             return False
         except Exception:
+            session.last_tts_error = "VOICE_GATEWAY_UNAVAILABLE"
             logger.warning("[DirectorRealtimeVoice] Voice gateway synthesis failed")
             return False
 

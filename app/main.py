@@ -56,6 +56,7 @@ from app.database import Base, engine
 from app.engine.autonomous_worker import autonomous_worker
 from app.services.director_auth_service import trusted_frontend_origins
 from app.services.director_speech_service import director_speech_service
+from app.services.director_voice_service import director_voice_service
 from app.services.engineering_execution_service import (
     engineering_runner_readiness,
     validate_engineering_runner_configuration,
@@ -131,6 +132,7 @@ async def health_check():
         "engine": "NIE v25.5",
         "database_status": database_status,
         "director_stt": director_speech_service.readiness(),
+        "director_tts": director_voice_service.readiness(),
         "engineering": {**runner_readiness, "storage": await probe_workspace_storage()},
     }
 

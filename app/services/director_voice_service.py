@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import logging
 import os
 from typing import Optional
+from urllib.parse import urlparse
 
 import httpx
 
@@ -45,6 +46,19 @@ class DirectorVoiceService:
                 ),
             )
         return self._http_client
+
+    @staticmethod
+    def readiness() -> dict:
+        """Expose safe TTS configuration diagnostics without returning secrets."""
+        gateway_url = os.getenv("VOICE_GATEWAY_URL", "").strip()
+        gateway_key = os.getenv("VOICE_GATEWAY_API_KEY", "").strip()
+        parsed = urlparse(gateway_url) if gateway_url else None
+        return {
+            "configured": bool(gateway_url and gateway_key),
+            "gateway_url_configured": bool(gateway_url),
+            "gateway_key_configured": bool(gateway_key),
+            "gateway_host": parsed.hostname if parsed else None,
+        }
 
     async def aclose(self) -> None:
         if self._http_client is not None and not self._http_client.is_closed:
