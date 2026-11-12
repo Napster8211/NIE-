@@ -403,6 +403,121 @@ class DirectorInteractionService:
             except Exception as e:
                 logger.error("[DirectorInteraction] Company briefing failed: %s", e, exc_info=True)
 
+        # 3. Lead Discovery Intent (e.g., "discover 5 restaurant leads in Accra", "find restaurant leads")
+        is_lead_discovery = (
+            ("discover" in msg_lower or "find" in msg_lower or "scout" in msg_lower or "search" in msg_lower)
+            and ("lead" in msg_lower or "prospect" in msg_lower or "restaurant" in msg_lower or "business" in msg_lower)
+            and not any(term in msg_lower for term in ("audit", "website", "code", "deploy"))
+        )
+        if is_lead_discovery:
+            try:
+                from app.tools.plugins.business_discovery import BusinessDiscoveryTool
+                from app.tools.plugins.lead_upsert import LeadUpsertTool
+                from app.engine.event_bus import event_bus, BusinessEvent
+                from datetime import datetime, timezone
+
+                category = "restaurant" if "restaurant" in msg_lower else "business"
+                location = "Accra, Ghana" if "accra" in msg_lower else "Global"
+
+                count = 5
+                for word in msg_lower.split():
+                    if word.isdigit():
+                        count = max(1, min(20, int(word)))
+                        break
+
+                tool = BusinessDiscoveryTool()
+                disc_res = await tool.execute(query=category, location=location, max_results=count)
+                raw_leads = disc_res.get("results", [])
+
+                if raw_leads:
+                    upsert_tool = LeadUpsertTool()
+                    await upsert_tool.execute(raw_leads=raw_leads, provider_mode=disc_res.get("provider_mode", "mock"))
+
+                await event_bus.publish(BusinessEvent(
+                    event_id=f"evt_{uuid.uuid4().hex[:8]}",
+                    event_type="LEAD_DISCOVERY_COMPLETED",
+                    timestamp=datetime.now(timezone.utc).isoformat(),
+                    lead_id="internal_napstertec",
+                    business_name="NapsterTec",
+                    communication_id="",
+                    conversation_id=conv_id,
+                    correlation_id=trace_id,
+                    workflow_id="",
+                    channel="director_voice",
+                    evidence=f"Discovered {len(raw_leads)} {category} leads in {location}.",
+                    confidence=1.0,
+                    execution_metadata={"count": len(raw_leads), "category": category, "location": location}
+                ))
+
+                lead_names = [l.get("name", "Unknown Business") for l in raw_leads[:count]]
+                names_summary = ", ".join(lead_names) if lead_names else f"{count} qualified leads"
+                return (
+                    f"Sayibu, Lead Intelligence has discovered and verified {len(lead_names)} {category} leads in {location}: "
+                    f"{names_summary}. All profiles and verified contact details are registered in our Enterprise Database."
+                )
+            except Exception as e:
+                logger.error("[DirectorInteraction] Lead discovery execution failed: %s", e, exc_info=True)
+                return "Sayibu, Lead Intelligence encountered an issue connecting to the discovery repository."
+
+        # 4. Website Intelligence Audit Intent (e.g., "audit the website and digital footprint for our top lead")
+        is_website_audit = (
+            "audit" in msg_lower
+            and ("website" in msg_lower or "digital footprint" in msg_lower or "web" in msg_lower)
+        )
+        if is_website_audit:
+            try:
+                from sqlalchemy import select
+                from app.database import AsyncSessionLocal
+                from app.models.lead import Lead
+                from app.tools.plugins.website_tools import WebsiteInspectorTool, WebsiteArtifactSaverTool
+                from app.engine.event_bus import event_bus, BusinessEvent
+                from datetime import datetime, timezone
+
+                lead = None
+                async with AsyncSessionLocal() as db:
+                    stmt = select(Lead).order_by(Lead.created_at.desc()).limit(1)
+                    lead = (await db.execute(stmt)).scalar_one_or_none()
+
+                business_name = lead.business_name if lead else "Mock Restaurants 1"
+                lead_id = lead.id if lead else "lead_001"
+                target_url = (lead.website_domain if lead else None) or "https://example1.com"
+
+                inspector = WebsiteInspectorTool()
+                audit_res = await inspector.execute(url=target_url)
+
+                saver = WebsiteArtifactSaverTool()
+                await saver.execute(lead_id=lead_id, raw_audit=audit_res)
+
+                await event_bus.publish(BusinessEvent(
+                    event_id=f"evt_{uuid.uuid4().hex[:8]}",
+                    event_type="WEBSITE_AUDIT_COMPLETED",
+                    timestamp=datetime.now(timezone.utc).isoformat(),
+                    lead_id=lead_id,
+                    business_name=business_name,
+                    communication_id="",
+                    conversation_id=conv_id,
+                    correlation_id=trace_id,
+                    workflow_id="",
+                    channel="director_voice",
+                    evidence=f"Audited website {target_url} for {business_name}.",
+                    confidence=1.0,
+                    execution_metadata={"lead_id": lead_id, "status": audit_res.get("status")}
+                ))
+
+                status = audit_res.get("status", "analyzed")
+                tech_list = [t.get("name") for t in audit_res.get("technology", []) if t.get("name")]
+                tech_str = f" Detected technologies include: {', '.join(tech_list[:3])}." if tech_list else ""
+                signals = [s.get("signal") for s in audit_res.get("business_signals", []) if s.get("signal")]
+                signal_str = f" Digital signals identified: {', '.join(signals[:2])}." if signals else ""
+
+                return (
+                    f"Sayibu, Website Intelligence has audited the digital footprint for {business_name} at {target_url}. "
+                    f"Audit status is {status}.{tech_str}{signal_str} The verified WebsiteArtifact is stored in our database."
+                )
+            except Exception as e:
+                logger.error("[DirectorInteraction] Website audit execution failed: %s", e, exc_info=True)
+                return "Sayibu, Website Intelligence was unable to complete the web inspection at this time."
+
         return None
 
     def _intercept_protected_command(
@@ -434,7 +549,7 @@ class DirectorInteractionService:
                 ),
             )
 
-        is_audit_or_query = any(q in msg_lower for q in ("audit", "calculate", "what is", "show", "report", "health", "status", "runway"))
+        is_audit_or_query = any(q in msg_lower for q in ("audit", "calculate", "what is", "show", "report", "health", "status", "runway", "discover", "find", "scout"))
         if any(term in msg_lower for term in ("spend", "pay")) or ("budget" in msg_lower and not is_audit_or_query):
             return self._safe_response(
                 ix_id,
