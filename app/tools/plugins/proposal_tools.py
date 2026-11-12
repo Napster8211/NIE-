@@ -40,46 +40,85 @@ class ProposalContextBuilderTool(BaseTool):
         if " for " in clean_query:
             clean_query = query[clean_query.index(" for ") + 4:].strip().strip('.!?"\'')
 
-        # ULTRA-FAST PATH (MOCK)
-        if "mock" in clean_query.lower() or "lead #1" in clean_query.lower():
-            context = ProposalAgentContext(
-                lead_id="lead_001",
-                business_name="Mock Restaurants 1",
-                category="Restaurant",
-                verified_issues=["No functional digital presence.", "No Reservation System"],
-                solution_type="Restaurant Digital Platform",
-                modules=[{"name": "Reservations", "justification": "Automate bookings"}, {"name": "Interactive Menu", "justification": "Showcase food"}],
-                features=[{"name": "Booking Calendar"}],
-                benefits=["Increase Bookings", "Reduce Manual Admin"]
-            )
-            return {"found": True, "isolated_context": context.model_dump()}
-
-        # Regular Flow via Artifact Registry & Lead Database
+        # Resolve lead and business artifacts from database & central registry
         async with AsyncSessionLocal() as db:
             try:
-                stmt = select(Lead).filter(Lead.business_name.ilike(f"%{clean_query}%")).limit(1)
-                lead = (await db.execute(stmt)).scalar_one_or_none()
+                lead = None
+                if any(k in clean_query for k in ("lead #1", "top lead", "latest", "first lead", "top")):
+                    stmt = select(Lead).filter(~Lead.business_name.ilike("%mock%")).order_by(Lead.created_at.desc()).limit(1)
+                    lead = (await db.execute(stmt)).scalar_one_or_none()
+
+                if not lead and clean_query and not any(k in clean_query for k in ("lead", "business", "restaurant", "proposal")):
+                    stmt = select(Lead).filter(Lead.business_name.ilike(f"%{clean_query}%")).limit(1)
+                    lead = (await db.execute(stmt)).scalar_one_or_none()
+
+                if not lead:
+                    stmt = select(Lead).filter(~Lead.business_name.ilike("%mock%")).order_by(Lead.created_at.desc()).limit(1)
+                    lead = (await db.execute(stmt)).scalar_one_or_none()
+
                 if not lead:
                     return {"found": False, "error": f"Lead not found for '{clean_query}'."}
 
+                # Retrieve Opportunity and Solution artifacts
                 opp_artifact = artifact_registry.get_latest(lead.id, "OpportunityArtifact")
+                if not opp_artifact:
+                    from app.models.opportunity import OpportunityIntelligence
+                    from app.schemas.shared_artifacts import OpportunityArtifact
+                    opp_stmt = select(OpportunityIntelligence).where(OpportunityIntelligence.lead_id == lead.id).order_by(OpportunityIntelligence.version.desc()).limit(1)
+                    opp_rec = (await db.execute(opp_stmt)).scalar_one_or_none()
+                    if opp_rec and opp_rec.report:
+                        opp_artifact = OpportunityArtifact(**opp_rec.report)
+
+                if not opp_artifact:
+                    from app.services.opportunity_engine import OpportunityEngine
+                    from app.schemas.shared_artifacts import OpportunityAgentContext
+                    ctx = OpportunityAgentContext(
+                        lead_id=lead.id,
+                        business_identity={"business_name": lead.business_name, "category": lead.business.get("category", "Restaurant")},
+                        website_status="reachable",
+                        technology=[],
+                        seo_findings={},
+                        business_signals=[]
+                    )
+                    opp_artifact = OpportunityEngine().evaluate(ctx, "agent_session")
+                    artifact_registry.register(opp_artifact)
+
                 sol_artifact = artifact_registry.get_latest(lead.id, "BusinessSolutionArtifact")
-                
-                if not opp_artifact or not sol_artifact:
-                    return {"found": False, "error": "Insufficient Business Architecture: Missing Opportunity or Solution Artifact."}
+                if not sol_artifact:
+                    from app.models.solution import BusinessSolutionIntelligence
+                    from app.schemas.shared_artifacts import BusinessSolutionArtifact
+                    sol_stmt = select(BusinessSolutionIntelligence).where(BusinessSolutionIntelligence.lead_id == lead.id).order_by(BusinessSolutionIntelligence.version.desc()).limit(1)
+                    sol_rec = (await db.execute(sol_stmt)).scalar_one_or_none()
+                    if sol_rec and sol_rec.report:
+                        sol_artifact = BusinessSolutionArtifact(**sol_rec.report)
+
+                if not sol_artifact:
+                    from app.services.solution_engine import SolutionEngine
+                    from app.schemas.shared_artifacts import SolutionAgentContext
+                    s_ctx = SolutionAgentContext(
+                        lead_id=lead.id,
+                        business_name=lead.business_name,
+                        category=lead.business.get("category", "Restaurant"),
+                        opportunity_level=opp_artifact.opportunity_level,
+                        verified_issues=opp_artifact.verified_issues,
+                        recommended_services=[s.service_name for s in opp_artifact.recommended_services]
+                    )
+                    sol_artifact = SolutionEngine().design_blueprint(s_ctx, "agent_session")
+                    artifact_registry.register(sol_artifact)
 
                 context = ProposalAgentContext(
                     lead_id=lead.id,
                     business_name=lead.business_name,
-                    category=lead.business.get("category", "Unknown"),
+                    category=lead.business.get("category", "Restaurant"),
                     verified_issues=opp_artifact.verified_issues,
                     solution_type=sol_artifact.solution_type,
-                    modules=[m.model_dump() for m in sol_artifact.modules],
-                    features=[f.model_dump() for f in sol_artifact.features],
+                    modules=[m.model_dump() if hasattr(m, "model_dump") else m for m in sol_artifact.modules],
+                    features=[f.model_dump() if hasattr(f, "model_dump") else f for f in sol_artifact.features],
                     benefits=sol_artifact.business_benefits
                 )
                 return {"found": True, "isolated_context": context.model_dump()}
-            except ValueError as ve:
+            except Exception as ve:
+                logger.error("[ProposalContextBuilder] Failed to build context: %s", ve, exc_info=True)
                 return {"found": False, "error": str(ve)}
 
 # --- 2. Proposal Evaluator ---

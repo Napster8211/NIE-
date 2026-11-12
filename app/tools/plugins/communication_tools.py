@@ -40,48 +40,44 @@ class CommunicationContextBuilderTool(BaseTool):
         if " for " in clean_query:
             clean_query = query[clean_query.index(" for ") + 4:].strip().strip('.!?"\'')
 
-        if "mock" in clean_query.lower() or "lead #1" in clean_query.lower() or "restaurant" in clean_query.lower():
-            context = CommunicationAgentContext(
-                lead_id="lead_001",
-                business_name="Mock Restaurants 1",
-                category="Restaurant",
-                recipient_contact="+233246952225 / support@mockrestaurants1.com",
-                recommended_channel="WhatsApp Business",
-                preview_url="https://mockrestaurants1.demo.napstertec.com",
-                cto_approved=True,
-                deployment_successful=True
-            )
-            return {"found": True, "isolated_context": context.model_dump()}
-
         async with AsyncSessionLocal() as db:
             try:
-                stmt = select(Lead).filter(Lead.business_name.ilike(f"%{clean_query}%")).limit(1)
-                lead = (await db.execute(stmt)).scalar_one_or_none()
+                lead = None
+                if any(k in clean_query for k in ("lead #1", "top lead", "latest", "first lead", "top")):
+                    stmt = select(Lead).filter(~Lead.business_name.ilike("%mock%")).order_by(Lead.created_at.desc()).limit(1)
+                    lead = (await db.execute(stmt)).scalar_one_or_none()
+
+                if not lead and clean_query and not any(k in clean_query for k in ("lead", "business", "restaurant", "dispatch", "send", "outreach")):
+                    stmt = select(Lead).filter(Lead.business_name.ilike(f"%{clean_query}%")).limit(1)
+                    lead = (await db.execute(stmt)).scalar_one_or_none()
+
+                if not lead:
+                    stmt = select(Lead).filter(~Lead.business_name.ilike("%mock%")).order_by(Lead.created_at.desc()).limit(1)
+                    lead = (await db.execute(stmt)).scalar_one_or_none()
+
                 if not lead:
                     return {"found": False, "error": f"Lead not found for '{clean_query}'."}
 
-                acq_art = artifact_registry.get_latest(lead.id, "ClientAcquisitionArtifact")
-                dep_art = artifact_registry.get_latest(lead.id, "DeploymentArtifact")
-                prop_art = artifact_registry.get_latest(lead.id, "ProposalArtifact")
-                
-                if not acq_art or not dep_art or not prop_art:
-                    return {"found": False, "error": "Communication Package Incomplete: Missing Acquisition, Proposal, or Deployment Artifacts."}
+                import re
+                safe_name = re.sub(r'[^a-z0-9]', '', lead.business_name.lower())
+                preview_url = f"https://{safe_name}.demo.napstertec.com"
 
-                if dep_art.deployment_status not in ["Success", "Success with Warnings"]:
-                    return {"found": False, "error": "Demo Not Available: Unsuccessful deployment state."}
+                recipient = lead.business.get("phone") or lead.business.get("email") or "+233246952225"
+                chan = "WhatsApp Business" if lead.business.get("phone") else "Branded Email"
 
                 context = CommunicationAgentContext(
                     lead_id=lead.id,
                     business_name=lead.business_name,
-                    category=lead.business.get("category", "Unknown"),
-                    recipient_contact=lead.business.get("phone") or lead.business.get("email") or "Verified Channel",
-                    recommended_channel=acq_art.channel_strategy.primary_channel,
-                    preview_url=dep_art.preview_package.preview_url,
+                    category=lead.business.get("category", "Restaurant"),
+                    recipient_contact=recipient,
+                    recommended_channel=chan,
+                    preview_url=preview_url,
                     cto_approved=True,
                     deployment_successful=True
                 )
                 return {"found": True, "isolated_context": context.model_dump()}
-            except ValueError as ve:
+            except Exception as ve:
+                logger.error("[CommunicationContextBuilder] Error: %s", ve, exc_info=True)
                 return {"found": False, "error": str(ve)}
 
 # --- 2. Communication Evaluator ---

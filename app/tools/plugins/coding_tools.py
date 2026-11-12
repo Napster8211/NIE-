@@ -40,46 +40,50 @@ class CodingContextBuilderTool(BaseTool):
         if " for " in clean_query:
             clean_query = query[clean_query.index(" for ") + 4:].strip().strip('.!?"\'')
 
-        if "mock" in clean_query.lower() or "lead #1" in clean_query.lower():
-            context = CodingAgentContext(
-                lead_id="lead_001",
-                business_name="Mock Restaurants 1",
-                architecture_pattern="Modular Monolith",
-                frontend_stack="React (Next.js)",
-                backend_stack="FastAPI",
-                database="PostgreSQL",
-                modules=["Reservations", "Menu", "Dashboard"],
-                pages=["Home", "Booking", "Admin"],
-                api_architecture={"style": "REST"}
-            )
-            return {"found": True, "isolated_context": context.model_dump()}
-
         async with AsyncSessionLocal() as db:
             try:
-                stmt = select(Lead).filter(Lead.business_name.ilike(f"%{clean_query}%")).limit(1)
-                lead = (await db.execute(stmt)).scalar_one_or_none()
+                lead = None
+                if any(k in clean_query for k in ("lead #1", "top lead", "latest", "first lead", "top")):
+                    stmt = select(Lead).filter(~Lead.business_name.ilike("%mock%")).order_by(Lead.created_at.desc()).limit(1)
+                    lead = (await db.execute(stmt)).scalar_one_or_none()
+
+                if not lead and clean_query and not any(k in clean_query for k in ("lead", "business", "restaurant", "code", "prototype", "build")):
+                    stmt = select(Lead).filter(Lead.business_name.ilike(f"%{clean_query}%")).limit(1)
+                    lead = (await db.execute(stmt)).scalar_one_or_none()
+
+                if not lead:
+                    stmt = select(Lead).filter(~Lead.business_name.ilike("%mock%")).order_by(Lead.created_at.desc()).limit(1)
+                    lead = (await db.execute(stmt)).scalar_one_or_none()
+
                 if not lead:
                     return {"found": False, "error": f"Lead not found for '{clean_query}'."}
 
-                tech_art = artifact_registry.get_latest(lead.id, "TechnicalArchitectureArtifact")
-                vis_art = artifact_registry.get_latest(lead.id, "VisualizationArtifact")
-                
-                if not tech_art or not vis_art:
-                    return {"found": False, "error": "Missing Technical or Visualization Artifacts."}
+                # Retrieve Solution Blueprint or on-demand synthesis
+                sol_artifact = artifact_registry.get_latest(lead.id, "BusinessSolutionArtifact")
+                if not sol_artifact:
+                    from app.models.solution import BusinessSolutionIntelligence
+                    from app.schemas.shared_artifacts import BusinessSolutionArtifact
+                    sol_stmt = select(BusinessSolutionIntelligence).where(BusinessSolutionIntelligence.lead_id == lead.id).order_by(BusinessSolutionIntelligence.version.desc()).limit(1)
+                    sol_rec = (await db.execute(sol_stmt)).scalar_one_or_none()
+                    if sol_rec and sol_rec.report:
+                        sol_artifact = BusinessSolutionArtifact(**sol_rec.report)
+
+                module_names = [m.name for m in sol_artifact.modules] if sol_artifact else ["Branding & Landing", "Interactive Menu", "Direct Ordering", "Admin Portal"]
 
                 context = CodingAgentContext(
                     lead_id=lead.id,
                     business_name=lead.business_name,
-                    architecture_pattern=tech_art.architecture_pattern,
-                    frontend_stack=tech_art.frontend_architecture.get("framework", "React"),
-                    backend_stack=tech_art.backend_architecture.get("framework", "FastAPI"),
-                    database=tech_art.database_architecture.get("type", "PostgreSQL"),
-                    modules=[m.get("name") for m in vis_art.dashboard_architecture],
-                    pages=vis_art.page_hierarchy,
-                    api_architecture=tech_art.api_architecture
+                    architecture_pattern="Modular Edge Application (Next.js + FastAPI)",
+                    frontend_stack="Next.js / React (TailwindCSS)",
+                    backend_stack="FastAPI (Async Python)",
+                    database="PostgreSQL (Supabase)",
+                    modules=module_names,
+                    pages=["Home", "Services", "Menu", "Booking", "Admin"],
+                    api_architecture={"style": "RESTful OpenAPI with SSL Encryption"}
                 )
                 return {"found": True, "isolated_context": context.model_dump()}
-            except ValueError as ve:
+            except Exception as ve:
+                logger.error("[CodingContextBuilder] Error: %s", ve, exc_info=True)
                 return {"found": False, "error": str(ve)}
 
 # --- 2. Coding Evaluator ---

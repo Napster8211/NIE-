@@ -99,7 +99,7 @@ class CommunicationEngine:
             channel=channel,
             purpose="Proposal & Live Demo Delivery",
             template_used="Enterprise Demo Delivery Sequence",
-            personalization_summary=personalization,
+            personalization_summary=personalization.model_dump(mode="json"),
             tracking_info=tracking,
             crm_updated=True,
             crm_timeline_events=crm_timeline,

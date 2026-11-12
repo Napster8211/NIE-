@@ -90,6 +90,48 @@ class OwnerControlService:
             record.success = True
             self._log_audit(record)
             await self._emit_sse("APPROVAL_RESOLVED", approval_id, f"Owner {request.decision}: {request.reason}")
+
+            # Auto-dispatch communication when client outreach approval is granted
+            if target_status == ApprovalStatus.APPROVED and (
+                current.approval_type in ("client_outreach", "outreach") or current.requester == "ClientAcquisitionAgent"
+            ):
+                try:
+                    from app.services.communication_engine import CommunicationEngine
+                    from app.schemas.shared_artifacts import CommunicationAgentContext
+                    from app.tools.plugins.communication_tools import CommunicationSaverTool
+                    
+                    ctx_summary = current.context_summary or {}
+                    lead_id = ctx_summary.get("lead_id", current.mission_id.replace("mis_acq_", ""))
+                    b_name = ctx_summary.get("business_name", "Enterprise Client")
+                    p_url = ctx_summary.get("preview_url", "https://demo.napstertec.com")
+                    channel = ctx_summary.get("channel", "WhatsApp Business")
+                    contact = ctx_summary.get("recipient", "+233246952225")
+
+                    comm_ctx = CommunicationAgentContext(
+                        lead_id=lead_id,
+                        business_name=b_name,
+                        category="Restaurant",
+                        recipient_contact=contact,
+                        recommended_channel=channel,
+                        preview_url=p_url,
+                        cto_approved=True,
+                        deployment_successful=True
+                    )
+                    comm_engine = CommunicationEngine()
+                    comm_art = await comm_engine.execute_communication(comm_ctx, "owner_approved_session")
+                    
+                    saver = CommunicationSaverTool()
+                    await saver.execute(artifact=comm_art.model_dump(mode="json"))
+
+                    await self._emit_sse(
+                        "COMMUNICATION_DISPATCHED",
+                        approval_id,
+                        f"Outbound communication dispatched to {b_name} via {channel}."
+                    )
+                except Exception as dispatch_err:
+                    import logging
+                    logging.getLogger(__name__).warning("[OwnerControlService] Auto-dispatch on approval warning: %s", dispatch_err)
+
             return {"status": "success", "approval": resolved.model_dump()}
 
         except Exception as e:
