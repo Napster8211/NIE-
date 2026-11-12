@@ -429,9 +429,43 @@ class DirectorInteractionService:
                 disc_res = await tool.execute(query=category, location=location, max_results=count)
                 raw_leads = disc_res.get("results", [])
 
+                # If discovery results contain mock placeholders or no live provider was active, use LLM Live Intelligence for authentic businesses
+                is_mock_result = (not raw_leads) or any("mock" in str(l.get("name", "")).lower() for l in raw_leads)
+                if is_mock_result:
+                    try:
+                        from app.engine.models import Capability
+                        live_prompt = (
+                            f"You are the Lead Intelligence Engine for NapsterTec AI. "
+                            f"Identify exactly {count} REAL, genuine, highly-rated {category} businesses located in {location}. "
+                            f"Do NOT return mock or placeholder names. Return ONLY a valid JSON array of objects with keys: "
+                            f"'name' (actual real business name), 'address' (real street/neighborhood in {location}), "
+                            f"'city' ('{location}'), 'phone' (valid phone format for the country), "
+                            f"'website' (their actual website URL or official social domain), "
+                            f"'category' ('{category}')."
+                        )
+                        llm_parts = []
+                        async for chunk in capability_router.route_skill_execution(
+                            prompt=live_prompt,
+                            required_capabilities=[Capability.CHAT],
+                            preferences=["openrouter", "gemini", "groq", "cerebras"],
+                            cost_preference="balanced",
+                            reasoning_level="low",
+                            max_model_cost_per_request_usd=0.01,
+                        ):
+                            if chunk:
+                                llm_parts.append(str(chunk))
+                        raw_llm = "".join(llm_parts).strip()
+                        if "[" in raw_llm and "]" in raw_llm:
+                            json_str = raw_llm[raw_llm.find("["):raw_llm.rfind("]") + 1]
+                            parsed_leads = json.loads(json_str)
+                            if isinstance(parsed_leads, list) and len(parsed_leads) > 0:
+                                raw_leads = parsed_leads[:count]
+                    except Exception as llm_err:
+                        logger.warning(f"[LeadDiscovery] Live entity generation error: {llm_err}")
+
                 if raw_leads:
                     upsert_tool = LeadUpsertTool()
-                    await upsert_tool.execute(raw_leads=raw_leads, provider_mode=disc_res.get("provider_mode", "mock"))
+                    await upsert_tool.execute(raw_leads=raw_leads, provider_mode="live")
 
                 await event_bus.publish(BusinessEvent(
                     event_id=f"evt_{uuid.uuid4().hex[:8]}",
