@@ -54,7 +54,10 @@ async def seed_interactive(profile_key: str, profile_name: str, target_url: str,
         page = await context.new_page()
         
         logger.info(f"Navigating to {target_url}...")
-        await page.goto(target_url)
+        try:
+            await page.goto(target_url, wait_until="domcontentloaded", timeout=90000)
+        except Exception as e:
+            logger.warning(f"Navigation wait notice ({e}). The page will continue loading in your browser window.")
         
         if profile_key == "1":
             print("\n>>> INSTRUCTIONS: Scan the QR code with WhatsApp on your phone (Linked Devices).")
