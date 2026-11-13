@@ -33,3 +33,8 @@ markdownify>=0.12.0
 
 # Server-side isolated Engineering execution (Python SDK, never browser-side).
 vercel==0.10.0
+
+# Autonomous Browser Automation & Video Media Generation
+playwright>=1.40.0
+pillow>=10.0.0
+imageio-ffmpeg>=0.4.9

@@ -26,6 +26,9 @@ class WhatsAppBrowserDispatcher:
         self.profile_name = "whatsapp"
 
     def is_configured(self) -> bool:
+        from app.browser.browser_pool import HAS_PLAYWRIGHT
+        if not HAS_PLAYWRIGHT:
+            return False
         return session_vault.has_session(self.profile_name)
 
     def clean_phone_number(self, phone: str) -> str:

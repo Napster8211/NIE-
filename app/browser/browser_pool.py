@@ -10,7 +10,17 @@ import asyncio
 import logging
 from typing import Dict, Optional, Tuple, Any
 from pathlib import Path
-from playwright.async_api import async_playwright, Browser, BrowserContext, Page, Route
+
+try:
+    from playwright.async_api import async_playwright, Browser, BrowserContext, Page, Route
+    HAS_PLAYWRIGHT = True
+except ImportError:
+    async_playwright = None
+    Browser = Any
+    BrowserContext = Any
+    Page = Any
+    Route = Any
+    HAS_PLAYWRIGHT = False
 
 from app.browser.session_vault import session_vault
 
@@ -59,6 +69,8 @@ class BrowserPool:
         self._lock = asyncio.Lock()
 
     async def initialize(self, headless: bool = True):
+        if not HAS_PLAYWRIGHT:
+            raise RuntimeError("Playwright package is not installed in this environment.")
         async with self._lock:
             if not self.playwright:
                 self.playwright = await async_playwright().start()

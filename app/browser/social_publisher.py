@@ -53,6 +53,14 @@ class SocialPublisher:
         platform = "tiktok"
         logger.info(f"[SocialPublisher] Starting TikTok publish for @view.storm5...")
 
+        from app.browser.browser_pool import HAS_PLAYWRIGHT
+        if not HAS_PLAYWRIGHT:
+            return PublishResult(
+                platform=platform,
+                success=False,
+                error_message="Playwright is not installed in this environment."
+            )
+
         if not session_vault.has_session("tiktok_viewstorm.json"):
             return PublishResult(
                 platform=platform,
