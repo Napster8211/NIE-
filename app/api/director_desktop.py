@@ -350,3 +350,94 @@ async def realtime_voice_session(
             await websocket.close(code=1011, reason="INTERNAL_ERROR")
         except Exception:
             pass
+
+
+# ==========================================
+# SPRINT 7: AUTONOMOUS MEDIA & SOCIAL PUBLISHER (VIEWSTORM AI)
+# ==========================================
+
+from pydantic import BaseModel, Field
+import time
+from pathlib import Path
+
+class WisdomVideoGenerateRequest(BaseModel):
+    title: Optional[str] = None
+    max_duration_seconds: Optional[float] = None
+    target_platforms: List[str] = Field(default_factory=lambda: ["tiktok"])
+
+class SocialBroadcastRequest(BaseModel):
+    video_filename: str
+    caption: str
+    hashtags: List[str] = Field(default_factory=lambda: ["#wisdom", "#selfmastery", "#viewstorm"])
+    target_platforms: List[str] = Field(default_factory=lambda: ["tiktok"])
+    dry_run: bool = False
+
+@router.post("/media/generate-video")
+async def generate_wisdom_video(
+    request: WisdomVideoGenerateRequest,
+    principal: DirectorPrincipal = Depends(require_director_mutation),
+):
+    from app.media.wisdom_script_engine import wisdom_script_engine
+    from app.media.video_compiler import video_compiler
+    
+    script = wisdom_script_engine.get_reference_script()
+    if request.title:
+        script.title = request.title
+    
+    filename = f"viewstorm_{int(time.time())}.mp4"
+    output_path = await video_compiler.compile_video(
+        script=script,
+        output_filename=filename,
+        max_duration_seconds=request.max_duration_seconds
+    )
+    return {
+        "success": True,
+        "video_path": str(output_path),
+        "filename": filename,
+        "title": script.title,
+        "hook": script.hook,
+        "tags": script.tags
+    }
+
+@router.get("/media/videos")
+async def list_rendered_videos(
+    principal: DirectorPrincipal = Depends(require_director_access),
+):
+    videos_dir = Path("storage/rendered_videos")
+    videos_dir.mkdir(parents=True, exist_ok=True)
+    
+    videos = []
+    for file in videos_dir.glob("*.mp4"):
+        stat = file.stat()
+        videos.append({
+            "filename": file.name,
+            "path": str(file),
+            "size_bytes": stat.st_size,
+            "created_at": stat.st_mtime
+        })
+    videos.sort(key=lambda x: x["created_at"], reverse=True)
+    return {"videos": videos}
+
+@router.post("/media/publish")
+async def publish_social_video(
+    request: SocialBroadcastRequest,
+    principal: DirectorPrincipal = Depends(require_director_mutation),
+):
+    from app.browser.social_publisher import social_publisher, PublishJob
+    
+    video_path = Path("storage/rendered_videos") / request.video_filename
+    if not video_path.exists():
+        raise HTTPException(status_code=404, detail="Video file not found in storage.")
+    
+    job = PublishJob(
+        video_path=str(video_path),
+        caption=request.caption,
+        hashtags=request.hashtags,
+        target_platforms=request.target_platforms,
+        dry_run=request.dry_run
+    )
+    results = await social_publisher.broadcast_video(job)
+    return {
+        "success": True,
+        "results": {k: v.model_dump() for k, v in results.items()}
+    }

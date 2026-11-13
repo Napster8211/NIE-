@@ -321,6 +321,71 @@ class DirectorInteractionService:
         conv_id: str,
         trace_id: str,
     ) -> Optional[str]:
+
+        # Social Media & Wisdom Video Generation Intent (@view.storm5)
+        media_phrases = (
+            "generate video",
+            "create video",
+            "wisdom video",
+            "generate wisdom",
+            "viewstorm",
+            "tiktok video",
+            "@view.storm5",
+            "publish to tiktok",
+            "publish video",
+            "social media content",
+        )
+        if any(phrase in msg_lower for phrase in media_phrases):
+            try:
+                from app.media.wisdom_script_engine import wisdom_script_engine
+                from app.media.video_compiler import video_compiler
+                from app.browser.social_publisher import social_publisher, PublishJob
+                from pathlib import Path
+
+                if "publish" in msg_lower:
+                    videos_dir = Path("storage/rendered_videos")
+                    rendered = sorted(list(videos_dir.glob("*.mp4")), key=lambda p: p.stat().st_mtime, reverse=True)
+                    if not rendered:
+                        return "Director, no rendered video was found in storage. Please generate a wisdom video first."
+                    
+                    target_vid = rendered[0]
+                    dry_run = "dry" in msg_lower or "test" in msg_lower
+                    job = PublishJob(
+                        video_path=str(target_vid),
+                        caption="10 things to do alone at least once in your life. Self-mastery begins in solitude.",
+                        hashtags=["#lifeadvice", "#selfimprovement", "#wisdom", "#stoicism", "#viewstorm"],
+                        target_platforms=["tiktok"],
+                        dry_run=dry_run
+                    )
+                    res = await social_publisher.broadcast_video(job)
+                    tt_res = res.get("tiktok")
+                    if tt_res and tt_res.success:
+                        mode_str = "staged (dry-run)" if dry_run else "published live"
+                        return f"Director, video '{target_vid.name}' has been successfully {mode_str} to @view.storm5 on TikTok. Proof screenshot saved at: {tt_res.screenshot_path}"
+                    else:
+                        err = tt_res.error_message if tt_res else "Unknown error"
+                        return f"Director, social publication encountered an issue: {err}"
+
+                # Generate Video
+                script = wisdom_script_engine.get_reference_script()
+                filename = f"viewstorm_{int(time.time())}.mp4"
+                output_path = await video_compiler.compile_video(
+                    script=script,
+                    output_filename=filename,
+                    max_duration_seconds=15.0
+                )
+                return (
+                    f"Director, 2D Animated Wisdom Video for @view.storm5 has been successfully generated!\n\n"
+                    f"• Title: {script.title}\n"
+                    f"• Character: Authentic 2D Einstein studio animator on stool\n"
+                    f"• Output File: {output_path.name}\n"
+                    f"• Stored at: storage/rendered_videos/{output_path.name}\n\n"
+                    f"Say 'Publish video to TikTok' to stage or broadcast to your live account."
+                )
+            except Exception as e:
+                logger.error(f"[DirectorInteraction] Video generation error: {e}", exc_info=True)
+                return f"Director, video generation encountered an operational error: {e}"
+
         # 1. Financial Audit & Runway Assessment Intent
         finance_audit_phrases = (
             "financial audit",
