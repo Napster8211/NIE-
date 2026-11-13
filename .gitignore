@@ -92,3 +92,8 @@ storage/engineering_workspaces/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+storage/sessions/
+storage/rendered_videos/
+storage/publish_screenshots/
+storage/outreach_proofs/
