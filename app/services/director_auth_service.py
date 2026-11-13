@@ -41,18 +41,24 @@ def is_production() -> bool:
     return runtime_environment() in {"production", "prod"}
 
 
+DEFAULT_TRUSTED_FRONTEND_ORIGINS = (
+    "https://napstertecai.vercel.app",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+)
+
+
 def trusted_frontend_origins() -> tuple[str, ...]:
     configured = os.getenv("NIE_TRUSTED_FRONTEND_ORIGINS", "")
-    origins = tuple(
+    origins = [
         item.strip().rstrip("/")
         for item in configured.split(",")
         if item.strip()
-    )
-    if origins:
-        return origins
-    if is_production():
-        return ()
-    return ("http://localhost:5173", "http://127.0.0.1:5173")
+    ]
+    for default_origin in DEFAULT_TRUSTED_FRONTEND_ORIGINS:
+        if default_origin not in origins:
+            origins.append(default_origin)
+    return tuple(origins)
 
 
 def session_ttl_seconds() -> int:
