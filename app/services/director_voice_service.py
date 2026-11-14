@@ -2,7 +2,9 @@
 NapsterTec AI - Director Voice Synthesis Service
 Module: app/services/director_voice_service.py
 """
+import asyncio
 from dataclasses import dataclass
+import io
 import logging
 import os
 from typing import Any, Dict, Optional, Tuple
@@ -22,7 +24,7 @@ DEFAULT_SAMPLE_RATE = 44100
 
 @dataclass(frozen=True)
 class DirectorAudioResult:
-    """Audio and playback metadata returned by the ElevenLabs voice service."""
+    """Audio and playback metadata returned by the voice service."""
 
     audio_bytes: bytes
     audio_format: str = "mp3"
@@ -31,7 +33,11 @@ class DirectorAudioResult:
 
 
 class DirectorVoiceService:
-    """Generate Director audio through the ElevenLabs Text-to-Speech API."""
+    """Generate Director audio with resilient multi-tier synthesis:
+    1. ElevenLabs (if configured and quota available)
+    2. Piper Voice Gateway (if configured via VOICE_GATEWAY_URL)
+    3. Sovereign Cloud Neural TTS via gTTS (zero-cost, zero-key, continuous uptime fallback)
+    """
 
     def __init__(self) -> None:
         self._http_client: Optional[httpx.AsyncClient] = None
@@ -52,10 +58,13 @@ class DirectorVoiceService:
         """Expose safe TTS configuration diagnostics without returning secrets."""
         api_key = os.getenv("ELEVENLABS_API_KEY", "").strip()
         voice_id = os.getenv("ELEVENLABS_VOICE_ID", "").strip()
+        voice_gateway_url = os.getenv("VOICE_GATEWAY_URL", "").strip()
         return {
-            "configured": bool(api_key and voice_id),
-            "api_key_configured": bool(api_key),
-            "voice_id_configured": bool(voice_id),
+            "configured": True,
+            "elevenlabs_configured": bool(api_key and voice_id),
+            "voice_gateway_configured": bool(voice_gateway_url),
+            "fallback_available": True,
+            "provider": "elevenlabs" if (api_key and voice_id) else ("piper" if voice_gateway_url else "gtts"),
             "model_id": os.getenv("ELEVENLABS_MODEL_ID", "eleven_multilingual_v2").strip(),
         }
 
@@ -104,19 +113,13 @@ class DirectorVoiceService:
 
         raise ValueError("VOICE_GENERATION_FAILED")
 
-    async def synthesize_text(self, text: str) -> DirectorAudioResult:
-        """Synthesize normalized text through ElevenLabs Text-to-Speech."""
+    async def _synthesize_elevenlabs(self, speech_text: str) -> Optional[DirectorAudioResult]:
         api_key = os.getenv("ELEVENLABS_API_KEY", "").strip()
         voice_id = os.getenv("ELEVENLABS_VOICE_ID", "").strip()
         model_id = os.getenv("ELEVENLABS_MODEL_ID", "eleven_multilingual_v2").strip()
 
         if not api_key or not voice_id:
-            logger.error(
-                "[DirectorVoice] Missing ElevenLabs configuration (API key present: %s, voice ID present: %s)",
-                bool(api_key),
-                bool(voice_id),
-            )
-            raise ValueError("VOICE_NOT_CONFIGURED")
+            return None
 
         try:
             timeout_seconds = float(os.getenv("ELEVENLABS_TIMEOUT_SECONDS", str(DEFAULT_ELEVENLABS_TIMEOUT_SECONDS)))
@@ -124,19 +127,6 @@ class DirectorVoiceService:
                 timeout_seconds = DEFAULT_ELEVENLABS_TIMEOUT_SECONDS
         except (TypeError, ValueError):
             timeout_seconds = DEFAULT_ELEVENLABS_TIMEOUT_SECONDS
-
-        try:
-            max_chars = int(os.getenv("MAX_DIRECTOR_SPEECH_CHARS", str(DEFAULT_MAX_DIRECTOR_SPEECH_CHARS)))
-            if max_chars <= 0:
-                max_chars = DEFAULT_MAX_DIRECTOR_SPEECH_CHARS
-        except (TypeError, ValueError):
-            max_chars = DEFAULT_MAX_DIRECTOR_SPEECH_CHARS
-
-        speech_text = " ".join((text or "").split())
-        if not speech_text:
-            raise ValueError("EMPTY_SPEECH_TEXT")
-        if len(speech_text) > max_chars:
-            raise ValueError("SPEECH_TOO_LONG")
 
         url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
         headers = {
@@ -162,28 +152,97 @@ class DirectorVoiceService:
                 headers=headers,
                 timeout=timeout_seconds,
             )
-        except httpx.TimeoutException:
-            raise ValueError("ELEVENLABS_TIMEOUT")
-        except httpx.RequestError:
-            logger.warning("[DirectorVoice] ElevenLabs network transport unavailable")
-            raise ValueError("ELEVENLABS_UNAVAILABLE")
-        except ValueError:
-            raise
-        except Exception:
-            logger.exception("[DirectorVoice] Unexpected ElevenLabs transport failure")
-            raise ValueError("ELEVENLABS_UNAVAILABLE")
+            if response.status_code == 200 and response.content:
+                return DirectorAudioResult(
+                    audio_bytes=response.content,
+                    audio_format="mp3",
+                    sample_rate=DEFAULT_SAMPLE_RATE,
+                    channels=1,
+                )
+            logger.warning("[DirectorVoice] ElevenLabs HTTP %s (likely quota exhausted). Falling back...", response.status_code)
+        except Exception as exc:
+            logger.warning("[DirectorVoice] ElevenLabs request failed (%s). Falling back...", exc)
 
-        if response.status_code != 200:
-            self._raise_for_upstream_error(response)
-        if not response.content:
-            raise ValueError("VOICE_GENERATION_FAILED")
+        return None
 
+    async def _synthesize_piper_gateway(self, speech_text: str) -> Optional[DirectorAudioResult]:
+        gateway_url = os.getenv("VOICE_GATEWAY_URL", "").strip().rstrip("/")
+        if not gateway_url:
+            return None
+
+        key = os.getenv("VOICE_GATEWAY_API_KEY", "").strip()
+        headers = {"Content-Type": "application/json"}
+        if key:
+            headers["X-NapsterTec-Key"] = key
+
+        try:
+            response = await self._get_http_client().post(
+                f"{gateway_url}/api/v1/tts/wav",
+                json={"text": speech_text},
+                headers=headers,
+                timeout=15.0,
+            )
+            if response.status_code == 200 and response.content:
+                sample_rate = int(response.headers.get("X-Sample-Rate", "22050"))
+                return DirectorAudioResult(
+                    audio_bytes=response.content,
+                    audio_format="wav",
+                    sample_rate=sample_rate,
+                    channels=1,
+                )
+            logger.warning("[DirectorVoice] Piper Gateway returned status %s", response.status_code)
+        except Exception as exc:
+            logger.warning("[DirectorVoice] Piper Gateway request failed: %s", exc)
+
+        return None
+
+    async def _synthesize_gtts(self, speech_text: str) -> DirectorAudioResult:
+        def _generate():
+            from gtts import gTTS
+            fp = io.BytesIO()
+            tts = gTTS(text=speech_text, lang="en", tld="com")
+            tts.write_to_fp(fp)
+            return fp.getvalue()
+
+        audio_bytes = await asyncio.to_thread(_generate)
         return DirectorAudioResult(
-            audio_bytes=response.content,
+            audio_bytes=audio_bytes,
             audio_format="mp3",
-            sample_rate=DEFAULT_SAMPLE_RATE,
+            sample_rate=24000,
             channels=1,
         )
+
+    async def synthesize_text(self, text: str) -> DirectorAudioResult:
+        """Synthesize normalized text through resilient multi-tier voice pipeline."""
+        try:
+            max_chars = int(os.getenv("MAX_DIRECTOR_SPEECH_CHARS", str(DEFAULT_MAX_DIRECTOR_SPEECH_CHARS)))
+            if max_chars <= 0:
+                max_chars = DEFAULT_MAX_DIRECTOR_SPEECH_CHARS
+        except (TypeError, ValueError):
+            max_chars = DEFAULT_MAX_DIRECTOR_SPEECH_CHARS
+
+        speech_text = " ".join((text or "").split())
+        if not speech_text:
+            raise ValueError("EMPTY_SPEECH_TEXT")
+        if len(speech_text) > max_chars:
+            raise ValueError("SPEECH_TOO_LONG")
+
+        # Tier 1: ElevenLabs (High fidelity)
+        result = await self._synthesize_elevenlabs(speech_text)
+        if result is not None:
+            return result
+
+        # Tier 2: Piper Voice Gateway (Self-hosted sovereign voice)
+        result = await self._synthesize_piper_gateway(speech_text)
+        if result is not None:
+            return result
+
+        # Tier 3: Sovereign Cloud Fallback (gTTS - 100% Free, zero-key, continuous uptime)
+        try:
+            return await self._synthesize_gtts(speech_text)
+        except Exception as exc:
+            logger.exception("[DirectorVoice] All voice synthesis tiers failed: %s", exc)
+            raise ValueError("VOICE_GENERATION_FAILED")
 
     async def generate_briefing_audio(self, request: DirectorVoiceRequest) -> bytes:
         """Resolve a canonical briefing and return its audio bytes."""
