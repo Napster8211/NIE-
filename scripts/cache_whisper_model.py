@@ -62,6 +62,10 @@ def prepare_model_cache(
 
 
 def main() -> int:
+    is_render = os.getenv("RENDER", "").lower() in {"true", "1"}
+    if is_render:
+        print("WHISPER_MODEL_CACHE_SKIPPED (Zero-RAM Cloud Groq STT active on Render)")
+        return 0
     try:
         result = prepare_model_cache()
     except Exception as exc:

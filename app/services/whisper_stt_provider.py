@@ -60,14 +60,14 @@ class WhisperSTTConfig:
         has_groq = bool(os.getenv("GROQ_API_KEY", "").strip())
         is_render = os.getenv("RENDER", "").lower() in {"true", "1"}
         
-        # On Render or when Groq is available, prioritize zero-RAM cloud Groq STT
-        # to prevent 512MB Out-Of-Memory (OOM) crashes
-        if has_groq and (is_render or provider_env in {"", "groq", "auto", "whisper"}):
+        # On Render or when Groq is available, enforce zero-RAM cloud Groq STT
+        # to strictly protect the 512MB RAM ceiling and prevent OOM SIGKILL
+        if is_render or has_groq or provider_env in {"groq", "auto"}:
             provider = "groq"
         elif provider_env:
             provider = provider_env
         else:
-            provider = "whisper"
+            provider = "groq" if is_render else "whisper"
         return cls(
             provider=provider,
             model_size=os.getenv("WHISPER_MODEL_SIZE", "tiny.en").strip() or "tiny.en",
@@ -223,7 +223,8 @@ class WhisperSTTProvider:
     def start_loading(self) -> None:
         """Start one background model load without blocking application startup."""
         with self._lock:
-            if self.config.provider == "groq":
+            is_render = os.getenv("RENDER", "").lower() in {"true", "1"}
+            if self.config.provider == "groq" or is_render:
                 self._state = STTReadinessState.READY
                 return
             if self.config.provider != "whisper":

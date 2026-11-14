@@ -69,6 +69,25 @@ from app.services.engineering_workspace_storage import (
 )
 
 
+async def _memory_hygiene_loop():
+    """Periodically triggers garbage collection and trims native glibc heap allocations back to the OS."""
+    import gc
+    while True:
+        try:
+            await asyncio.sleep(60)
+            gc.collect()
+            try:
+                import ctypes
+                libc = ctypes.CDLL("libc.so.6")
+                libc.malloc_trim(0)
+            except Exception:
+                pass
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            pass
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Engineering mode may be staged while disabled, but can never start
@@ -90,10 +109,14 @@ async def lifespan(app: FastAPI):
     logger.info("[Main] Launching Autonomous Mission Worker background loop...")
     await autonomous_worker.start_worker_loop()
 
+    # Start memory hygiene monitor to keep Render memory within 512MB ceiling
+    hygiene_task = asyncio.create_task(_memory_hygiene_loop())
+
     yield  # Application processes requests here
 
     # Shutdown Phase: Stop worker loop and clean up DB connections.
     logger.info("[Main] Shutting down Autonomous Mission Worker...")
+    hygiene_task.cancel()
     await autonomous_worker.stop_worker_loop()
     await ProcessManager.shutdown_active()
     await director_speech_service.shutdown()
