@@ -56,8 +56,20 @@ class WhisperSTTConfig:
         local_files_only = os.getenv("WHISPER_LOCAL_FILES_ONLY", "false").strip().lower()
         if local_files_only not in {"true", "false"}:
             raise ValueError("WHISPER_LOCAL_FILES_ONLY must be true or false")
+        provider_env = os.getenv("DIRECTOR_STT_PROVIDER", "").strip().lower()
+        has_groq = bool(os.getenv("GROQ_API_KEY", "").strip())
+        is_render = os.getenv("RENDER", "").lower() in {"true", "1"}
+        
+        # On Render or when Groq is available, prioritize zero-RAM cloud Groq STT
+        # to prevent 512MB Out-Of-Memory (OOM) crashes
+        if has_groq and (is_render or provider_env in {"", "groq", "auto", "whisper"}):
+            provider = "groq"
+        elif provider_env:
+            provider = provider_env
+        else:
+            provider = "whisper"
         return cls(
-            provider=os.getenv("DIRECTOR_STT_PROVIDER", "whisper").strip().lower(),
+            provider=provider,
             model_size=os.getenv("WHISPER_MODEL_SIZE", "tiny.en").strip() or "tiny.en",
             device=os.getenv("WHISPER_DEVICE", "cpu").strip() or "cpu",
             compute_type=os.getenv("WHISPER_COMPUTE_TYPE", "int8").strip() or "int8",
@@ -178,6 +190,21 @@ class WhisperSTTProvider:
 
     def readiness(self) -> dict:
         with self._lock:
+            if self.config.provider == "groq":
+                return {
+                    "provider": "groq",
+                    "model": "whisper-large-v3-turbo",
+                    "device": "cloud_lpu",
+                    "compute_type": "fp16",
+                    "loaded": True,
+                    "state": STTReadinessState.READY.value,
+                    "cache_configured": False,
+                    "local_files_only": False,
+                    "load_started_at": None,
+                    "load_completed_at": None,
+                    "load_duration_ms": 0,
+                    "error": None,
+                }
             return {
                 "provider": self.config.provider,
                 "model": self.config.model_size,
@@ -196,6 +223,9 @@ class WhisperSTTProvider:
     def start_loading(self) -> None:
         """Start one background model load without blocking application startup."""
         with self._lock:
+            if self.config.provider == "groq":
+                self._state = STTReadinessState.READY
+                return
             if self.config.provider != "whisper":
                 self._state = STTReadinessState.FAILED
                 self._last_error = "STT_NOT_READY"
@@ -269,7 +299,48 @@ class WhisperSTTProvider:
             self._state = STTReadinessState.READY
         return model
 
+    async def _transcribe_groq(self, audio_path: Path) -> WhisperTranscription:
+        import httpx
+        groq_key = os.getenv("GROQ_API_KEY", "").strip()
+        if not groq_key:
+            raise STTProviderError("STT_NOT_READY")
+        t0 = time.monotonic()
+        url = "https://api.groq.com/openai/v1/audio/transcriptions"
+        headers = {"Authorization": f"Bearer {groq_key}"}
+        suffix = audio_path.suffix.lower()
+        mime = "audio/webm" if suffix == ".webm" else ("audio/mp4" if suffix == ".mp4" else "audio/mpeg")
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                with open(audio_path, "rb") as f:
+                    files = {"file": (audio_path.name, f, mime)}
+                    data = {"model": "whisper-large-v3-turbo", "response_format": "verbose_json"}
+                    if self.config.language:
+                        data["language"] = self.config.language
+                    resp = await client.post(url, headers=headers, files=files, data=data)
+            if resp.status_code != 200:
+                logger.error("[DirectorSTT] Groq transcription error: %s %s", resp.status_code, resp.text)
+                raise STTProviderError("STT_TRANSCRIPTION_FAILED")
+            res_json = resp.json()
+            inference_ms = int((time.monotonic() - t0) * 1000)
+            text = (res_json.get("text") or "").strip()
+            duration = float(res_json.get("duration", 0.0) or 0.0)
+            language = str(res_json.get("language") or self.config.language or "en")
+            return WhisperTranscription(
+                text=text,
+                language=language,
+                language_probability=1.0,
+                duration_seconds=duration,
+                inference_ms=inference_ms,
+            )
+        except STTProviderError:
+            raise
+        except Exception as exc:
+            logger.exception("[DirectorSTT] Groq transcription exception")
+            raise STTProviderError("STT_TRANSCRIPTION_FAILED") from exc
+
     async def transcribe(self, audio_path: Path) -> WhisperTranscription:
+        if self.config.provider == "groq":
+            return await self._transcribe_groq(audio_path)
         model = await self._ensure_loaded()
         submitted_at = time.monotonic()
         with self._lock:
