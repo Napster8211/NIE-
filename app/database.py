@@ -9,19 +9,19 @@ load_dotenv()
 # Fetch the connection string from the environment variables
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-# Initialize the asynchronous engine with robust local pooling + Supabase compatibility
+# Initialize the asynchronous engine with lean connection pooling for Render 512MB RAM ceiling
 engine = create_async_engine(
     DATABASE_URL,
     echo=False,
     future=True,
     pool_pre_ping=True,      # Tests connection liveness before every query
     pool_recycle=300,        # Recycles connections every 5 minutes to prevent stale drops
-    pool_size=10,            # Maintains a local pool of warm connections (stops TLS timeouts)
-    max_overflow=20,
+    pool_size=2,             # Lean pool prevents multi-socket SSL buffer bloat
+    max_overflow=3,          # Caps maximum burst connections at 5
     connect_args={
         "statement_cache_size": 0,          # Disables asyncpg primary cache (Required for Supavisor)
         "prepared_statement_cache_size": 0, # Disables secondary LRU cache (Required for Supavisor)
-        "timeout": 60                       # Fails fast on network drops rather than hanging
+        "timeout": 30                       # Fails fast on network drops rather than hanging
     }
 )
 

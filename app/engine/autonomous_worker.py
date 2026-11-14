@@ -57,20 +57,33 @@ class AutonomousMissionWorker:
 
     async def _poll_loop(self):
         while self.is_running:
+            active_work = False
             try:
                 # 1. Mission Dispatcher Bridge: Scan for READY execution requests -> Dispatch to Director
-                await MissionExecutionDispatcher().process_ready_requests()
+                dispatched = await MissionExecutionDispatcher().process_ready_requests()
+                if dispatched > 0:
+                    active_work = True
                 
                 # 2. Worker Loop: Scan for PENDING delegations -> Execute the Specialist
-                await self._process_pending_work()
+                processed = await self._process_pending_work()
+                if processed > 0:
+                    active_work = True
             except Exception as e:
                 logger.error(f"[Autonomous Mission Worker] Error in poll loop: {e}", exc_info=True)
                 self.failure_count += 1
-            await asyncio.sleep(5.0)
+            # Dynamic backoff: poll every 5s during active missions, 20s when idle to save RAM & CPU
+            await asyncio.sleep(5.0 if active_work else 20.0)
 
-    async def _process_pending_work(self):
-        for mission_id in mission_registry.snapshot().keys():
-            await self.process_mission_once(mission_id)
+    async def _process_pending_work(self) -> int:
+        processed_count = 0
+        missions = mission_registry.missions
+        if not missions:
+            return 0
+        for mission_id in list(missions.keys()):
+            success = await self.process_mission_once(mission_id)
+            if success:
+                processed_count += 1
+        return processed_count
 
     async def process_mission_once(self, mission_id: str) -> bool:
         if MissionSafetyReconciler().quarantine_unsafe_missions(mission_id):

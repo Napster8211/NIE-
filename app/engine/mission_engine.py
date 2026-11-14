@@ -447,6 +447,8 @@ class MissionRegistry:
             cls._instance = super(MissionRegistry, cls).__new__(cls)
             cls._instance.missions = {}
             cls._instance.mission_file = MISSION_FILE
+            cls._instance._last_mtime = 0.0
+            cls._instance._last_size = -1
             cls._instance._lock = threading.RLock()
             cls._instance._load_state()
         return cls._instance
@@ -461,14 +463,21 @@ class MissionRegistry:
                 yield
 
     def _read_models_from_disk(self) -> Dict[str, PersistentMission]:
-        if os.path.exists(self.mission_file):
-            try:
-                with open(self.mission_file, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                return {k: PersistentMission(**v) for k, v in data.items()}
-            except Exception as e:
-                logger.error(f"Failed to load mission state: {e}")
-        return {}
+        if not os.path.exists(self.mission_file):
+            return {}
+        try:
+            stat = os.stat(self.mission_file)
+            if stat.st_mtime == getattr(self, "_last_mtime", 0.0) and stat.st_size == getattr(self, "_last_size", -1):
+                return self.missions
+            with open(self.mission_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            loaded = {k: PersistentMission(**v) for k, v in data.items()}
+            self._last_mtime = stat.st_mtime
+            self._last_size = stat.st_size
+            return loaded
+        except Exception as e:
+            logger.error(f"Failed to load mission state: {e}")
+        return self.missions if hasattr(self, "missions") and self.missions else {}
 
     def _load_state_unlocked(self):
         loaded = self._read_models_from_disk()

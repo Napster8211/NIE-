@@ -72,9 +72,10 @@ from app.services.engineering_workspace_storage import (
 async def _memory_hygiene_loop():
     """Periodically triggers garbage collection and trims native glibc heap allocations back to the OS."""
     import gc
+    loop_count = 0
     while True:
         try:
-            await asyncio.sleep(60)
+            await asyncio.sleep(30)
             gc.collect()
             try:
                 import ctypes
@@ -82,6 +83,17 @@ async def _memory_hygiene_loop():
                 libc.malloc_trim(0)
             except Exception:
                 pass
+            loop_count += 1
+            if loop_count % 10 == 0:  # Every 5 minutes, log memory telemetry
+                try:
+                    with open("/proc/self/status", "r") as f:
+                        for line in f:
+                            if line.startswith("VmRSS:"):
+                                rss_kb = int(line.split()[1])
+                                logger.info("[MemoryHygiene] Process RSS: %.1f MB / 512 MB limit", rss_kb / 1024)
+                                break
+                except Exception:
+                    pass
         except asyncio.CancelledError:
             break
         except Exception:
