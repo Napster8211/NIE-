@@ -382,6 +382,28 @@ class SocialBroadcastRequest(BaseModel):
     target_platforms: List[str] = Field(default_factory=lambda: ["tiktok"])
     dry_run: bool = False
 
+class ScriptGeneratePayload(BaseModel):
+    topic: str
+    mode: str = "dual" # "solo" | "dual"
+    speaker1: Optional[str] = "einstein"
+    speaker2: Optional[str] = "apprentice"
+    background: Optional[str] = "podcast"
+
+@router.post("/media/generate-script")
+async def generate_studio_script(
+    request: ScriptGeneratePayload,
+    principal: DirectorPrincipal = Depends(require_director_access),
+):
+    from app.media.wisdom_script_engine import wisdom_script_engine
+    script_data = await wisdom_script_engine.generate_dynamic_script(
+        topic=request.topic,
+        mode=request.mode,
+        speaker1=request.speaker1 or "einstein",
+        speaker2=request.speaker2 or "apprentice",
+        background=request.background or "podcast"
+    )
+    return script_data
+
 @router.post("/media/generate-video")
 async def generate_wisdom_video(
     request: WisdomVideoGenerateRequest,

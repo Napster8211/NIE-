@@ -326,6 +326,10 @@ class DirectorInteractionService:
         media_phrases = (
             "generate video",
             "create video",
+            "make video",
+            "make a video",
+            "generate a video",
+            "create a video",
             "wisdom video",
             "generate wisdom",
             "viewstorm",
@@ -334,6 +338,12 @@ class DirectorInteractionService:
             "publish to tiktok",
             "publish video",
             "social media content",
+            "missed-down video", # Acoustic fallback for "wisdom video"
+            "missed-down",
+            "generate debate",
+            "create debate",
+            "podcast video",
+            "dialogue video",
         )
         if any(phrase in msg_lower for phrase in media_phrases):
             try:
@@ -366,7 +376,31 @@ class DirectorInteractionService:
                         err = tt_res.error_message if tt_res else "Unknown error"
                         return f"Director, social publication encountered an issue: {err}"
 
-                # Generate Video
+                # Check if user requested a debate or dual-character podcast
+                if any(k in msg_lower for k in ("debate", "dialogue", "podcast", "two character", "dual")):
+                    topic = "Consistency vs Motivation"
+                    for term in ("about", "on"):
+                        if term in msg_lower:
+                            parts = msg_lower.split(term, 1)
+                            if len(parts) > 1 and len(parts[1].strip()) > 2:
+                                topic = parts[1].strip().split(".")[0].strip()
+                                break
+                    script_res = await wisdom_script_engine.generate_dynamic_script(
+                        topic=topic,
+                        mode="dual",
+                        speaker1="einstein",
+                        speaker2="apprentice",
+                        background="podcast"
+                    )
+                    return (
+                        f"Director, I have synthesized a dual-character debate on '{script_res['title']}' "
+                        f"between Albert Einstein and the Curious Apprentice!\n\n"
+                        f"• Format: Dual Podcast / Debate Arena (Neon Podcast Lounge)\n"
+                        f"• Script Turns: {len(script_res['points'])} alternating speech cues\n"
+                        f"• Action: The scene is staged and ready for your visual review in Content Studio at /studio."
+                    )
+
+                # Generate Standard Wisdom Video
                 script = wisdom_script_engine.get_reference_script()
                 filename = f"viewstorm_{int(time.time())}.mp4"
                 output_path = await video_compiler.compile_video(

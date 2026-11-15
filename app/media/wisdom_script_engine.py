@@ -155,5 +155,116 @@ class WisdomScriptEngine:
             lines.append(item.spoken_text)
         return " ".join(lines)
 
+    @classmethod
+    async def generate_dynamic_script(
+        cls,
+        topic: str,
+        mode: str = "dual",
+        speaker1: str = "einstein",
+        speaker2: str = "apprentice",
+        background: str = "podcast"
+    ) -> Dict[str, Any]:
+        """
+        Dynamically generates structured, viral dialogue turns or listicle points
+        tailored for the Content Studio canvas.
+        """
+        topic_clean = (topic or "Self-Mastery and Consistency").strip()
+        is_dual = mode == "dual"
+
+        char_names = {
+            "einstein": "Albert Einstein",
+            "stoic": "Marcus Aurelius",
+            "executive": "Tech Executive",
+            "apprentice": "Curious Apprentice",
+        }
+        name1 = char_names.get(speaker1, "Speaker 1")
+        name2 = char_names.get(speaker2, "Speaker 2")
+
+        # Fast Template Engine for instant response & 100% reliability
+        lower_t = topic_clean.lower()
+        
+        if "consisten" in lower_t or "habit" in lower_t or "motivat" in lower_t:
+            points_raw = [
+                (1, "THE MOTIVATION TRAP", "Most people wait to feel motivated. Motivation is an emotion; momentum is a discipline.", "🔥"),
+                (2, "THEN WHAT BUILDS MOMENTUM?", "If motivation fades after day two, what actually keeps you showing up?", "⚡"),
+                (3, "MAKE THE STEP TOO SMALL TO FAIL", "Never set a goal you can negotiate with. One page. One pushup. Win the smallest unit of action.", "🎯"),
+                (4, "THE REPUTATION WITH YOURSELF", "Self-confidence is simply keeping the promises you made when no one was watching.", "🏆"),
+            ]
+            title = "Why Motivation Is A Trap"
+            subtitle = f"{name1} & {name2} on Relentless Consistency"
+        elif "fear" in lower_t or "hard" in lower_t or "adversity" in lower_t or "stoic" in lower_t:
+            points_raw = [
+                (1, "THE OBSTACLE IS THE WAY", "What stands in the path becomes the path. Adversity is not an interruption to the work; it IS the work.", "🏛️"),
+                (2, "IS IT PAIN OR GROWTH?", "How do you separate needless suffering from the friction that makes you sharper?", "⚖️"),
+                (3, "SEPARATE EVENT FROM REACTION", "You have power over your mind, not outside events. Realize this, and you will find indestructible strength.", "🛡️"),
+                (4, "THE INNER CITADEL", "When the world outside is chaos, the person with self-command remains undisturbed.", "🧘"),
+            ]
+            title = "Turning Pain Into Armor"
+            subtitle = f"{name1} & {name2} on Stoic Resilience"
+        elif "focus" in lower_t or "distract" in lower_t or "phone" in lower_t:
+            points_raw = [
+                (1, "PROTECT YOUR ATTENTION", "Your attention is your currency. Every app on your phone is designed to make you poor.", "📵"),
+                (2, "THE COST OF FRAGMENTATION", "Every time you check a notification, your brain takes 23 minutes to refocus.", "🧠"),
+                (3, "DEEP WORK OVER BUSYWORK", "One hour of unbroken concentration creates more value than eight hours of distracted hustle.", "⚡"),
+                (4, "THE SILENT ADVANTAGE", "While the world drowns in noise, the person who can sit in silence for two hours dominates.", "🏆"),
+            ]
+            title = "The War on Attention"
+            subtitle = f"{name1} & {name2} on Ruthless Focus"
+        else:
+            points_raw = [
+                (1, f"THE REALITY OF {topic_clean.upper()}", f"True mastery of {topic_clean} begins when you strip away everyone else's expectations.", "💡"),
+                (2, "THE HARD QUESTION", "Are we solving the real problem or just managing our comfort zone?", "❓"),
+                (3, "THE BREAKTHROUGH PRINCIPLE", "Complexity is lazy. True genius is finding the simplest truth and executing it without mercy.", "🎯"),
+                (4, "THE COMPOUND EFFECT", "A single good decision repeated daily changes your entire trajectory in six months.", "🚀"),
+            ]
+            title = f"The Truth About {topic_clean.title()}"
+            subtitle = f"{name1} & {name2} Masterclass"
+
+        if not is_dual:
+            # In Solo mode, all points belong to Speaker 1
+            points_raw = [(1, p[1], p[2], p[3]) for p in points_raw]
+
+        # Calculate timeline timing
+        duration_per_turn = 5.0
+        start_t = 2.0
+        points = []
+        cues = []
+
+        for idx, (spk, hline, body, icon) in enumerate(points_raw):
+            pid = f"p{idx + 1}"
+            cid = f"c{idx + 1}"
+            end_t = start_t + duration_per_turn
+            points.append({
+                "id": pid,
+                "speaker": spk,
+                "icon": icon,
+                "headline": hline,
+                "body": body,
+                "start": round(start_t, 1),
+                "end": round(end_t, 1),
+            })
+            cues.append({
+                "id": cid,
+                "label": hline,
+                "start": round(start_t, 1),
+                "end": round(end_t, 1),
+                "color": "#00f2fe" if spk == 2 else "#e6a44c",
+            })
+            start_t = end_t + 0.5
+
+        total_duration = int(start_t + 2.0)
+
+        return {
+            "title": title,
+            "subtitle": subtitle,
+            "stageMode": mode,
+            "character": speaker1,
+            "character2": speaker2,
+            "background": background,
+            "duration": total_duration,
+            "points": points,
+            "cues": cues,
+        }
+
 # Singleton instance
 wisdom_script_engine = WisdomScriptEngine()
