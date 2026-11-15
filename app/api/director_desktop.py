@@ -60,12 +60,22 @@ def get_state_service() -> ExecutiveStateService:
 # PREVIOUS SPRINT ENDPOINTS (6A / 6B)
 # ==========================================
 
+_bootstrap_cache = None
+_bootstrap_cache_time = 0.0
+
 @router.get("/desktop/bootstrap", response_model=DesktopBootstrapState)
 async def get_bootstrap_state(
     service: ExecutiveStateService = Depends(get_state_service),
     principal: DirectorPrincipal = Depends(require_director_access),
 ):
-    return service.get_bootstrap_state()
+    global _bootstrap_cache, _bootstrap_cache_time
+    now = time.monotonic()
+    if _bootstrap_cache is not None and (now - _bootstrap_cache_time) < 3.0:
+        return _bootstrap_cache
+    data = service.get_bootstrap_state()
+    _bootstrap_cache = data
+    _bootstrap_cache_time = now
+    return data
 
 @router.get("/overview", response_model=ExecutiveOverview)
 async def get_overview(
@@ -151,7 +161,7 @@ async def stream_executive_events(
                     yield f"data: {event.model_dump_json()}\n\n"
                 except asyncio.TimeoutError:
                     yield ": heartbeat\n\n"
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, GeneratorExit):
             pass
         finally:
             executive_event_service.unsubscribe(queue)

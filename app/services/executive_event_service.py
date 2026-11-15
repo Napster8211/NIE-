@@ -105,6 +105,9 @@ class ExecutiveEventService:
                 if evt.event_id == last_event_id:
                     replay = True
                     
+        if len(self._queues) >= 10:
+            logger.warning("[ExecutiveEventService] Pruning oldest subscriber queue to enforce memory bounds.")
+            self._queues.pop(0)
         self._queues.append(q)
         return q
 
