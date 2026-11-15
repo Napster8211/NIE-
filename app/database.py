@@ -6,8 +6,9 @@ from sqlalchemy.orm import sessionmaker, declarative_base
 # Load environment variables (e.g., from .env file)
 load_dotenv()
 
-# Fetch the connection string from the environment variables
-DATABASE_URL = os.getenv("DATABASE_URL")
+# Fetch the connection string from the environment variables with production fallback
+DEFAULT_DATABASE_URL = "postgresql+asyncpg://postgres.owsiridmqlvncryyahvr:468211Sayibu@aws-1-us-west-2.pooler.supabase.com:6543/postgres?ssl=require"
+DATABASE_URL = os.getenv("DATABASE_URL") or DEFAULT_DATABASE_URL
 
 # Initialize the asynchronous engine with lean connection pooling for Render 512MB RAM ceiling
 engine = create_async_engine(
