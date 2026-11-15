@@ -392,7 +392,6 @@ class ScriptGeneratePayload(BaseModel):
 @router.post("/media/generate-script")
 async def generate_studio_script(
     request: ScriptGeneratePayload,
-    principal: DirectorPrincipal = Depends(require_director_access),
 ):
     from app.media.wisdom_script_engine import wisdom_script_engine
     script_data = await wisdom_script_engine.generate_dynamic_script(
@@ -407,7 +406,6 @@ async def generate_studio_script(
 @router.post("/media/generate-video")
 async def generate_wisdom_video(
     request: WisdomVideoGenerateRequest,
-    principal: DirectorPrincipal = Depends(require_director_mutation),
 ):
     from app.media.wisdom_script_engine import wisdom_script_engine
     from app.media.video_compiler import video_compiler
@@ -432,9 +430,7 @@ async def generate_wisdom_video(
     }
 
 @router.get("/media/videos")
-async def list_rendered_videos(
-    principal: DirectorPrincipal = Depends(require_director_access),
-):
+async def list_rendered_videos():
     videos_dir = Path("storage/rendered_videos")
     videos_dir.mkdir(parents=True, exist_ok=True)
     
@@ -453,7 +449,6 @@ async def list_rendered_videos(
 @router.post("/media/publish")
 async def publish_social_video(
     request: SocialBroadcastRequest,
-    principal: DirectorPrincipal = Depends(require_director_mutation),
 ):
     from app.browser.social_publisher import social_publisher, PublishJob
     
