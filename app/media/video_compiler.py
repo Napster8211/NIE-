@@ -127,15 +127,17 @@ class VideoCompiler:
         self,
         script: WisdomScript,
         output_filename: str = "viewstorm_wisdom_reel.mp4",
-        fps: int = 24,
+        fps: int = 15,
         max_duration_seconds: Optional[float] = None
     ) -> Path:
         """
         Compiles the complete 2D animated vertical MP4 video (1080x1920)
         matching the exact visual layout and timing of @view.storm5.
+        Engineered with strict memory caps to safely operate under Render's 512MB RAM ceiling.
         """
+        import gc
         output_file = self.output_dir / output_filename
-        logger.info(f"[VideoCompiler] Starting video compilation for '{script.title}'...")
+        logger.info(f"[VideoCompiler] Starting memory-safe video compilation for '{script.title}'...")
 
         # 1. Synthesize Audio
         audio_path, duration = await self.generate_narration_audio(script)
@@ -143,27 +145,33 @@ class VideoCompiler:
             duration = min(duration, max_duration_seconds)
 
         total_frames = int(duration * fps)
-        logger.info(f"[VideoCompiler] Rendering {total_frames} frames at {fps} FPS ({duration:.1f}s)...")
+        logger.info(
+            f"[VideoCompiler] Rendering {total_frames} frames at {fps} FPS ({duration:.1f}s) "
+            f"[Buffer: {character_renderer.render_width}x{character_renderer.render_height} -> Output: 1080x1920]..."
+        )
 
         # 2. Map timeline
         timeline = self._flatten_timeline_chunks(script, duration)
 
-        # 3. Spawn FFmpeg process with stdin pipe for direct frame delivery
+        # 3. Spawn FFmpeg process with single-thread lean buffer and hardware-efficient upscaler
         ffmpeg_cmd = [
             self.ffmpeg_path, "-y",
             "-loglevel", "error",
             "-f", "rawvideo",
             "-vcodec", "rawvideo",
-            "-s", f"{CANVAS_WIDTH}x{CANVAS_HEIGHT}",
+            "-s", f"{character_renderer.render_width}x{character_renderer.render_height}",
             "-pix_fmt", "rgba",
             "-r", str(fps),
             "-i", "-", # Stdin pipe
             "-i", audio_path,
             "-c:v", "libx264",
-            "-preset", "ultrafast",
+            "-preset", "veryfast",
+            "-tune", "fastdecode",
+            "-threads", "1", # Strictly cap encoder thread memory on Render 512MB
+            "-vf", "scale=1080:1920:flags=lanczos", # Upscale to crisp 1080p inside FFmpeg C graph
             "-pix_fmt", "yuv420p",
             "-c:a", "aac",
-            "-b:a", "192k",
+            "-b:a", "128k",
             "-shortest",
             str(output_file)
         ]
@@ -187,12 +195,10 @@ class VideoCompiler:
                 sub_emoji = active_chunk["emoji"] if active_chunk else None
 
                 # Animation cycles
-                # Mouth moves 3 frames open, 3 frames closed during active speech
                 mouth_open = (frame_idx % 6) in (1, 2, 3)
-                # Eyes blink for 2 frames every 80 frames
                 eyes_blink = (frame_idx % 80) in (0, 1)
 
-                # Render frame
+                # Render frame at lean dimensions (e.g. 540x960, ~2MB)
                 frame_img = character_renderer.render_frame(
                     mouth_open=mouth_open,
                     eyes_blink=eyes_blink,
@@ -203,7 +209,17 @@ class VideoCompiler:
                 )
 
                 # Write raw RGBA bytes into FFmpeg stdin
-                proc.stdin.write(frame_img.tobytes())
+                frame_bytes = frame_img.tobytes()
+                proc.stdin.write(frame_bytes)
+
+                # Explicit memory reclamation immediately after each frame write
+                del frame_img
+                del frame_bytes
+
+                # Periodic garbage collection and event-loop yield every 15 frames
+                if frame_idx % 15 == 0:
+                    gc.collect()
+                    await asyncio.sleep(0.001)
 
                 if frame_idx % (fps * 5) == 0:
                     pct = (frame_idx / total_frames) * 100
@@ -211,13 +227,17 @@ class VideoCompiler:
 
             proc.stdin.close()
             proc.wait()
+            gc.collect()
             logger.info(f"[VideoCompiler] FFmpeg compilation complete! Saved to: {output_file}")
             return output_file
 
         except Exception as e:
             logger.error(f"[VideoCompiler] Error during compilation: {e}", exc_info=True)
             if proc and proc.stdin:
-                proc.stdin.close()
+                try:
+                    proc.stdin.close()
+                except Exception:
+                    pass
             raise
 
 # Singleton instance

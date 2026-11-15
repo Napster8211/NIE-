@@ -112,25 +112,30 @@ async def lifespan(app: FastAPI):
     # Startup Phase: Connect to PostgreSQL and provision missing tables.
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-        # Ensure images table explicitly exists with exact schema
-        await conn.execute(
-            text("""
-                CREATE TABLE IF NOT EXISTS images (
-                    id VARCHAR PRIMARY KEY,
-                    filename VARCHAR NOT NULL,
-                    file_path VARCHAR NOT NULL,
-                    mime_type VARCHAR NOT NULL,
-                    file_size_bytes INTEGER DEFAULT 0,
-                    source VARCHAR DEFAULT 'UPLOADED',
-                    status VARCHAR DEFAULT 'COMPLETED',
-                    prompt_used TEXT,
-                    metadata_blob JSON DEFAULT '{}',
-                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-                );
-                CREATE INDEX IF NOT EXISTS ix_images_id ON images (id);
-            """)
-        )
+        # Ensure images table explicitly exists with exact schema (individual asyncpg statements)
+        try:
+            await conn.execute(
+                text("""
+                    CREATE TABLE IF NOT EXISTS images (
+                        id VARCHAR PRIMARY KEY,
+                        filename VARCHAR NOT NULL,
+                        file_path VARCHAR NOT NULL,
+                        mime_type VARCHAR NOT NULL,
+                        file_size_bytes INTEGER DEFAULT 0,
+                        source VARCHAR DEFAULT 'UPLOADED',
+                        status VARCHAR DEFAULT 'COMPLETED',
+                        prompt_used TEXT,
+                        metadata_blob JSON DEFAULT '{}',
+                        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+            )
+            await conn.execute(
+                text("CREATE INDEX IF NOT EXISTS ix_images_id ON images (id)")
+            )
+        except Exception as ddl_err:
+            logger.warning("[Main] Images table DDL notice: %s", ddl_err)
 
     # Warm the self-hosted STT model once per application process. Loading is
     # asynchronous; readiness stays false and transcription fails closed until ready.

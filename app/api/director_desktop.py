@@ -372,8 +372,14 @@ from pathlib import Path
 
 class WisdomVideoGenerateRequest(BaseModel):
     title: Optional[str] = None
-    max_duration_seconds: Optional[float] = None
+    topic: Optional[str] = None
+    custom_hook: Optional[str] = None
+    points_count: Optional[int] = None
+    max_duration_seconds: Optional[float] = 20.0
     target_platforms: List[str] = Field(default_factory=lambda: ["tiktok"])
+
+    class Config:
+        extra = "allow"
 
 class SocialBroadcastRequest(BaseModel):
     video_filename: str
@@ -413,12 +419,18 @@ async def generate_wisdom_video(
     script = wisdom_script_engine.get_reference_script()
     if request.title:
         script.title = request.title
+    elif request.topic:
+        script.title = request.topic
+
+    if request.custom_hook:
+        script.hook = request.custom_hook
     
     filename = f"viewstorm_{int(time.time())}.mp4"
+    max_dur = min(request.max_duration_seconds or 20.0, 25.0)
     output_path = await video_compiler.compile_video(
         script=script,
         output_filename=filename,
-        max_duration_seconds=request.max_duration_seconds
+        max_duration_seconds=max_dur
     )
     return {
         "success": True,
