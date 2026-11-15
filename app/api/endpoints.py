@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from app.database import get_db_session
 from app.models.document import Document
+from app.models.image import ImageRecord
 from app.models.memory_models import Message
 
 # --- Engine & Router Imports ---
@@ -887,6 +888,12 @@ async def chat_endpoint(request: ChatRequest, db: AsyncSession = Depends(get_db_
                             document_context += f"--- Start of File: {doc.filename} ---\n{doc_text}\n--- End of File ---\n\n"
                         else:
                             document_context += f"--- File: {doc.filename} (No readable text found) ---\n\n"
+                    else:
+                        img_stmt = select(ImageRecord).where(ImageRecord.id == doc_id)
+                        img_res = await db.execute(img_stmt)
+                        img = img_res.scalar_one_or_none()
+                        if img:
+                            document_context += f"--- Attached Image: {img.filename} ({img.mime_type}) ---\n[Visual multimodal frame is attached for direct scene inspection.]\n\n"
 
         if isinstance(execution_prompt, str):
             branded_prompt = f"{NAPSTERTEC_SYSTEM_PROMPT}{think_instruction}{history_context}{web_context}{document_context}{execution_prompt}"

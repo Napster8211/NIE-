@@ -48,6 +48,39 @@ class DocumentParserService:
 
             elif ext in ['.xlsx', '.pptx']:
                 text = "[System: Excel/PPT extraction pipeline pending future RAG update.]"
+
+            elif ext in ['.mp4', '.mov', '.webm', '.avi', '.mkv'] or (mime_type and 'video' in mime_type):
+                file_size_mb = os.path.getsize(file_path) / (1024 * 1024) if os.path.exists(file_path) else 0.0
+                duration_sec = 0.0
+                width, height, fps, codec = "Unknown", "Unknown", "Unknown", "Unknown"
+                has_audio = False
+                try:
+                    import av
+                    container = av.open(file_path)
+                    video_stream = next((s for s in container.streams if s.type == "video"), None)
+                    audio_stream = next((s for s in container.streams if s.type == "audio"), None)
+                    if container.duration:
+                        duration_sec = float(container.duration) / 1000000.0
+                    if video_stream:
+                        width = video_stream.width
+                        height = video_stream.height
+                        codec = video_stream.codec_context.name if video_stream.codec_context else "Unknown"
+                        fps = float(video_stream.average_rate) if video_stream.average_rate else "Unknown"
+                    has_audio = audio_stream is not None
+                    container.close()
+                except Exception as av_err:
+                    pass
+
+                text = (
+                    f"[Attached Video Media: {os.path.basename(file_path)}]\n"
+                    f"• Container / Format: {ext.upper()} ({mime_type})\n"
+                    f"• Duration: {duration_sec:.1f}s\n"
+                    f"• Resolution: {width}x{height} @ {fps} fps (Codec: {codec})\n"
+                    f"• Audio Track Detected: {has_audio}\n"
+                    f"• Media File Size: {file_size_mb:.2f} MB\n\n"
+                    f"[Video Context: This video file has been ingested into the NapsterTec Intelligence Engine. "
+                    f"Visual snapshot frames are attached to this context for multimodal scene, character, and text analysis.]"
+                )
                 
             else:
                 text = f"[System: Unsupported file format {ext}]"

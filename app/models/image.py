@@ -1,6 +1,6 @@
 from sqlalchemy import Column, String, Integer, DateTime, Text, JSON
 from sqlalchemy.sql import func
-from app.db.base_class import Base
+from app.database import Base
 import uuid
 
 def generate_uuid():
