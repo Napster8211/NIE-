@@ -51,16 +51,16 @@ DEFAULT_TRUSTED_FRONTEND_ORIGINS = (
 
 
 def trusted_frontend_origins() -> tuple[str, ...]:
-    configured = os.getenv("NIE_TRUSTED_FRONTEND_ORIGINS", "")
-    origins = [
-        item.strip().rstrip("/")
-        for item in configured.split(",")
-        if item.strip()
-    ]
-    for default_origin in DEFAULT_TRUSTED_FRONTEND_ORIGINS:
-        if default_origin not in origins:
-            origins.append(default_origin)
-    return tuple(origins)
+    configured = os.getenv("NIE_TRUSTED_FRONTEND_ORIGINS")
+    if configured is not None:
+        return tuple(
+            item.strip().rstrip("/")
+            for item in configured.split(",")
+            if item.strip()
+        )
+    if is_production():
+        return ("https://napstertecai.vercel.app",)
+    return ("http://localhost:5173", "http://127.0.0.1:5173")
 
 
 def session_ttl_seconds() -> int:
@@ -122,7 +122,16 @@ async def verify_firebase_identity(
     error_prefix: str = "DIRECTOR",
 ) -> VerifiedOwnerIdentity:
     """Verify a Firebase assertion without assigning an application role."""
-    project_id = os.getenv("FIREBASE_PROJECT_ID", "").strip() or DEFAULT_FIREBASE_PROJECT_ID
+    configured_project_id = os.getenv("FIREBASE_PROJECT_ID")
+    if configured_project_id is not None:
+        project_id = configured_project_id.strip()
+    else:
+        project_id = DEFAULT_FIREBASE_PROJECT_ID
+    if not project_id:
+        raise DirectorAuthError(
+            f"{error_prefix}_IDENTITY_NOT_CONFIGURED",
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
     if not assertion:
         raise DirectorAuthError(f"{error_prefix}_IDENTITY_REQUIRED", status.HTTP_401_UNAUTHORIZED)
 
@@ -173,13 +182,22 @@ class FirebaseOwnerIdentityVerifier:
     """Verifies Firebase assertions and applies a server-side UID allowlist."""
 
     async def verify(self, assertion: str) -> VerifiedOwnerIdentity:
-        allowlisted_uids = {
-            item.strip()
-            for item in os.getenv("NIE_OWNER_FIREBASE_UIDS", "").split(",")
-            if item.strip()
-        }
+        configured_uids = os.getenv("NIE_OWNER_FIREBASE_UIDS")
+        if configured_uids is not None:
+            allowlisted_uids = {
+                item.strip()
+                for item in configured_uids.split(",")
+                if item.strip()
+            }
+        else:
+            allowlisted_uids = {
+                "JZ0CvUDJrMQ4siE8EmD8pDSwzaV2",
+                "1qkaqPDPeMPahh3c8bGBMpZklA53",
+            }
+        if not allowlisted_uids:
+            raise DirectorAuthError("DIRECTOR_IDENTITY_NOT_CONFIGURED", status.HTTP_503_SERVICE_UNAVAILABLE)
         identity = await verify_firebase_identity(assertion)
-        if allowlisted_uids and identity.uid not in allowlisted_uids:
+        if identity.uid not in allowlisted_uids:
             raise DirectorAuthError("DIRECTOR_OWNER_NOT_ALLOWED", status.HTTP_403_FORBIDDEN)
         return identity
 
