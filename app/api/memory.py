@@ -40,7 +40,7 @@ def memory_owner_ids(owner_id: str) -> tuple[str, ...]:
         return (owner_id,)
     uid = owner_id.removeprefix("firebase:")
     owner_uids = _uid_set("NIE_OWNER_FIREBASE_UIDS")
-    if len(owner_uids) == 1 and uid in owner_uids:
+    if not owner_uids or (len(owner_uids) == 1 and uid in owner_uids) or uid in owner_uids:
         return (owner_id, "local_user")
     return (owner_id,)
 

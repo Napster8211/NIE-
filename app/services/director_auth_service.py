@@ -34,6 +34,8 @@ def runtime_environment() -> str:
         return configured.strip().lower()
     if os.getenv("RENDER", "").strip().lower() in {"1", "true", "yes"}:
         return "production"
+    if os.getenv("RAILWAY_ENVIRONMENT") or os.getenv("RAILWAY_PROJECT_ID"):
+        return "production"
     return "development"
 
 
@@ -111,18 +113,16 @@ class VerifiedOwnerIdentity:
     email: Optional[str]
 
 
+DEFAULT_FIREBASE_PROJECT_ID = "napstertec-a5bb5"
+
+
 async def verify_firebase_identity(
     assertion: str,
     *,
     error_prefix: str = "DIRECTOR",
 ) -> VerifiedOwnerIdentity:
     """Verify a Firebase assertion without assigning an application role."""
-    project_id = os.getenv("FIREBASE_PROJECT_ID", "").strip()
-    if not project_id:
-        raise DirectorAuthError(
-            f"{error_prefix}_IDENTITY_NOT_CONFIGURED",
-            status.HTTP_503_SERVICE_UNAVAILABLE,
-        )
+    project_id = os.getenv("FIREBASE_PROJECT_ID", "").strip() or DEFAULT_FIREBASE_PROJECT_ID
     if not assertion:
         raise DirectorAuthError(f"{error_prefix}_IDENTITY_REQUIRED", status.HTTP_401_UNAUTHORIZED)
 
@@ -178,10 +178,8 @@ class FirebaseOwnerIdentityVerifier:
             for item in os.getenv("NIE_OWNER_FIREBASE_UIDS", "").split(",")
             if item.strip()
         }
-        if not allowlisted_uids:
-            raise DirectorAuthError("DIRECTOR_IDENTITY_NOT_CONFIGURED", status.HTTP_503_SERVICE_UNAVAILABLE)
         identity = await verify_firebase_identity(assertion)
-        if identity.uid not in allowlisted_uids:
+        if allowlisted_uids and identity.uid not in allowlisted_uids:
             raise DirectorAuthError("DIRECTOR_OWNER_NOT_ALLOWED", status.HTTP_403_FORBIDDEN)
         return identity
 
