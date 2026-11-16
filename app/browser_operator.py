@@ -113,7 +113,52 @@ class BrowserOperatorManager:
                 session_id=request.session_id, action=action, status="CLOSED"
             ).model_dump()
 
-        page = await self._page(request.session_id)
+        try:
+            page = await self._page(request.session_id)
+        except Exception as browser_err:
+            logger.error("[BrowserOperator] Playwright page launch failed: %s", browser_err)
+            self._sessions.pop(request.session_id, None)
+            if action in {"navigate", "inspect"} and request.url:
+                try:
+                    import httpx
+                    from bs4 import BeautifulSoup
+                    valid_url = self._validate_url(request.url)
+                    headers = {
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    }
+                    async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
+                        resp = await client.get(valid_url, headers=headers)
+                    soup = BeautifulSoup(resp.text, "html.parser")
+                    title = soup.title.string.strip() if soup.title and soup.title.string else valid_url
+                    for tag in soup(["script", "style", "noscript", "svg"]):
+                        tag.decompose()
+                    clean_text = soup.get_text(separator="\n", strip=True)
+                    clean_text = re.sub(r"\n{3,}", "\n\n", clean_text)[:8000]
+                    return BrowserOperatorOutput(
+                        session_id=request.session_id,
+                        action=action,
+                        status="COMPLETED",
+                        url=str(resp.url),
+                        title=title,
+                        text=clean_text,
+                        error=None,
+                    ).model_dump()
+                except Exception as fallback_err:
+                    return BrowserOperatorOutput(
+                        session_id=request.session_id,
+                        action=action,
+                        status="FAILED",
+                        url=request.url,
+                        error=f"Browser driver error: {browser_err}; fallback error: {fallback_err}",
+                    ).model_dump()
+            return BrowserOperatorOutput(
+                session_id=request.session_id,
+                action=action,
+                status="FAILED",
+                error=f"Browser driver error: {browser_err}",
+            ).model_dump()
+
         if action == "navigate":
             if not request.url:
                 raise ValueError("navigate requires url")

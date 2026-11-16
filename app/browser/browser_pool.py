@@ -72,20 +72,81 @@ class BrowserPool:
         if not HAS_PLAYWRIGHT:
             raise RuntimeError("Playwright package is not installed in this environment.")
         async with self._lock:
+            # Check if existing browser is still connected and alive
+            if self.browser and hasattr(self.browser, "is_connected") and not self.browser.is_connected():
+                logger.warning("[BrowserPool] Existing browser disconnected. Cleaning up stale handle.")
+                self.browser = None
+                if self.playwright:
+                    try:
+                        await self.playwright.stop()
+                    except Exception:
+                        pass
+                    self.playwright = None
+
             if not self.playwright:
-                self.playwright = await async_playwright().start()
+                try:
+                    self.playwright = await async_playwright().start()
+                except Exception as pw_err:
+                    logger.error(f"[BrowserPool] Failed to start Playwright driver: {pw_err}")
+                    self.playwright = None
+                    raise
+
             if not self.browser:
                 logger.info("[BrowserPool] Launching sandboxed Chromium with anti-detection flags...")
-                self.browser = await self.playwright.chromium.launch(
-                    headless=headless,
-                    args=[
-                        "--disable-blink-features=AutomationControlled",
-                        "--no-sandbox",
-                        "--disable-dev-shm-usage",
-                        "--disable-infobars",
-                        "--window-size=1280,800"
-                    ]
-                )
+                launch_args = [
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-infobars",
+                    "--disable-gpu",
+                    "--no-first-run",
+                    "--window-size=1280,800"
+                ]
+                try:
+                    self.browser = await self.playwright.chromium.launch(
+                        headless=headless,
+                        args=launch_args
+                    )
+                except Exception as launch_err:
+                    logger.warning(f"[BrowserPool] First launch failed ({launch_err}). Cleaning driver & attempting auto-install...")
+                    # Clean up broken driver transport so it is not reused
+                    if self.playwright:
+                        try:
+                            await self.playwright.stop()
+                        except Exception:
+                            pass
+                        self.playwright = None
+                    self.browser = None
+
+                    # Self-heal: install chromium if missing in runtime container
+                    try:
+                        import sys
+                        install_proc = await asyncio.create_subprocess_exec(
+                            sys.executable, "-m", "playwright", "install", "chromium",
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE
+                        )
+                        await asyncio.wait_for(install_proc.communicate(), timeout=90.0)
+                    except Exception as inst_err:
+                        logger.warning(f"[BrowserPool] Runtime install attempt finished with: {inst_err}")
+
+                    # Retry launch with fresh driver instance
+                    try:
+                        self.playwright = await async_playwright().start()
+                        self.browser = await self.playwright.chromium.launch(
+                            headless=headless,
+                            args=launch_args
+                        )
+                    except Exception as retry_err:
+                        logger.error(f"[BrowserPool] Second Chromium launch failed: {retry_err}")
+                        if self.playwright:
+                            try:
+                                await self.playwright.stop()
+                            except Exception:
+                                pass
+                            self.playwright = None
+                        self.browser = None
+                        raise
                 logger.info("[BrowserPool] Chromium engine online and ready.")
 
     async def _ssrf_guard(self, route: Route):
