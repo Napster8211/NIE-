@@ -42,6 +42,7 @@ from app.tools.tool_executor import ToolExecutor
 from app.tools.workspace_reader import WorkspaceReaderTool
 from app.tools.workspace_writer import WorkspaceWriterTool
 from app.services.stream_events import sse_event
+from app.browser_operator import BrowserOperatorTool
 
 # --- SPRINT 2 IMPORTS (Lead Intelligence) ---
 from app.tools.plugins.business_discovery import BusinessDiscoveryTool
@@ -729,6 +730,13 @@ class AgentExecutionRequest(BaseModel):
     goal: str = Field(..., description="The objective for the autonomous agent to achieve.")
     session_id: str = Field(default_factory=lambda: str(uuid.uuid4()), description="Unique session identifier.")
 
+
+class BrowserOperatorRequest(BaseModel):
+    goal: str = Field(..., description="The browser task for the interactive operator.")
+    session_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    start_url: Optional[str] = None
+    allow_interactions: bool = False
+
 # --- Endpoints ---
 @router.get("/health")
 async def health_check() -> Dict[str, str]:
@@ -1072,6 +1080,88 @@ async def execute_deep_research(request: ResearchRequest):
     except Exception as e:
         logger.error(f"Deep Research execution failed: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Research Engine Error: {str(e)}")
+
+
+@router.post("/browser/stream")
+async def stream_browser_operator(request: BrowserOperatorRequest):
+    """Run the general interactive browser operator for Standard Chat."""
+    logger.info(
+        "Received Standard Chat browser task for session %s (interactions=%s)",
+        request.session_id,
+        request.allow_interactions,
+    )
+
+    async def sse_generator() -> AsyncGenerator[str, None]:
+        try:
+            goal = request.goal
+            if request.start_url:
+                goal = (
+                    f"First navigate to this exact URL: {request.start_url}\n"
+                    f"Then complete the user's browser task: {goal}"
+                )
+            scoped_registry = ToolRegistry()
+            scoped_registry.register(BrowserOperatorTool())
+            scoped_tool_manager = ToolManager(
+                registry=scoped_registry,
+                executor=tool_executor,
+            )
+            command_context = {
+                "read_only": not request.allow_interactions,
+                "mutation_allowed": request.allow_interactions,
+                "external_side_effect_allowed": False,
+                "access_mode": "INTERACTIVE" if request.allow_interactions else "READ_ONLY",
+                "source": "standard_chat_browser_operator",
+                "session_id": request.session_id,
+                "browser_allow_interactions": request.allow_interactions,
+            }
+            agent_loop = AutonomousAgentLoop(
+                primary_llm=llm_provider,
+                fallback_llm=llm_provider,
+                tool_manager=scoped_tool_manager,
+                command_context=command_context,
+                model_routing={
+                    "cost_preference": "balanced",
+                    "reasoning_level": "medium",
+                    "max_model_cost_per_request_usd": 0.02,
+                },
+            )
+
+            yield f"data: {json.dumps({'type': 'browser.session_created', 'session_id': request.session_id, 'allow_interactions': request.allow_interactions})}\n\n"
+            async for telemetry_event in agent_loop.execute_goal(
+                session_id=request.session_id,
+                goal=goal,
+            ):
+                yield f"data: {json.dumps(telemetry_event)}\n\n"
+                trace = telemetry_event.get("trace") or {}
+                action = trace.get("action") or {}
+                if action.get("tool_name") == "browser_operator" and trace.get("observation"):
+                    try:
+                        browser_result = json.loads(trace["observation"])
+                        if isinstance(browser_result.get("data"), dict):
+                            browser_result = browser_result["data"]
+                        event_name = (
+                            "browser.approval_required"
+                            if browser_result.get("approval_required")
+                            else "browser.action_completed"
+                        )
+                        browser_result["session_id"] = request.session_id
+                        yield f"data: {json.dumps({'type': event_name, **browser_result})}\n\n"
+                    except (TypeError, json.JSONDecodeError):
+                        pass
+                if telemetry_event.get("type") in {"completion", "failure"}:
+                    break
+        except asyncio.CancelledError:
+            logger.info("Browser operator client disconnected for %s", request.session_id)
+            yield f"data: {json.dumps({'type': 'browser.session_paused', 'session_id': request.session_id})}\n\n"
+        except Exception as error:
+            logger.error("Browser operator stream failed: %s", error, exc_info=True)
+            yield f"data: {json.dumps({'type': 'browser.failed', 'session_id': request.session_id, 'error': str(error)})}\n\n"
+
+    return StreamingResponse(
+        sse_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+    )
 
 @router.post("/agent/stream")
 async def stream_agent_execution(request: AgentExecutionRequest):
