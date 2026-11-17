@@ -37,7 +37,8 @@ aptPkgs = [
 cmds = [
     "python -m pip install --upgrade pip",
     "pip install -r requirements.txt",
-    "playwright install --with-deps chromium"
+    "playwright install --with-deps chromium",
+    "cp uvicorn_wrapper.py $(which uvicorn) 2>/dev/null || true"
 ]
 
 [variables]

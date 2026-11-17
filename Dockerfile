@@ -25,6 +25,9 @@ RUN playwright install --with-deps chromium
 # Copy application source code
 COPY . .
 
+# Install uvicorn wrapper to handle unexpanded $PORT arguments from cloud custom start commands
+RUN cp uvicorn_wrapper.py /usr/local/bin/uvicorn && chmod +x /usr/local/bin/uvicorn
+
 # Expose service port and start application
 EXPOSE 8000
 CMD ["python", "run.py"]
