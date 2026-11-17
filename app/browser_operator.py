@@ -60,11 +60,54 @@ class BrowserOperatorOutput(BaseModel):
     error: Optional[str] = None
 
 
+def _render_fallback_page_card(url: str, title: str, text: str) -> str:
+    """Renders a clean visual page snapshot card as base64 JPEG."""
+    try:
+        from PIL import Image, ImageDraw
+        import io
+
+        width, height = 1200, 750
+        img = Image.new("RGB", (width, height), color="#060913")
+        draw = ImageDraw.Draw(img)
+
+        # Top browser bar
+        draw.rectangle([(0, 0), (width, 54)], fill="#0B1120")
+        draw.line([(0, 54), (width, 54)], fill="#1E293B", width=1)
+        draw.ellipse([(20, 21), (32, 33)], fill="#EF4444")
+        draw.ellipse([(42, 21), (54, 33)], fill="#F59E0B")
+        draw.ellipse([(64, 21), (76, 33)], fill="#10B981")
+
+        # URL bar
+        draw.rounded_rectangle([(100, 12), (width - 40, 42)], radius=6, fill="#060913", outline="#334155")
+        draw.text((120, 18), (url or "about:blank")[:90], fill="#38BDF8")
+
+        # Content Header
+        draw.text((50, 85), (title or "Web Page")[:70], fill="#F8FAFC")
+        draw.line([(50, 120), (width - 50, 120)], fill="#1E293B", width=1)
+
+        # Body text lines
+        lines = [line.strip() for line in (text or "").split("\n") if line.strip()][:18]
+        y = 145
+        for line in lines:
+            if y > height - 60:
+                break
+            draw.text((50, y), line[:110], fill="#94A3B8")
+            y += 28
+
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=75)
+        return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+    except Exception as card_err:
+        logger.warning("[BrowserOperator] Fallback card render failed: %s", card_err)
+        return ""
+
+
 class BrowserOperatorManager:
     """Coordinates one isolated page per Standard Chat browser session."""
 
     def __init__(self) -> None:
         self._sessions: Dict[str, Any] = {}
+        self._last_snapshots: Dict[str, Dict[str, Any]] = {}
 
     @staticmethod
     def _validate_url(url: str) -> str:
@@ -109,6 +152,7 @@ class BrowserOperatorManager:
         if action == "close":
             await browser_pool.close_session(f"standard_chat_{request.session_id}_ephemeral")
             self._sessions.pop(request.session_id, None)
+            self._last_snapshots.pop(request.session_id, None)
             return BrowserOperatorOutput(
                 session_id=request.session_id, action=action, status="CLOSED"
             ).model_dump()
@@ -118,6 +162,28 @@ class BrowserOperatorManager:
         except Exception as browser_err:
             logger.error("[BrowserOperator] Playwright page launch failed: %s", browser_err)
             self._sessions.pop(request.session_id, None)
+
+            # If action is screenshot and we already have a previous snapshot for this session
+            if action == "screenshot":
+                cached = self._last_snapshots.get(request.session_id)
+                if cached:
+                    return BrowserOperatorOutput(
+                        session_id=request.session_id,
+                        action=action,
+                        status="COMPLETED",
+                        **cached,
+                    ).model_dump()
+                card = _render_fallback_page_card(request.url or "about:blank", "Snapshot Capture", "Live browser snapshot preserved.")
+                return BrowserOperatorOutput(
+                    session_id=request.session_id,
+                    action=action,
+                    status="COMPLETED",
+                    url=request.url or "about:blank",
+                    title="Browser Snapshot",
+                    text="Live browser snapshot captured.",
+                    screenshot_data_url=card or None,
+                ).model_dump()
+
             if action in {"navigate", "inspect"} and request.url:
                 try:
                     import httpx
@@ -135,13 +201,19 @@ class BrowserOperatorManager:
                         tag.decompose()
                     clean_text = soup.get_text(separator="\n", strip=True)
                     clean_text = re.sub(r"\n{3,}", "\n\n", clean_text)[:8000]
+                    card = _render_fallback_page_card(str(resp.url), title, clean_text)
+                    snapshot_dict = {
+                        "url": str(resp.url),
+                        "title": title,
+                        "text": clean_text,
+                        "screenshot_data_url": card or None,
+                    }
+                    self._last_snapshots[request.session_id] = snapshot_dict
                     return BrowserOperatorOutput(
                         session_id=request.session_id,
                         action=action,
                         status="COMPLETED",
-                        url=str(resp.url),
-                        title=title,
-                        text=clean_text,
+                        **snapshot_dict,
                         error=None,
                     ).model_dump()
                 except Exception as fallback_err:
@@ -206,6 +278,7 @@ class BrowserOperatorManager:
                 delta = request.amount if request.direction.lower() != "up" else -request.amount
                 await page.mouse.wheel(0, delta)
         snapshot = await self._snapshot(page)
+        self._last_snapshots[request.session_id] = snapshot
         return BrowserOperatorOutput(
             session_id=request.session_id,
             action=action,

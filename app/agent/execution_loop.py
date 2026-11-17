@@ -49,6 +49,7 @@ class AutonomousAgentLoop:
         "url_reader",
         "web_search",
         "document_retrieval",
+        "browser_operator",
     }
 
     WORKSPACE_NAVIGATION_ACTIONS: Set[str] = {
