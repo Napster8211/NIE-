@@ -1136,11 +1136,21 @@ async def stream_browser_operator(request: BrowserOperatorRequest):
                 yield f"event: {telemetry_type}\ndata: {json.dumps(telemetry_event)}\n\n"
                 trace = telemetry_event.get("trace") or {}
                 action = trace.get("action") or {}
-                if action.get("tool_name") == "browser_operator" and trace.get("observation"):
-                    try:
-                        browser_result = json.loads(trace["observation"])
-                        if isinstance(browser_result.get("data"), dict):
-                            browser_result = browser_result["data"]
+                tool_metadata = trace.get("tool_metadata")
+                if action.get("tool_name") == "browser_operator" or (isinstance(tool_metadata, dict) and tool_metadata.get("screenshot_data_url")):
+                    browser_result = None
+                    if isinstance(tool_metadata, dict) and (tool_metadata.get("screenshot_data_url") or tool_metadata.get("url") or tool_metadata.get("status")):
+                        browser_result = dict(tool_metadata)
+                    elif trace.get("observation"):
+                        try:
+                            parsed = json.loads(trace["observation"])
+                            if isinstance(parsed.get("data"), dict):
+                                parsed = parsed["data"]
+                            browser_result = parsed
+                        except (TypeError, json.JSONDecodeError):
+                            pass
+
+                    if browser_result:
                         event_name = (
                             "browser.approval_required"
                             if browser_result.get("approval_required")
@@ -1148,8 +1158,6 @@ async def stream_browser_operator(request: BrowserOperatorRequest):
                         )
                         browser_result["session_id"] = request.session_id
                         yield f"event: {event_name}\ndata: {json.dumps({'type': event_name, **browser_result})}\n\n"
-                    except (TypeError, json.JSONDecodeError):
-                        pass
                 if telemetry_event.get("type") in {"completion", "failure"}:
                     terminal_emitted = True
                     break

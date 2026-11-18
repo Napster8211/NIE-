@@ -15,6 +15,7 @@ class ExecutionTrace(BaseModel):
     confidence: float = Field(default=1.0, description="Agent's confidence in the result (0.0 to 1.0).")
     reflection: Optional[str] = Field(default=None, description="Self-correction or analysis of the observation.")
     is_error: bool = Field(default=False, description="Flag indicating if the action resulted in a failure.")
+    tool_metadata: Optional[Dict[str, Any]] = Field(default=None, description="Structured un-truncated metadata from tool execution (e.g. browser screenshots, url, title).")
 
 class AgentState(BaseModel):
     session_id: str

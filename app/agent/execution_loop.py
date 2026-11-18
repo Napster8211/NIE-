@@ -170,9 +170,10 @@ class AutonomousAgentLoop:
                     break
 
                 # Phase 3: Observe
-                observation, is_error = await self._execute_tool_with_recovery(trace.action)
+                observation, is_error, raw_metadata = await self._execute_tool_with_recovery(trace.action)
                 trace.observation = observation
                 trace.is_error = is_error
+                trace.tool_metadata = raw_metadata
 
                 yield {
                     "type": "trace_update",
@@ -312,7 +313,7 @@ Rules:
 
         return self._validate_cognitive_response(raw)
 
-    async def _execute_tool_with_recovery(self, action: ToolExecution) -> tuple[str, bool]:
+    async def _execute_tool_with_recovery(self, action: ToolExecution) -> tuple[str, bool, Optional[Dict[str, Any]]]:
         for attempt in range(self.max_retries_per_step):
             try:
                 parameters = dict(action.arguments or {})
@@ -322,16 +323,22 @@ Rules:
                     tool_name=action.tool_name,
                     parameters=parameters,
                 )
+                raw_payload: Optional[Dict[str, Any]] = None
+                if hasattr(result, "model_dump"):
+                    raw_payload = result.model_dump()
+                elif isinstance(result, dict):
+                    raw_payload = dict(result)
+
                 observation = self._normalize_tool_result(result)
-                return observation, False
+                return observation, False, raw_payload
 
             except Exception as exc:
                 logger.error("[AgentLoop] Tool execution failed (Attempt %s): %s", attempt + 1, str(exc))
                 if attempt == self.max_retries_per_step - 1:
-                    return (f"System Error: {str(exc)}. Tool execution failed permanently after retries.", True)
+                    return (f"System Error: {str(exc)}. Tool execution failed permanently after retries.", True, None)
                 await asyncio.sleep(2 ** attempt)
 
-        return "Unknown Execution Failure", True
+        return "Unknown Execution Failure", True, None
 
     async def _reflect_on_observation(self, state: AgentState, trace: ExecutionTrace) -> ReflectionResponse:
         system_prompt = """
@@ -444,7 +451,7 @@ CRITICAL: Even if the user requested "Return only: [Text]", you must output the 
     def _normalize_tool_result(self, result: Any) -> str:
         payload: Any
         if hasattr(result, "model_dump"): payload = result.model_dump()
-        elif isinstance(result, dict): payload = result
+        elif isinstance(result, dict): payload = dict(result)
         else:
             payload = {
                 "status": getattr(result, "status", None),
@@ -454,7 +461,13 @@ CRITICAL: Even if the user requested "Return only: [Text]", you must output the 
             if not any(value is not None for value in payload.values()):
                 payload = str(result)
 
-        text = json.dumps(payload, ensure_ascii=False, default=str)
+        if isinstance(payload, dict) and "screenshot_data_url" in payload:
+            llm_payload = dict(payload)
+            if llm_payload.get("screenshot_data_url"):
+                llm_payload["screenshot_data_url"] = "[SCREENSHOT_CAPTURED_AND_AVAILABLE_TO_USER]"
+            text = json.dumps(llm_payload, ensure_ascii=False, default=str)
+        else:
+            text = json.dumps(payload, ensure_ascii=False, default=str)
         return self._truncate(text, self.max_observation_chars)
 
     def _bounded_history(self, state: AgentState, limit: int = 3) -> List[Dict[str, Any]]:
