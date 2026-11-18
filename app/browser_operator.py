@@ -57,7 +57,23 @@ class BrowserOperatorOutput(BaseModel):
     text: Optional[str] = None
     screenshot_data_url: Optional[str] = None
     approval_required: bool = False
+    auth_required: bool = False
     error: Optional[str] = None
+
+
+def _is_auth_required(url: str, title: str, text: str) -> bool:
+    target = f"{url or ''} {title or ''} {(text or '')[:3000]}".lower()
+    auth_patterns = [
+        r"\b(login|log in|log-in|signin|sign in|sign-in)\b",
+        r"\b(enter password|verify account|two-factor|checkpoint|oauth/authorize)\b",
+        r"tiktok\.com/login",
+        r"accounts\.google\.com",
+        r"twitter\.com/i/flow/login",
+        r"x\.com/i/flow/login",
+        r"facebook\.com/login",
+        r"github\.com/login",
+    ]
+    return any(re.search(pat, target) for pat in auth_patterns)
 
 
 def _render_fallback_page_card(url: str, title: str, text: str) -> str:
@@ -143,6 +159,50 @@ class BrowserOperatorManager:
             "text": text,
             "screenshot_data_url": f"data:image/jpeg;base64,{encoded}",
         }
+
+    async def get_session_info(self, session_id: str) -> Dict[str, Any]:
+        snapshot = self._last_snapshots.get(session_id) or {}
+        page = self._sessions.get(session_id)
+        current_url = page.url if page and not page.is_closed() else snapshot.get("url", "about:blank")
+        current_title = await page.title() if page and not page.is_closed() else snapshot.get("title", "Browser Session")
+        auth_req = _is_auth_required(current_url, current_title, snapshot.get("text", ""))
+        return {
+            "session_id": session_id,
+            "url": current_url,
+            "title": current_title,
+            "status": "WAITING_FOR_AUTH" if auth_req else "ACTIVE",
+            "auth_required": auth_req,
+            "screenshot_data_url": snapshot.get("screenshot_data_url"),
+        }
+
+    async def take_control(self, session_id: str) -> Dict[str, Any]:
+        info = await self.get_session_info(session_id)
+        info["status"] = "USER_IN_CONTROL"
+        return info
+
+    async def return_control(self, session_id: str) -> Dict[str, Any]:
+        page = self._sessions.get(session_id)
+        if page and not page.is_closed():
+            snapshot = await self._snapshot(page)
+            self._last_snapshots[session_id] = snapshot
+        else:
+            snapshot = self._last_snapshots.get(session_id) or {}
+
+        current_url = snapshot.get("url", "about:blank")
+        current_title = snapshot.get("title", "")
+        auth_req = _is_auth_required(current_url, current_title, snapshot.get("text", ""))
+
+        return {
+            "session_id": session_id,
+            "status": "WAITING_FOR_AUTH" if auth_req else "AUTH_VERIFIED",
+            "auth_verified": not auth_req,
+            "url": current_url,
+            "title": current_title,
+            "screenshot_data_url": snapshot.get("screenshot_data_url"),
+        }
+
+    async def verify_auth(self, session_id: str) -> Dict[str, Any]:
+        return await self.return_control(session_id)
 
     async def execute(self, request: BrowserOperatorInput) -> Dict[str, Any]:
         action = request.action.strip().lower()
@@ -262,10 +322,13 @@ class BrowserOperatorManager:
                         "screenshot_data_url": card or None,
                     }
                     self._last_snapshots[request.session_id] = snapshot
+                    auth_req = _is_auth_required(snapshot["url"], snapshot["title"], snapshot["text"])
+                    step_status = "WAITING_FOR_AUTH" if auth_req else "COMPLETED"
                     return BrowserOperatorOutput(
                         session_id=request.session_id,
                         action=action,
-                        status="COMPLETED",
+                        status=step_status,
+                        auth_required=auth_req,
                         **snapshot,
                     ).model_dump()
                 except Exception as fb_err:
@@ -277,10 +340,13 @@ class BrowserOperatorManager:
                         "screenshot_data_url": card or None,
                     }
                     self._last_snapshots[request.session_id] = snapshot
+                    auth_req = _is_auth_required(snapshot["url"], snapshot["title"], snapshot["text"])
+                    step_status = "WAITING_FOR_AUTH" if auth_req else "COMPLETED"
                     return BrowserOperatorOutput(
                         session_id=request.session_id,
                         action=action,
-                        status="COMPLETED",
+                        status=step_status,
+                        auth_required=auth_req,
                         **snapshot,
                     ).model_dump()
         elif action in {"click", "type", "scroll"}:
@@ -327,10 +393,13 @@ class BrowserOperatorManager:
                 await page.mouse.wheel(0, delta)
         snapshot = await self._snapshot(page)
         self._last_snapshots[request.session_id] = snapshot
+        auth_req = _is_auth_required(snapshot["url"], snapshot["title"], snapshot["text"])
+        step_status = "WAITING_FOR_AUTH" if auth_req else "COMPLETED"
         return BrowserOperatorOutput(
             session_id=request.session_id,
             action=action,
-            status="COMPLETED",
+            status=step_status,
+            auth_required=auth_req,
             **snapshot,
         ).model_dump()
 

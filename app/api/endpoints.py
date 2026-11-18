@@ -42,7 +42,7 @@ from app.tools.tool_executor import ToolExecutor
 from app.tools.workspace_reader import WorkspaceReaderTool
 from app.tools.workspace_writer import WorkspaceWriterTool
 from app.services.stream_events import sse_event
-from app.browser_operator import BrowserOperatorTool
+from app.browser_operator import BrowserOperatorTool, browser_operator_manager
 
 # --- SPRINT 2 IMPORTS (Lead Intelligence) ---
 from app.tools.plugins.business_discovery import BusinessDiscoveryTool
@@ -1151,41 +1151,54 @@ async def stream_browser_operator(request: BrowserOperatorRequest):
                             pass
 
                     if browser_result:
-                        event_name = (
-                            "browser.approval_required"
-                            if browser_result.get("approval_required")
-                            else "browser.action_completed"
-                        )
+                        if browser_result.get("auth_required") or browser_result.get("status") == "WAITING_FOR_AUTH":
+                            event_name = "browser.waiting_for_auth"
+                        elif browser_result.get("approval_required"):
+                            event_name = "browser.approval_required"
+                        else:
+                            event_name = "browser.action_completed"
                         browser_result["session_id"] = request.session_id
                         yield f"event: {event_name}\ndata: {json.dumps({'type': event_name, **browser_result})}\n\n"
                 if telemetry_event.get("type") in {"completion", "failure"}:
                     terminal_emitted = True
-                    final_text = telemetry_event.get("state", {}).get("final_result", "Browser operation completed.")
-                    if telemetry_event.get("type") == "completion":
-                        yield f"event: message.completed\ndata: {json.dumps({'type': 'message.completed', 'content': final_text})}\n\n"
-                    else:
-                        yield f"event: message.failed\ndata: {json.dumps({'type': 'message.failed', 'error': final_text})}\n\n"
                     break
 
             if not terminal_emitted:
                 yield f"event: completion\ndata: {json.dumps({'type': 'completion', 'state': {'final_result': 'Browser operation completed.'}})}\n\n"
-                yield f"event: message.completed\ndata: {json.dumps({'type': 'message.completed', 'content': 'Browser operation completed.'})}\n\n"
         except asyncio.CancelledError:
             logger.info("Browser operator client disconnected for %s", request.session_id)
             yield f"event: browser.session_paused\ndata: {json.dumps({'type': 'browser.session_paused', 'session_id': request.session_id})}\n\n"
             yield f"event: completion\ndata: {json.dumps({'type': 'completion', 'state': {'final_result': 'Browser session paused.'}})}\n\n"
-            yield f"event: message.completed\ndata: {json.dumps({'type': 'message.completed', 'content': 'Browser session paused.'})}\n\n"
         except Exception as error:
             logger.error("Browser operator stream failed: %s", error, exc_info=True)
             yield f"event: browser.failed\ndata: {json.dumps({'type': 'browser.failed', 'session_id': request.session_id, 'error': str(error)})}\n\n"
             yield f"event: failure\ndata: {json.dumps({'type': 'failure', 'state': {'final_result': f'Browser operation failed: {error}'}})}\n\n"
-            yield f"event: message.failed\ndata: {json.dumps({'type': 'message.failed', 'error': str(error)})}\n\n"
 
     return StreamingResponse(
         sse_generator(),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
     )
+
+
+@router.get("/browser/session/{session_id}")
+async def get_browser_session(session_id: str):
+    return await browser_operator_manager.get_session_info(session_id)
+
+
+@router.post("/browser/session/{session_id}/take-control")
+async def take_browser_control(session_id: str):
+    return await browser_operator_manager.take_control(session_id)
+
+
+@router.post("/browser/session/{session_id}/return-control")
+async def return_browser_control(session_id: str):
+    return await browser_operator_manager.return_control(session_id)
+
+
+@router.post("/browser/session/{session_id}/verify-auth")
+async def verify_browser_auth(session_id: str):
+    return await browser_operator_manager.verify_auth(session_id)
 
 @router.post("/agent/stream")
 async def stream_agent_execution(request: AgentExecutionRequest):
@@ -1526,6 +1539,7 @@ async def stream_agent_execution(request: AgentExecutionRequest):
                 },
             )
 
+            terminal_seen = False
             async for telemetry_event in agent_loop.execute_goal(
                 session_id=request.session_id, 
                 goal=request.goal
@@ -1534,14 +1548,18 @@ async def stream_agent_execution(request: AgentExecutionRequest):
                 yield f"data: {event_data}\n\n"
                 
                 if telemetry_event.get("type") in ["completion", "failure"]:
+                    terminal_seen = True
                     break
+
+            if not terminal_seen:
+                yield f"data: {json.dumps({'type': 'completion', 'state': {'final_result': 'Execution completed.'}})}\n\n"
                     
         except asyncio.CancelledError:
             logger.warning(f"Client disconnected during session {request.session_id}.")
-            yield f"data: {json.dumps({'type': 'error', 'message': 'Client disconnected prematurely. (Frontend Timeout)'})}\n\n"
+            yield f"data: {json.dumps({'type': 'failure', 'state': {'final_result': 'Client disconnected prematurely. (Frontend Timeout)'}})}\n\n"
         except Exception as e:
             logger.error(f"Agent execution stream failed: {str(e)}", exc_info=True)
-            yield f"data: {json.dumps({'type': 'error', 'message': f'Fatal Loop Error: {str(e)}'})}\n\n"
+            yield f"data: {json.dumps({'type': 'failure', 'state': {'final_result': f'Fatal Loop Error: {str(e)}'}})}\n\n"
 
     return StreamingResponse(
         sse_generator(),
