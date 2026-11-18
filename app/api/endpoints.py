@@ -1151,7 +1151,9 @@ async def stream_browser_operator(request: BrowserOperatorRequest):
                             pass
 
                     if browser_result:
-                        if browser_result.get("auth_required") or browser_result.get("status") == "WAITING_FOR_AUTH":
+                        if browser_result.get("status") == "FAILED" or browser_result.get("error"):
+                            event_name = "browser.failed"
+                        elif browser_result.get("auth_required") or browser_result.get("status") == "WAITING_FOR_AUTH":
                             event_name = "browser.waiting_for_auth"
                         elif browser_result.get("approval_required"):
                             event_name = "browser.approval_required"
