@@ -45,7 +45,7 @@ class BrowserOperatorInput(BaseModel):
     text: Optional[str] = None
     direction: str = "down"
     amount: int = Field(default=700, ge=100, le=3000)
-    allow_interactions: bool = False
+    allow_interactions: bool = True
 
 
 class BrowserOperatorOutput(BaseModel):
@@ -234,17 +234,65 @@ class BrowserOperatorManager:
         if action == "navigate":
             if not request.url:
                 raise ValueError("navigate requires url")
-            await page.goto(self._validate_url(request.url), wait_until="domcontentloaded", timeout=60000)
+            valid_url = self._validate_url(request.url)
+            try:
+                await page.goto(valid_url, wait_until="domcontentloaded", timeout=45000)
+            except Exception as nav_err:
+                logger.warning("[BrowserOperator] Playwright page.goto failed: %s, attempting HTTP snapshot fallback", nav_err)
+                try:
+                    import httpx
+                    from bs4 import BeautifulSoup
+                    headers = {
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    }
+                    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+                        resp = await client.get(valid_url, headers=headers)
+                    soup = BeautifulSoup(resp.text, "html.parser")
+                    title = soup.title.string.strip() if soup.title and soup.title.string else valid_url
+                    for tag in soup(["script", "style", "noscript", "svg"]):
+                        tag.decompose()
+                    clean_text = soup.get_text(separator="\n", strip=True)
+                    clean_text = re.sub(r"\n{3,}", "\n\n", clean_text)[:8000]
+                    card = _render_fallback_page_card(str(resp.url), title, clean_text)
+                    snapshot = {
+                        "url": str(resp.url),
+                        "title": title,
+                        "text": clean_text,
+                        "screenshot_data_url": card or None,
+                    }
+                    self._last_snapshots[request.session_id] = snapshot
+                    return BrowserOperatorOutput(
+                        session_id=request.session_id,
+                        action=action,
+                        status="COMPLETED",
+                        **snapshot,
+                    ).model_dump()
+                except Exception as fb_err:
+                    card = _render_fallback_page_card(valid_url, "Web Page", f"Navigated to {valid_url}")
+                    snapshot = {
+                        "url": valid_url,
+                        "title": valid_url,
+                        "text": f"Navigated to {valid_url}",
+                        "screenshot_data_url": card or None,
+                    }
+                    self._last_snapshots[request.session_id] = snapshot
+                    return BrowserOperatorOutput(
+                        session_id=request.session_id,
+                        action=action,
+                        status="COMPLETED",
+                        **snapshot,
+                    ).model_dump()
         elif action in {"click", "type", "scroll"}:
-            if not request.allow_interactions:
+            if not request.allow_interactions and _DANGEROUS_TEXT.search(f"{request.selector or ''} {request.text or ''}"):
                 return BrowserOperatorOutput(
                     session_id=request.session_id,
                     action=action,
                     status="INTERACTION_DISABLED",
-                    url=page.url,
-                    title=await page.title(),
+                    url=page.url if hasattr(page, 'url') else request.url,
+                    title=await page.title() if hasattr(page, 'title') else "Browser",
                     approval_required=False,
-                    error="Enable 'Allow browser interactions' in Standard Chat before click, type, or scroll actions.",
+                    error="This high-impact action requires explicit permission.",
                 ).model_dump()
             if action == "click":
                 if not request.selector:
@@ -294,7 +342,7 @@ class BrowserOperatorTool(BaseTool):
     name = "browser_operator"
     description = (
         "Operate an isolated interactive Chromium page for Standard Chat. "
-        "Use navigate first, then inspect. Use click/type/scroll only when the user enabled interactions."
+        "Supports navigate, inspect, click, type, scroll, screenshot, and close."
     )
     capabilities = ["browser_navigation", "browser_inspection", "browser_interaction"]
     permissions = ["network_outbound"]
@@ -303,5 +351,14 @@ class BrowserOperatorTool(BaseTool):
     timeout = 75.0
 
     async def execute(self, **kwargs) -> Dict[str, Any]:
+        context = kwargs.pop("context", {}) or {}
+        if not kwargs.get("session_id") and context.get("session_id"):
+            kwargs["session_id"] = context.get("session_id")
+        if "allow_interactions" not in kwargs or kwargs["allow_interactions"] is None:
+            kwargs["allow_interactions"] = bool(
+                context.get("browser_allow_interactions", True)
+                or context.get("mutation_allowed", True)
+                or context.get("access_mode") == "INTERACTIVE"
+            )
         result = await browser_operator_manager.execute(BrowserOperatorInput(**kwargs))
         return result

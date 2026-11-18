@@ -735,7 +735,7 @@ class BrowserOperatorRequest(BaseModel):
     goal: str = Field(..., description="The browser task for the interactive operator.")
     session_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     start_url: Optional[str] = None
-    allow_interactions: bool = False
+    allow_interactions: bool = True
 
 # --- Endpoints ---
 @router.get("/health")
@@ -1160,18 +1160,26 @@ async def stream_browser_operator(request: BrowserOperatorRequest):
                         yield f"event: {event_name}\ndata: {json.dumps({'type': event_name, **browser_result})}\n\n"
                 if telemetry_event.get("type") in {"completion", "failure"}:
                     terminal_emitted = True
+                    final_text = telemetry_event.get("state", {}).get("final_result", "Browser operation completed.")
+                    if telemetry_event.get("type") == "completion":
+                        yield f"event: message.completed\ndata: {json.dumps({'type': 'message.completed', 'content': final_text})}\n\n"
+                    else:
+                        yield f"event: message.failed\ndata: {json.dumps({'type': 'message.failed', 'error': final_text})}\n\n"
                     break
 
             if not terminal_emitted:
                 yield f"event: completion\ndata: {json.dumps({'type': 'completion', 'state': {'final_result': 'Browser operation completed.'}})}\n\n"
+                yield f"event: message.completed\ndata: {json.dumps({'type': 'message.completed', 'content': 'Browser operation completed.'})}\n\n"
         except asyncio.CancelledError:
             logger.info("Browser operator client disconnected for %s", request.session_id)
             yield f"event: browser.session_paused\ndata: {json.dumps({'type': 'browser.session_paused', 'session_id': request.session_id})}\n\n"
             yield f"event: completion\ndata: {json.dumps({'type': 'completion', 'state': {'final_result': 'Browser session paused.'}})}\n\n"
+            yield f"event: message.completed\ndata: {json.dumps({'type': 'message.completed', 'content': 'Browser session paused.'})}\n\n"
         except Exception as error:
             logger.error("Browser operator stream failed: %s", error, exc_info=True)
             yield f"event: browser.failed\ndata: {json.dumps({'type': 'browser.failed', 'session_id': request.session_id, 'error': str(error)})}\n\n"
             yield f"event: failure\ndata: {json.dumps({'type': 'failure', 'state': {'final_result': f'Browser operation failed: {error}'}})}\n\n"
+            yield f"event: message.failed\ndata: {json.dumps({'type': 'message.failed', 'error': str(error)})}\n\n"
 
     return StreamingResponse(
         sse_generator(),
