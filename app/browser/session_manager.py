@@ -45,6 +45,7 @@ VALID_TRANSITIONS: Dict[SessionState, set] = {
         SessionState.RECOVERING,
         SessionState.CLOSING,
         SessionState.FAILED,
+        SessionState.CLOSED,
     },
     SessionState.IDLE: {
         SessionState.ACTIVE,
@@ -52,14 +53,18 @@ VALID_TRANSITIONS: Dict[SessionState, set] = {
         SessionState.RECOVERING,
         SessionState.CLOSING,
         SessionState.FAILED,
+        SessionState.CLOSED,
     },
     SessionState.WAITING_FOR_USER: {
         SessionState.ACTIVE,
+        SessionState.IDLE,
         SessionState.CLOSING,
         SessionState.FAILED,
+        SessionState.CLOSED,
     },
     SessionState.RECOVERING: {
         SessionState.ACTIVE,
+        SessionState.IDLE,
         SessionState.FAILED,
         SessionState.CLOSED,
     },
@@ -143,6 +148,8 @@ class BrowserSession:
         """Check if session exceeded idle timeout while not actively executing."""
         if self.state in {SessionState.CLOSED, SessionState.FAILED}:
             return True
+        if self._lock is not None and self._lock.locked():
+            return False
         now = time.time()
         return (now - self.last_active_at) > self.idle_timeout_seconds
 
@@ -448,13 +455,16 @@ class BrowserSessionManager:
         return True
 
     async def cleanup_expired_sessions(self) -> int:
-        """Sweep and terminate any idle or expired sessions."""
+        """Sweep and terminate any idle or expired sessions, skipping active locked sessions."""
         cleaned_count = 0
         now = time.time()
         to_remove = []
 
         async with self._get_lock():
             for sid, session in list(self._sessions.items()):
+                # HIGH (LIFE-01): Skip sessions with active in-flight operations (lock held)
+                if session.get_lock().locked():
+                    continue
                 if session.state in {SessionState.CLOSED, SessionState.FAILED}:
                     to_remove.append((sid, "Already closed/failed"))
                 elif (now - session.created_at) > session.max_lifetime_seconds:
@@ -470,6 +480,37 @@ class BrowserSessionManager:
             logger.info("[SessionManager] Cleaned up %d expired browser sessions.", cleaned_count)
         return cleaned_count
 
+    def start_cleanup_loop(self, interval_seconds: float = 60.0) -> None:
+        """Start recurring background cleanup task if not already running."""
+        if self._cleanup_task is None or self._cleanup_task.done():
+            self._cleanup_task = asyncio.create_task(self._run_cleanup_loop(interval_seconds))
+            logger.info(
+                "[SessionManager] Started background session cleanup loop (interval=%.1fs)",
+                interval_seconds,
+            )
+
+    async def stop_cleanup_loop(self) -> None:
+        """Gracefully stop recurring background cleanup task."""
+        if self._cleanup_task and not self._cleanup_task.done():
+            self._cleanup_task.cancel()
+            try:
+                await self._cleanup_task
+            except asyncio.CancelledError:
+                pass
+            self._cleanup_task = None
+            logger.info("[SessionManager] Stopped background session cleanup loop")
+
+    async def _run_cleanup_loop(self, interval_seconds: float) -> None:
+        """Background loop executing cleanup_expired_sessions periodically."""
+        while True:
+            try:
+                await asyncio.sleep(interval_seconds)
+                await self.cleanup_expired_sessions()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error("[SessionManager] Background cleanup loop error: %s", e)
+
     async def list_sessions(self) -> List[Dict[str, Any]]:
         """List summary info for all tracked sessions."""
         async with self._get_lock():
@@ -477,6 +518,7 @@ class BrowserSessionManager:
 
     async def shutdown(self) -> None:
         """Shutdown all active sessions and release browser processes."""
+        await self.stop_cleanup_loop()
         async with self._get_lock():
             sessions = list(self._sessions.values())
             self._sessions.clear()

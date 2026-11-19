@@ -51,6 +51,7 @@ from app.api.routers.documents import router as documents_router
 from app.api.routers.images import router as images_router
 from app.api.routers.system import system_router
 from app.database import Base, engine
+from app.browser.session_manager import browser_session_manager
 
 # --- SPRINT 25.5: AUTONOMOUS MISSION WORKER IMPORT ---
 from app.engine.autonomous_worker import autonomous_worker
@@ -148,12 +149,16 @@ async def lifespan(app: FastAPI):
     # Start memory hygiene monitor to keep Render memory within 512MB ceiling
     hygiene_task = asyncio.create_task(_memory_hygiene_loop())
 
+    # Start browser session cleaner background loop (Milestone 2.1)
+    browser_session_manager.start_cleanup_loop(interval_seconds=60.0)
+
     yield  # Application processes requests here
 
     # Shutdown Phase: Stop worker loop and clean up DB connections.
     logger.info("[Main] Shutting down Autonomous Mission Worker...")
     hygiene_task.cancel()
     await autonomous_worker.stop_worker_loop()
+    await browser_session_manager.shutdown()
     await ProcessManager.shutdown_active()
     await director_speech_service.shutdown()
     await engine.dispose()

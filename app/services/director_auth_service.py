@@ -393,12 +393,23 @@ async def require_director_access(
         # browser identity module itself is being initialized.
         from app.services.authorization import verify_owner_key_token
 
-        owner_id = verify_owner_key_token(credentials.credentials)
-        return DirectorPrincipal(
-            owner_id=owner_id,
-            owner_uid=owner_id,
-            auth_method="owner_key",
-        )
+        try:
+            owner_id = verify_owner_key_token(credentials.credentials)
+            return DirectorPrincipal(
+                owner_id=owner_id,
+                owner_uid=owner_id,
+                auth_method="owner_key",
+            )
+        except HTTPException:
+            try:
+                identity = await verify_firebase_identity(credentials.credentials, error_prefix="DIRECTOR")
+                return DirectorPrincipal(
+                    owner_id=f"firebase:{identity.uid}",
+                    owner_uid=identity.uid,
+                    auth_method="firebase_bearer",
+                )
+            except Exception:
+                raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="DIRECTOR_AUTH_REQUIRED")
     raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="DIRECTOR_AUTH_REQUIRED")
 
 

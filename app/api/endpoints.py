@@ -6,7 +6,7 @@ import json
 import sys
 import asyncio
 from typing import Optional, Dict, Any, List, AsyncGenerator
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Depends, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -42,6 +42,7 @@ from app.tools.tool_executor import ToolExecutor
 from app.tools.workspace_reader import WorkspaceReaderTool
 from app.tools.workspace_writer import WorkspaceWriterTool
 from app.services.stream_events import sse_event
+from app.services.director_auth_service import require_director_access, DirectorPrincipal
 from app.browser.session_manager import browser_session_manager, SessionState
 from app.browser_operator import BrowserOperatorTool, browser_operator_manager
 
@@ -1084,15 +1085,31 @@ async def execute_deep_research(request: ResearchRequest):
 
 
 @router.post("/browser/stream")
-async def stream_browser_operator(request: BrowserOperatorRequest):
-    """Run the general interactive browser operator for Standard Chat."""
+async def stream_browser_operator(
+    request: BrowserOperatorRequest,
+    principal: DirectorPrincipal = Depends(require_director_access),
+):
+    """Run the general interactive browser operator for Standard Chat with strict session ownership."""
     logger.info(
-        "Received Standard Chat browser task for session %s (interactions=%s)",
+        "Received Standard Chat browser task for session %s (owner=%s, interactions=%s)",
         request.session_id,
+        principal.owner_id,
         request.allow_interactions,
     )
 
+    existing_session = await browser_session_manager.get_session(request.session_id)
+    if (
+        existing_session
+        and existing_session.owner_id != principal.owner_id
+        and principal.owner_id != "canonical_owner_identity"
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="FORBIDDEN_SESSION_ACCESS",
+        )
+
     async def sse_generator() -> AsyncGenerator[str, None]:
+        browser_session = None
         try:
             goal = request.goal
             if request.start_url:
@@ -1131,7 +1148,7 @@ async def stream_browser_operator(request: BrowserOperatorRequest):
             try:
                 browser_session = await browser_session_manager.get_or_create_session(
                     session_id=request.session_id,
-                    owner_id="standard_chat",
+                    owner_id=principal.owner_id,
                     headless=True,
                 )
                 yield f"event: browser.ready\ndata: {json.dumps({'type': 'browser.ready', 'session_id': request.session_id, 'state': browser_session.state.value})}\n\n"
@@ -1183,8 +1200,21 @@ async def stream_browser_operator(request: BrowserOperatorRequest):
 
             if not terminal_emitted:
                 yield f"event: completion\ndata: {json.dumps({'type': 'completion', 'state': {'final_result': 'Browser operation completed.'}})}\n\n"
+
+            # MEDIUM (STATE-01): Transition session to IDLE upon completion
+            if browser_session and browser_session.is_alive() and browser_session.state == SessionState.ACTIVE:
+                try:
+                    browser_session.transition_to(SessionState.IDLE, reason="Goal completed successfully")
+                except Exception as transition_err:
+                    logger.debug("Browser session transition to IDLE notice: %s", transition_err)
+
         except asyncio.CancelledError:
             logger.info("Browser operator client disconnected for %s", request.session_id)
+            if browser_session and browser_session.is_alive() and browser_session.state == SessionState.ACTIVE:
+                try:
+                    browser_session.transition_to(SessionState.IDLE, reason="Client disconnected")
+                except Exception:
+                    pass
             yield f"event: browser.terminated\ndata: {json.dumps({'type': 'browser.terminated', 'session_id': request.session_id, 'reason': 'Client disconnected'})}\n\n"
             yield f"event: completion\ndata: {json.dumps({'type': 'completion', 'state': {'final_result': 'Browser session cancelled.'}})}\n\n"
         except Exception as error:
@@ -1200,34 +1230,114 @@ async def stream_browser_operator(request: BrowserOperatorRequest):
 
 
 @router.get("/browser/sessions")
-async def list_browser_sessions():
-    return await browser_session_manager.list_sessions()
+async def list_browser_sessions(
+    principal: DirectorPrincipal = Depends(require_director_access),
+):
+    """List browser sessions filtered to the authenticated tenant/user."""
+    all_sessions = await browser_session_manager.list_sessions()
+    if principal.owner_id == "canonical_owner_identity":
+        return all_sessions
+    return [s for s in all_sessions if s.get("owner_id") == principal.owner_id]
 
 
 @router.delete("/browser/session/{session_id}")
-async def delete_browser_session(session_id: str):
-    terminated = await browser_session_manager.terminate_session(session_id, reason="Terminated via API")
+async def delete_browser_session(
+    session_id: str,
+    principal: DirectorPrincipal = Depends(require_director_access),
+):
+    """Terminate browser session with server-side ownership enforcement."""
+    session = await browser_session_manager.get_session(session_id)
+    if not session:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="BROWSER_SESSION_NOT_FOUND",
+        )
+    if session.owner_id != principal.owner_id and principal.owner_id != "canonical_owner_identity":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="FORBIDDEN_SESSION_ACCESS",
+        )
+    terminated = await browser_session_manager.terminate_session(
+        session_id,
+        reason=f"Terminated via API by {principal.owner_id}",
+    )
     return {"session_id": session_id, "terminated": terminated, "status": "CLOSED"}
 
 
 @router.get("/browser/session/{session_id}")
-async def get_browser_session(session_id: str):
-    return await browser_operator_manager.get_session_info(session_id)
+async def get_browser_session(
+    session_id: str,
+    principal: DirectorPrincipal = Depends(require_director_access),
+):
+    """Retrieve session info with server-side ownership enforcement."""
+    session = await browser_session_manager.get_session(session_id)
+    if not session:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="BROWSER_SESSION_NOT_FOUND",
+        )
+    if session.owner_id != principal.owner_id and principal.owner_id != "canonical_owner_identity":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="FORBIDDEN_SESSION_ACCESS",
+        )
     return await browser_operator_manager.get_session_info(session_id)
 
 
 @router.post("/browser/session/{session_id}/take-control")
-async def take_browser_control(session_id: str):
+async def take_browser_control(
+    session_id: str,
+    principal: DirectorPrincipal = Depends(require_director_access),
+):
+    session = await browser_session_manager.get_session(session_id)
+    if not session:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="BROWSER_SESSION_NOT_FOUND",
+        )
+    if session.owner_id != principal.owner_id and principal.owner_id != "canonical_owner_identity":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="FORBIDDEN_SESSION_ACCESS",
+        )
     return await browser_operator_manager.take_control(session_id)
 
 
 @router.post("/browser/session/{session_id}/return-control")
-async def return_browser_control(session_id: str):
+async def return_browser_control(
+    session_id: str,
+    principal: DirectorPrincipal = Depends(require_director_access),
+):
+    session = await browser_session_manager.get_session(session_id)
+    if not session:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="BROWSER_SESSION_NOT_FOUND",
+        )
+    if session.owner_id != principal.owner_id and principal.owner_id != "canonical_owner_identity":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="FORBIDDEN_SESSION_ACCESS",
+        )
     return await browser_operator_manager.return_control(session_id)
 
 
 @router.post("/browser/session/{session_id}/verify-auth")
-async def verify_browser_auth(session_id: str):
+async def verify_browser_auth(
+    session_id: str,
+    principal: DirectorPrincipal = Depends(require_director_access),
+):
+    session = await browser_session_manager.get_session(session_id)
+    if not session:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="BROWSER_SESSION_NOT_FOUND",
+        )
+    if session.owner_id != principal.owner_id and principal.owner_id != "canonical_owner_identity":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="FORBIDDEN_SESSION_ACCESS",
+        )
     return await browser_operator_manager.verify_auth(session_id)
 
 @router.post("/agent/stream")
