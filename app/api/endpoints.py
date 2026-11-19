@@ -42,6 +42,7 @@ from app.tools.tool_executor import ToolExecutor
 from app.tools.workspace_reader import WorkspaceReaderTool
 from app.tools.workspace_writer import WorkspaceWriterTool
 from app.services.stream_events import sse_event
+from app.browser.session_manager import browser_session_manager, SessionState
 from app.browser_operator import BrowserOperatorTool, browser_operator_manager
 
 # --- SPRINT 2 IMPORTS (Lead Intelligence) ---
@@ -1127,6 +1128,16 @@ async def stream_browser_operator(request: BrowserOperatorRequest):
             )
 
             yield f"event: browser.session_created\ndata: {json.dumps({'type': 'browser.session_created', 'session_id': request.session_id, 'allow_interactions': request.allow_interactions})}\n\n"
+            try:
+                browser_session = await browser_session_manager.get_or_create_session(
+                    session_id=request.session_id,
+                    owner_id="standard_chat",
+                    headless=True,
+                )
+                yield f"event: browser.ready\ndata: {json.dumps({'type': 'browser.ready', 'session_id': request.session_id, 'state': browser_session.state.value})}\n\n"
+            except Exception as init_err:
+                logger.warning("Browser pre-initialization notice: %s", init_err)
+
             terminal_emitted = False
             async for telemetry_event in agent_loop.execute_goal(
                 session_id=request.session_id,
@@ -1137,6 +1148,11 @@ async def stream_browser_operator(request: BrowserOperatorRequest):
                 trace = telemetry_event.get("trace") or {}
                 action = trace.get("action") or {}
                 tool_metadata = trace.get("tool_metadata")
+
+                if action.get("tool_name") == "browser_operator" and telemetry_event.get("phase") == "act":
+                    act_name = action.get("tool_args", {}).get("action", "execute")
+                    yield f"event: browser.action_started\ndata: {json.dumps({'type': 'browser.action_started', 'session_id': request.session_id, 'action': act_name})}\n\n"
+
                 if action.get("tool_name") == "browser_operator" or (isinstance(tool_metadata, dict) and tool_metadata.get("screenshot_data_url")):
                     browser_result = None
                     if isinstance(tool_metadata, dict) and (tool_metadata.get("screenshot_data_url") or tool_metadata.get("url") or tool_metadata.get("status")):
@@ -1153,8 +1169,8 @@ async def stream_browser_operator(request: BrowserOperatorRequest):
                     if browser_result:
                         if browser_result.get("status") == "FAILED" or browser_result.get("error"):
                             event_name = "browser.failed"
-                        elif browser_result.get("auth_required") or browser_result.get("status") == "WAITING_FOR_AUTH":
-                            event_name = "browser.waiting_for_auth"
+                        elif browser_result.get("auth_required") or browser_result.get("status") in {"WAITING_FOR_AUTH", "WAITING_FOR_USER"}:
+                            event_name = "browser.waiting_for_user"
                         elif browser_result.get("approval_required"):
                             event_name = "browser.approval_required"
                         else:
@@ -1169,8 +1185,8 @@ async def stream_browser_operator(request: BrowserOperatorRequest):
                 yield f"event: completion\ndata: {json.dumps({'type': 'completion', 'state': {'final_result': 'Browser operation completed.'}})}\n\n"
         except asyncio.CancelledError:
             logger.info("Browser operator client disconnected for %s", request.session_id)
-            yield f"event: browser.session_paused\ndata: {json.dumps({'type': 'browser.session_paused', 'session_id': request.session_id})}\n\n"
-            yield f"event: completion\ndata: {json.dumps({'type': 'completion', 'state': {'final_result': 'Browser session paused.'}})}\n\n"
+            yield f"event: browser.terminated\ndata: {json.dumps({'type': 'browser.terminated', 'session_id': request.session_id, 'reason': 'Client disconnected'})}\n\n"
+            yield f"event: completion\ndata: {json.dumps({'type': 'completion', 'state': {'final_result': 'Browser session cancelled.'}})}\n\n"
         except Exception as error:
             logger.error("Browser operator stream failed: %s", error, exc_info=True)
             yield f"event: browser.failed\ndata: {json.dumps({'type': 'browser.failed', 'session_id': request.session_id, 'error': str(error)})}\n\n"
@@ -1183,8 +1199,20 @@ async def stream_browser_operator(request: BrowserOperatorRequest):
     )
 
 
+@router.get("/browser/sessions")
+async def list_browser_sessions():
+    return await browser_session_manager.list_sessions()
+
+
+@router.delete("/browser/session/{session_id}")
+async def delete_browser_session(session_id: str):
+    terminated = await browser_session_manager.terminate_session(session_id, reason="Terminated via API")
+    return {"session_id": session_id, "terminated": terminated, "status": "CLOSED"}
+
+
 @router.get("/browser/session/{session_id}")
 async def get_browser_session(session_id: str):
+    return await browser_operator_manager.get_session_info(session_id)
     return await browser_operator_manager.get_session_info(session_id)
 
 

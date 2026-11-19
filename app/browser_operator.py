@@ -18,6 +18,12 @@ from urllib.parse import urlparse
 from pydantic import BaseModel, Field
 
 from app.browser.browser_pool import browser_pool
+from app.browser.session_manager import (
+    BrowserSession,
+    BrowserSessionManager,
+    SessionState,
+    browser_session_manager,
+)
 from app.tools.base_tool import BaseTool
 
 logger = logging.getLogger(__name__)
@@ -103,8 +109,7 @@ class BrowserOperatorManager:
     """Coordinates one isolated page per Standard Chat browser session."""
 
     def __init__(self) -> None:
-        self._sessions: Dict[str, Any] = {}
-        self._last_snapshots: Dict[str, Dict[str, Any]] = {}
+        self.session_manager: BrowserSessionManager = browser_session_manager
 
     @staticmethod
     def _validate_url(url: str) -> str:
@@ -117,16 +122,12 @@ class BrowserOperatorManager:
         return url.strip()
 
     async def _page(self, session_id: str):
-        page = self._sessions.get(session_id)
-        if page is None or page.is_closed():
-            page = await browser_pool.get_or_create_page(
-                department="standard_chat",
-                agent_id=session_id,
-                profile_name=None,
-                headless=True,
-            )
-            self._sessions[session_id] = page
-        return page
+        session = await self.session_manager.get_or_create_session(
+            session_id=session_id,
+            owner_id="standard_chat",
+            headless=True,
+        )
+        return session.page
 
     async def _snapshot(self, page) -> Dict[str, Any]:
         title = await page.title()
@@ -142,32 +143,53 @@ class BrowserOperatorManager:
         }
 
     async def get_session_info(self, session_id: str) -> Dict[str, Any]:
-        snapshot = self._last_snapshots.get(session_id) or {}
-        page = self._sessions.get(session_id)
-        current_url = page.url if page and not page.is_closed() else snapshot.get("url", "about:blank")
-        current_title = await page.title() if page and not page.is_closed() else snapshot.get("title", "Browser Session")
+        session = await self.session_manager.get_session(session_id)
+        if not session:
+            return {
+                "session_id": session_id,
+                "url": "about:blank",
+                "title": "",
+                "status": "CLOSED",
+                "auth_required": False,
+                "screenshot_data_url": None,
+            }
+        snapshot = session.last_snapshot or {}
+        current_url = session.page.url if session.page and not session.page.is_closed() else snapshot.get("url", "about:blank")
+        current_title = await session.page.title() if session.page and not session.page.is_closed() else snapshot.get("title", "Browser Session")
         auth_req = _is_auth_required(current_url, current_title, snapshot.get("text", ""))
+
+        status_val = "WAITING_FOR_AUTH" if auth_req else session.state.value
         return {
             "session_id": session_id,
             "url": current_url,
             "title": current_title,
-            "status": "WAITING_FOR_AUTH" if auth_req else "ACTIVE",
+            "status": status_val,
             "auth_required": auth_req,
             "screenshot_data_url": snapshot.get("screenshot_data_url"),
         }
 
     async def take_control(self, session_id: str) -> Dict[str, Any]:
+        session = await self.session_manager.get_session(session_id)
+        if session:
+            try:
+                session.transition_to(SessionState.WAITING_FOR_USER, reason="User control requested")
+            except Exception:
+                pass
         info = await self.get_session_info(session_id)
         info["status"] = "USER_IN_CONTROL"
         return info
 
     async def return_control(self, session_id: str) -> Dict[str, Any]:
-        page = self._sessions.get(session_id)
-        if page and not page.is_closed():
-            snapshot = await self._snapshot(page)
-            self._last_snapshots[session_id] = snapshot
+        session = await self.session_manager.get_session(session_id)
+        if session and session.is_alive():
+            try:
+                session.transition_to(SessionState.ACTIVE, reason="Control returned to AI")
+            except Exception:
+                pass
+            snapshot = await self._snapshot(session.page)
+            session.last_snapshot = snapshot
         else:
-            snapshot = self._last_snapshots.get(session_id) or {}
+            snapshot = session.last_snapshot if session else {}
 
         current_url = snapshot.get("url", "about:blank")
         current_title = snapshot.get("title", "")
@@ -191,18 +213,16 @@ class BrowserOperatorManager:
             raise ValueError(f"Unsupported browser action: {action}")
 
         if action == "close":
-            await browser_pool.close_session(f"standard_chat_{request.session_id}_ephemeral")
-            self._sessions.pop(request.session_id, None)
-            self._last_snapshots.pop(request.session_id, None)
+            await self.session_manager.terminate_session(request.session_id, reason="Explicit close action")
             return BrowserOperatorOutput(
                 session_id=request.session_id, action=action, status="CLOSED"
             ).model_dump()
 
         try:
             page = await self._page(request.session_id)
+            session = await self.session_manager.get_session(request.session_id)
         except Exception as browser_err:
             logger.error("[BrowserOperator] Playwright page launch failed: %s", browser_err)
-            self._sessions.pop(request.session_id, None)
             return BrowserOperatorOutput(
                 session_id=request.session_id,
                 action=action,
@@ -211,40 +231,141 @@ class BrowserOperatorManager:
                 error=f"Browser driver error: {browser_err}",
             ).model_dump()
 
-        if action == "navigate":
-            if not request.url:
-                return BrowserOperatorOutput(
-                    session_id=request.session_id,
-                    action=action,
-                    status="FAILED",
-                    error="navigate requires url",
-                ).model_dump()
-            try:
-                valid_url = self._validate_url(request.url)
-            except Exception as val_err:
-                return BrowserOperatorOutput(
-                    session_id=request.session_id,
-                    action=action,
-                    status="FAILED",
-                    url=request.url,
-                    error=f"URL validation error: {val_err}",
-                ).model_dump()
-            try:
-                await page.goto(valid_url, wait_until="domcontentloaded", timeout=45000)
-            except Exception as nav_err:
-                logger.error("[BrowserOperator] Playwright page.goto failed: %s", nav_err)
-                return BrowserOperatorOutput(
-                    session_id=request.session_id,
-                    action=action,
-                    status="FAILED",
-                    url=valid_url,
-                    error=f"Browser navigation error: {nav_err}",
-                ).model_dump()
-        elif action == "screenshot":
+        async with session.get_lock():
+            # Validate session is alive, if not attempt recovery
+            if not session.is_alive():
+                try:
+                    session = await self.session_manager.recover_session(request.session_id, headless=True)
+                except Exception as rec_err:
+                    return BrowserOperatorOutput(
+                        session_id=request.session_id,
+                        action=action,
+                        status="FAILED",
+                        url=request.url,
+                        error=f"Browser session recovery failed: {rec_err}",
+                    ).model_dump()
+
+            session.touch()
+            page = session.page
+
+            if action == "navigate":
+                if not request.url:
+                    return BrowserOperatorOutput(
+                        session_id=request.session_id,
+                        action=action,
+                        status="FAILED",
+                        error="navigate requires url",
+                    ).model_dump()
+                try:
+                    valid_url = self._validate_url(request.url)
+                except Exception as val_err:
+                    return BrowserOperatorOutput(
+                        session_id=request.session_id,
+                        action=action,
+                        status="FAILED",
+                        url=request.url,
+                        error=f"URL validation error: {val_err}",
+                    ).model_dump()
+                try:
+                    await page.goto(valid_url, wait_until="domcontentloaded", timeout=45000)
+                except Exception as nav_err:
+                    logger.error("[BrowserOperator] Playwright page.goto failed: %s", nav_err)
+                    return BrowserOperatorOutput(
+                        session_id=request.session_id,
+                        action=action,
+                        status="FAILED",
+                        url=valid_url,
+                        error=f"Browser navigation error: {nav_err}",
+                    ).model_dump()
+            elif action == "screenshot":
+                try:
+                    snapshot = await self._snapshot(page)
+                    session.last_snapshot = snapshot
+                    auth_req = _is_auth_required(snapshot["url"], snapshot["title"], snapshot["text"])
+                    if auth_req:
+                        try:
+                            session.transition_to(SessionState.WAITING_FOR_USER, reason="Auth required")
+                        except Exception:
+                            pass
+                    step_status = "WAITING_FOR_AUTH" if auth_req else "COMPLETED"
+                    return BrowserOperatorOutput(
+                        session_id=request.session_id,
+                        action=action,
+                        status=step_status,
+                        auth_required=auth_req,
+                        **snapshot,
+                    ).model_dump()
+                except Exception as ss_err:
+                    logger.error("[BrowserOperator] Playwright screenshot failed: %s", ss_err)
+                    return BrowserOperatorOutput(
+                        session_id=request.session_id,
+                        action=action,
+                        status="FAILED",
+                        url=page.url if hasattr(page, "url") else request.url,
+                        error=f"Browser screenshot failed: {ss_err}",
+                    ).model_dump()
+            elif action in {"click", "type", "scroll"}:
+                if not request.allow_interactions and _DANGEROUS_TEXT.search(f"{request.selector or ''} {request.text or ''}"):
+                    return BrowserOperatorOutput(
+                        session_id=request.session_id,
+                        action=action,
+                        status="INTERACTION_DISABLED",
+                        url=page.url if hasattr(page, 'url') else request.url,
+                        title=await page.title() if hasattr(page, 'title') else "Browser",
+                        approval_required=False,
+                        error="This high-impact action requires explicit permission.",
+                    ).model_dump()
+                try:
+                    if action == "click":
+                        if not request.selector:
+                            raise ValueError("click requires selector")
+                        if _DANGEROUS_TEXT.search(request.selector):
+                            return BrowserOperatorOutput(
+                                session_id=request.session_id,
+                                action=action,
+                                status="APPROVAL_REQUIRED",
+                                url=page.url,
+                                title=await page.title(),
+                                approval_required=True,
+                                error="This click may cause an external side effect and requires explicit confirmation.",
+                            ).model_dump()
+                        await page.locator(request.selector).first.click(timeout=30000)
+                    elif action == "type":
+                        if not request.selector or request.text is None:
+                            raise ValueError("type requires selector and text")
+                        if _DANGEROUS_TEXT.search(request.text):
+                            return BrowserOperatorOutput(
+                                session_id=request.session_id,
+                                action=action,
+                                status="APPROVAL_REQUIRED",
+                                url=page.url,
+                                title=await page.title(),
+                                approval_required=True,
+                                error="This text may trigger an external side effect and requires explicit confirmation.",
+                            ).model_dump()
+                        await page.locator(request.selector).first.fill(request.text)
+                    else:
+                        delta = request.amount if request.direction.lower() != "up" else -request.amount
+                        await page.mouse.wheel(0, delta)
+                except Exception as act_err:
+                    logger.error("[BrowserOperator] Browser %s failed: %s", action, act_err)
+                    return BrowserOperatorOutput(
+                        session_id=request.session_id,
+                        action=action,
+                        status="FAILED",
+                        url=page.url if hasattr(page, "url") else request.url,
+                        error=f"Browser action '{action}' failed: {act_err}",
+                    ).model_dump()
+
             try:
                 snapshot = await self._snapshot(page)
-                self._last_snapshots[request.session_id] = snapshot
+                session.last_snapshot = snapshot
                 auth_req = _is_auth_required(snapshot["url"], snapshot["title"], snapshot["text"])
+                if auth_req:
+                    try:
+                        session.transition_to(SessionState.WAITING_FOR_USER, reason="Auth required")
+                    except Exception:
+                        pass
                 step_status = "WAITING_FOR_AUTH" if auth_req else "COMPLETED"
                 return BrowserOperatorOutput(
                     session_id=request.session_id,
@@ -253,78 +374,15 @@ class BrowserOperatorManager:
                     auth_required=auth_req,
                     **snapshot,
                 ).model_dump()
-            except Exception as ss_err:
-                logger.error("[BrowserOperator] Playwright screenshot failed: %s", ss_err)
+            except Exception as snap_err:
+                logger.error("[BrowserOperator] Post-action snapshot failed: %s", snap_err)
                 return BrowserOperatorOutput(
                     session_id=request.session_id,
                     action=action,
                     status="FAILED",
                     url=page.url if hasattr(page, "url") else request.url,
-                    error=f"Browser screenshot failed: {ss_err}",
+                    error=f"Snapshot error: {snap_err}",
                 ).model_dump()
-        elif action in {"click", "type", "scroll"}:
-            if not request.allow_interactions and _DANGEROUS_TEXT.search(f"{request.selector or ''} {request.text or ''}"):
-                return BrowserOperatorOutput(
-                    session_id=request.session_id,
-                    action=action,
-                    status="INTERACTION_DISABLED",
-                    url=page.url if hasattr(page, 'url') else request.url,
-                    title=await page.title() if hasattr(page, 'title') else "Browser",
-                    approval_required=False,
-                    error="This high-impact action requires explicit permission.",
-                ).model_dump()
-            try:
-                if action == "click":
-                    if not request.selector:
-                        raise ValueError("click requires selector")
-                    if _DANGEROUS_TEXT.search(request.selector):
-                        return BrowserOperatorOutput(
-                            session_id=request.session_id,
-                            action=action,
-                            status="APPROVAL_REQUIRED",
-                            url=page.url,
-                            title=await page.title(),
-                            approval_required=True,
-                            error="This click may cause an external side effect and requires explicit confirmation.",
-                        ).model_dump()
-                    await page.locator(request.selector).first.click(timeout=30000)
-                elif action == "type":
-                    if not request.selector or request.text is None:
-                        raise ValueError("type requires selector and text")
-                    if _DANGEROUS_TEXT.search(request.text):
-                        return BrowserOperatorOutput(
-                            session_id=request.session_id,
-                            action=action,
-                            status="APPROVAL_REQUIRED",
-                            url=page.url,
-                            title=await page.title(),
-                            approval_required=True,
-                            error="This text may trigger an external side effect and requires explicit confirmation.",
-                        ).model_dump()
-                    await page.locator(request.selector).first.fill(request.text)
-                else:
-                    delta = request.amount if request.direction.lower() != "up" else -request.amount
-                    await page.mouse.wheel(0, delta)
-            except Exception as act_err:
-                logger.error("[BrowserOperator] Browser %s failed: %s", action, act_err)
-                return BrowserOperatorOutput(
-                    session_id=request.session_id,
-                    action=action,
-                    status="FAILED",
-                    url=page.url if hasattr(page, "url") else request.url,
-                    error=f"Browser action '{action}' failed: {act_err}",
-                ).model_dump()
-        snapshot = await self._snapshot(page)
-        self._last_snapshots[request.session_id] = snapshot
-        auth_req = _is_auth_required(snapshot["url"], snapshot["title"], snapshot["text"])
-        step_status = "WAITING_FOR_AUTH" if auth_req else "COMPLETED"
-        return BrowserOperatorOutput(
-            session_id=request.session_id,
-            action=action,
-            status=step_status,
-            auth_required=auth_req,
-            **snapshot,
-        ).model_dump()
 
 
 browser_operator_manager = BrowserOperatorManager()

@@ -74,79 +74,83 @@ class BrowserPool:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             loop = None
-        if self._lock is None or (loop and getattr(self._lock, "_loop", None) != loop):
+        if self._lock is None or self._loop != loop:
             self._lock = asyncio.Lock()
+            self._loop = loop
         return self._lock
 
-    async def initialize(self, headless: bool = True, force: bool = False):
+    async def _initialize_locked(self, headless: bool = True, force: bool = False):
         if not HAS_PLAYWRIGHT:
             raise RuntimeError("Playwright package is not installed in this environment.")
-        async with self._get_lock():
-            current_loop = None
+        current_loop = None
+        try:
+            current_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+
+        needs_init = force or not self.browser or (self._loop != current_loop)
+        if not needs_init:
             try:
-                current_loop = asyncio.get_running_loop()
-            except RuntimeError:
-                pass
-
-            needs_init = force or not self.browser or (self._loop != current_loop)
-            if not needs_init:
-                try:
-                    if hasattr(self.browser, "is_connected") and not self.browser.is_connected():
-                        needs_init = True
-                except Exception:
+                if hasattr(self.browser, "is_connected") and not self.browser.is_connected():
                     needs_init = True
+            except Exception:
+                needs_init = True
 
-            if needs_init:
-                if self.browser:
-                    try:
-                        await self.browser.close()
-                    except Exception:
-                        pass
-                    self.browser = None
+        if needs_init:
+            if self.browser:
+                try:
+                    await self.browser.close()
+                except Exception:
+                    pass
+                self.browser = None
+            if self.playwright:
+                try:
+                    await self.playwright.stop()
+                except Exception:
+                    pass
+                self.playwright = None
+
+            self.active_contexts.clear()
+            self.active_pages.clear()
+            self._loop = current_loop
+
+            try:
+                self.playwright = await async_playwright().start()
+            except Exception as pw_err:
+                logger.error(f"[BrowserPool] Failed to start Playwright driver: {pw_err}")
+                self.playwright = None
+                raise RuntimeError(f"Failed to start Playwright driver: {pw_err}") from pw_err
+
+            logger.info("[BrowserPool] Launching sandboxed Chromium with anti-detection flags...")
+            launch_args = [
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-infobars",
+                "--disable-gpu",
+                "--no-first-run",
+                "--window-size=1280,800"
+            ]
+            try:
+                self.browser = await self.playwright.chromium.launch(
+                    headless=headless,
+                    args=launch_args
+                )
+            except Exception as launch_err:
+                logger.error(f"[BrowserPool] Chromium launch failed: {launch_err}")
                 if self.playwright:
                     try:
                         await self.playwright.stop()
                     except Exception:
                         pass
                     self.playwright = None
+                self.browser = None
+                raise RuntimeError(f"Chromium launch failed: {launch_err}") from launch_err
+            logger.info("[BrowserPool] Chromium engine online and ready.")
 
-                self.active_contexts.clear()
-                self.active_pages.clear()
-                self._loop = current_loop
-
-                try:
-                    self.playwright = await async_playwright().start()
-                except Exception as pw_err:
-                    logger.error(f"[BrowserPool] Failed to start Playwright driver: {pw_err}")
-                    self.playwright = None
-                    raise RuntimeError(f"Failed to start Playwright driver: {pw_err}") from pw_err
-
-                logger.info("[BrowserPool] Launching sandboxed Chromium with anti-detection flags...")
-                launch_args = [
-                    "--disable-blink-features=AutomationControlled",
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-infobars",
-                    "--disable-gpu",
-                    "--no-first-run",
-                    "--window-size=1280,800"
-                ]
-                try:
-                    self.browser = await self.playwright.chromium.launch(
-                        headless=headless,
-                        args=launch_args
-                    )
-                except Exception as launch_err:
-                    logger.error(f"[BrowserPool] Chromium launch failed: {launch_err}")
-                    if self.playwright:
-                        try:
-                            await self.playwright.stop()
-                        except Exception:
-                            pass
-                        self.playwright = None
-                    self.browser = None
-                    raise RuntimeError(f"Chromium launch failed: {launch_err}") from launch_err
-                logger.info("[BrowserPool] Chromium engine online and ready.")
+    async def initialize(self, headless: bool = True, force: bool = False):
+        async with self._get_lock():
+            await self._initialize_locked(headless=headless, force=force)
 
     async def _ssrf_guard(self, route: Route):
         """Prevents agents from requesting local network metadata services."""
@@ -170,60 +174,61 @@ class BrowserPool:
         If profile_name is specified (e.g. 'whatsapp', 'tiktok_viewstorm'),
         loads authenticated cookies and tokens from the SessionVault.
         """
-        is_alive = False
-        try:
-            if self.browser and hasattr(self.browser, "is_connected") and self.browser.is_connected():
-                is_alive = True
-        except Exception:
-            is_alive = False
-
-        if not is_alive:
-            await self.initialize(headless=headless)
-
         session_key = f"{department}_{agent_id}_{profile_name or 'ephemeral'}"
-        if session_key in self.active_pages:
-            page = self.active_pages[session_key]
+        async with self._get_lock():
+            is_alive = False
             try:
-                if not page.is_closed():
-                    return page
+                if self.browser and hasattr(self.browser, "is_connected") and self.browser.is_connected():
+                    is_alive = True
             except Exception:
-                pass
+                is_alive = False
 
-        # Determine if saved session exists in Vault
-        storage_path = None
-        if profile_name and session_vault.has_session(profile_name):
-            storage_path = str(session_vault.get_storage_path(profile_name))
-            logger.info(f"[BrowserPool] Injecting saved session state for '{profile_name}' from {storage_path}")
+            if not is_alive:
+                await self._initialize_locked(headless=headless)
 
-        try:
-            context = await self.browser.new_context(
-                storage_state=storage_path,
-                viewport={"width": 1280, "height": 800},
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
-                locale="en-US",
-                timezone_id="GMT"
-            )
-        except Exception as ctx_err:
-            logger.warning(f"[BrowserPool] Context creation failed ({ctx_err}). Re-initializing browser engine with force=True...")
-            await self.initialize(headless=headless, force=True)
-            context = await self.browser.new_context(
-                storage_state=storage_path,
-                viewport={"width": 1280, "height": 800},
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
-                locale="en-US",
-                timezone_id="GMT"
-            )
+            if session_key in self.active_pages:
+                page = self.active_pages[session_key]
+                try:
+                    if not page.is_closed():
+                        return page
+                except Exception:
+                    pass
 
-        # Apply security guard
-        await context.route("**/*", self._ssrf_guard)
+            # Determine if saved session exists in Vault
+            storage_path = None
+            if profile_name and session_vault.has_session(profile_name):
+                storage_path = str(session_vault.get_storage_path(profile_name))
+                logger.info(f"[BrowserPool] Injecting saved session state for '{profile_name}' from {storage_path}")
 
-        page = await context.new_page()
-        # Inject anti-detection overrides into every frame
-        await page.add_init_script(STEALTH_INJECTION_SCRIPT)
+            try:
+                context = await self.browser.new_context(
+                    storage_state=storage_path,
+                    viewport={"width": 1280, "height": 800},
+                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+                    locale="en-US",
+                    timezone_id="GMT"
+                )
+            except Exception as ctx_err:
+                logger.warning(f"[BrowserPool] Context creation failed ({ctx_err}). Re-initializing browser engine with force=True...")
+                await self._initialize_locked(headless=headless, force=True)
+                context = await self.browser.new_context(
+                    storage_state=storage_path,
+                    viewport={"width": 1280, "height": 800},
+                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+                    locale="en-US",
+                    timezone_id="GMT"
+                )
 
-        self.active_contexts[session_key] = context
-        self.active_pages[session_key] = page
-        return page
+            # Apply security guard
+            await context.route("**/*", self._ssrf_guard)
+
+            page = await context.new_page()
+            # Inject anti-detection overrides into every frame
+            await page.add_init_script(STEALTH_INJECTION_SCRIPT)
+
+            self.active_contexts[session_key] = context
+            self.active_pages[session_key] = page
+            return page
 
     async def save_profile(self, session_key: str, profile_name: str) -> Path:
         """Exports the active cookies and localStorage of a session to the SessionVault."""
