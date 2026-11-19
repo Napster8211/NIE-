@@ -25,6 +25,8 @@ logger = logging.getLogger(__name__)
 class SessionState(str, Enum):
     INITIALIZING = "INITIALIZING"
     ACTIVE = "ACTIVE"
+    AI_CONTROLLED = "AI_CONTROLLED"
+    USER_CONTROLLED = "USER_CONTROLLED"
     IDLE = "IDLE"
     WAITING_FOR_USER = "WAITING_FOR_USER"
     RECOVERING = "RECOVERING"
@@ -36,10 +38,34 @@ class SessionState(str, Enum):
 VALID_TRANSITIONS: Dict[SessionState, set] = {
     SessionState.INITIALIZING: {
         SessionState.ACTIVE,
+        SessionState.AI_CONTROLLED,
+        SessionState.IDLE,
         SessionState.FAILED,
         SessionState.CLOSED,
     },
     SessionState.ACTIVE: {
+        SessionState.AI_CONTROLLED,
+        SessionState.USER_CONTROLLED,
+        SessionState.IDLE,
+        SessionState.WAITING_FOR_USER,
+        SessionState.RECOVERING,
+        SessionState.CLOSING,
+        SessionState.FAILED,
+        SessionState.CLOSED,
+    },
+    SessionState.AI_CONTROLLED: {
+        SessionState.ACTIVE,
+        SessionState.USER_CONTROLLED,
+        SessionState.IDLE,
+        SessionState.WAITING_FOR_USER,
+        SessionState.RECOVERING,
+        SessionState.CLOSING,
+        SessionState.FAILED,
+        SessionState.CLOSED,
+    },
+    SessionState.USER_CONTROLLED: {
+        SessionState.ACTIVE,
+        SessionState.AI_CONTROLLED,
         SessionState.IDLE,
         SessionState.WAITING_FOR_USER,
         SessionState.RECOVERING,
@@ -49,6 +75,8 @@ VALID_TRANSITIONS: Dict[SessionState, set] = {
     },
     SessionState.IDLE: {
         SessionState.ACTIVE,
+        SessionState.AI_CONTROLLED,
+        SessionState.USER_CONTROLLED,
         SessionState.WAITING_FOR_USER,
         SessionState.RECOVERING,
         SessionState.CLOSING,
@@ -57,6 +85,8 @@ VALID_TRANSITIONS: Dict[SessionState, set] = {
     },
     SessionState.WAITING_FOR_USER: {
         SessionState.ACTIVE,
+        SessionState.AI_CONTROLLED,
+        SessionState.USER_CONTROLLED,
         SessionState.IDLE,
         SessionState.CLOSING,
         SessionState.FAILED,
@@ -64,6 +94,7 @@ VALID_TRANSITIONS: Dict[SessionState, set] = {
     },
     SessionState.RECOVERING: {
         SessionState.ACTIVE,
+        SessionState.AI_CONTROLLED,
         SessionState.IDLE,
         SessionState.FAILED,
         SessionState.CLOSED,
@@ -73,7 +104,10 @@ VALID_TRANSITIONS: Dict[SessionState, set] = {
         SessionState.FAILED,
     },
     SessionState.CLOSED: set(),
-    SessionState.FAILED: set(),
+    SessionState.FAILED: {
+        SessionState.RECOVERING,
+        SessionState.CLOSED,
+    },
 }
 
 
@@ -128,6 +162,13 @@ class BrowserSession:
         self._loop = None
         self.metadata: Dict[str, Any] = {}
         self.last_snapshot: Optional[Dict[str, Any]] = None
+        self.viewport_size: Dict[str, int] = {"width": 1280, "height": 800}
+
+    def is_user_controlled(self) -> bool:
+        return self.state == SessionState.USER_CONTROLLED
+
+    def is_ai_controlled(self) -> bool:
+        return self.state in {SessionState.ACTIVE, SessionState.AI_CONTROLLED}
 
     def get_lock(self) -> asyncio.Lock:
         """Lazily initialize an event-loop-aware lock for coordinating concurrent actions."""
@@ -263,6 +304,9 @@ class BrowserSession:
             "idle_timeout_seconds": self.idle_timeout_seconds,
             "max_lifetime_seconds": self.max_lifetime_seconds,
             "has_storage_profile": self.profile_name is not None,
+            "viewport_size": self.viewport_size,
+            "is_user_controlled": self.is_user_controlled(),
+            "is_ai_controlled": self.is_ai_controlled(),
             "screenshot_data_url": snapshot.get("screenshot_data_url"),
         }
 

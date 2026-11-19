@@ -1,0 +1,361 @@
+"""
+Unit and Integration Tests for Milestone 3:
+Live Browser Viewport, Interactive Control & AI/User Handoff.
+"""
+
+import asyncio
+import os
+import time
+import pytest
+from httpx import AsyncClient, ASGITransport
+from starlette.testclient import TestClient
+
+# Ensure test owner key is configured for authenticated requests
+os.environ["NIE_OWNER_KEY"] = "test-director-owner-key-m3"
+
+from app.main import app
+from app.browser.session_manager import browser_session_manager, SessionState
+from app.browser.live_viewport_service import (
+    live_viewport_service,
+    validate_mouse_input,
+    validate_keyboard_input,
+    validate_scroll_input,
+    validate_navigation_url,
+    validate_resize_input,
+)
+
+
+@pytest.fixture
+def auth_headers():
+    return {"Authorization": "Bearer test-director-owner-key-m3"}
+
+
+# ---------------------------------------------------------
+# 1. Validation Logic Tests
+# ---------------------------------------------------------
+
+def test_validate_mouse_input():
+    # Valid clicks
+    validate_mouse_input(100, 200, "left", "click")
+    validate_mouse_input(0, 0, "right", "click")
+    validate_mouse_input(1280, 800, "middle", "move")
+
+    # Invalid coordinates
+    with pytest.raises(ValueError, match="Invalid mouse X coordinate"):
+        validate_mouse_input(-5, 200, "left", "click")
+    with pytest.raises(ValueError, match="Invalid mouse Y coordinate"):
+        validate_mouse_input(100, 5000, "left", "click")
+
+    # Invalid button
+    with pytest.raises(ValueError, match="Invalid mouse button"):
+        validate_mouse_input(100, 200, "invalid_btn", "click")
+
+    # Invalid action
+    with pytest.raises(ValueError, match="Invalid mouse action"):
+        validate_mouse_input(100, 200, "left", "hover_unsupported")
+
+
+def test_validate_keyboard_input():
+    # Valid actions
+    validate_keyboard_input("type", "hello world", None)
+    validate_keyboard_input("press", None, "Enter")
+    validate_keyboard_input("press", None, "Backspace")
+
+    # Invalid action
+    with pytest.raises(ValueError, match="Invalid keyboard action"):
+        validate_keyboard_input("fly", "text", None)
+
+    # Empty payload
+    with pytest.raises(ValueError, match="requires a valid string 'text'"):
+        validate_keyboard_input("type", None, None)
+    with pytest.raises(ValueError, match="requires a valid 'key'"):
+        validate_keyboard_input("press", None, "")
+
+
+def test_validate_scroll_input():
+    # Valid scroll
+    validate_scroll_input(0, 300)
+    validate_scroll_input(-100, -200)
+
+    # Out of range delta
+    with pytest.raises(ValueError, match="Scroll delta_y must be within"):
+        validate_scroll_input(0, 15000)
+
+
+def test_validate_navigation_url():
+    # Valid URLs
+    assert validate_navigation_url("https://example.com") == "https://example.com"
+    assert validate_navigation_url("http://example.org/test") == "http://example.org/test"
+
+    # Blocked schemes
+    with pytest.raises(ValueError, match="Disallowed navigation URL scheme"):
+        validate_navigation_url("file:///etc/passwd")
+    with pytest.raises(ValueError, match="Disallowed navigation URL scheme"):
+        validate_navigation_url("javascript:alert(1)")
+
+    # Blocked hosts (SSRF)
+    with pytest.raises(ValueError, match="Navigation to restricted host"):
+        validate_navigation_url("http://localhost:8000")
+    with pytest.raises(ValueError, match="Navigation to restricted host"):
+        validate_navigation_url("http://127.0.0.1/admin")
+    with pytest.raises(ValueError, match="Navigation to restricted host"):
+        validate_navigation_url("http://169.254.169.254/latest/meta-data")
+
+
+def test_validate_resize_input():
+    validate_resize_input(1280, 800)
+    validate_resize_input(1920, 1080)
+
+    with pytest.raises(ValueError, match="Width .* must be between"):
+        validate_resize_input(100, 800)
+    with pytest.raises(ValueError, match="Height .* must be between"):
+        validate_resize_input(1280, 5000)
+
+
+# ---------------------------------------------------------
+# 2. REST API Security & Viewport Tests
+# ---------------------------------------------------------
+
+@pytest.mark.anyio
+async def test_viewport_unauthenticated_rejected():
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        res = await ac.get("/api/v1/browser/session/any-session/viewport")
+        assert res.status_code == 401
+        assert "DIRECTOR_AUTH_REQUIRED" in res.text
+
+
+@pytest.mark.anyio
+async def test_interact_unauthenticated_rejected():
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        res = await ac.post(
+            "/api/v1/browser/session/any-session/interact",
+            json={"type": "mouse", "action": "click", "x": 100, "y": 100},
+        )
+        assert res.status_code == 401
+
+
+@pytest.mark.anyio
+async def test_take_control_unauthenticated_rejected():
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        res = await ac.post("/api/v1/browser/session/any-session/take-control")
+        assert res.status_code == 401
+
+
+@pytest.mark.anyio
+async def test_return_control_unauthenticated_rejected():
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        res = await ac.post("/api/v1/browser/session/any-session/return-control")
+        assert res.status_code == 401
+
+
+# ---------------------------------------------------------
+# 3. Live Session Interaction & Control Handoff Tests
+# ---------------------------------------------------------
+
+@pytest.mark.anyio
+async def test_session_control_handoff_and_interaction(auth_headers):
+    session_id = f"test-m3-handoff-{int(asyncio.get_event_loop().time() * 1000)}"
+
+    # 1. Create session owned by director principal
+    session = await browser_session_manager.get_or_create_session(
+        session_id=session_id,
+        owner_id="canonical_owner_identity",
+        headless=True,
+    )
+    assert session is not None
+    assert session.is_alive()
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        try:
+            # Navigate to real page
+            await session.page.goto("https://example.com", wait_until="domcontentloaded", timeout=30000)
+
+            # 2. Test GET /viewport
+            viewport_res = await ac.get(
+                f"/api/v1/browser/session/{session_id}/viewport",
+                headers=auth_headers,
+            )
+            assert viewport_res.status_code == 200
+            vp_data = viewport_res.json()
+            assert vp_data["session_id"] == session_id
+            assert vp_data["url"].startswith("https://example.com")
+            assert "data:image/jpeg;base64," in vp_data["frame"]
+            assert vp_data["controlled_by"] == "ai"
+
+            # 3. In AI_CONTROLLED / ACTIVE mode, direct interaction is rejected with 409
+            interact_fail = await ac.post(
+                f"/api/v1/browser/session/{session_id}/interact",
+                headers=auth_headers,
+                json={"type": "mouse", "action": "click", "x": 100, "y": 100, "button": "left"},
+            )
+            assert interact_fail.status_code == 409
+            assert "Take Control" in interact_fail.text
+
+            # 4. Take Control
+            take_ctrl_res = await ac.post(
+                f"/api/v1/browser/session/{session_id}/take-control",
+                headers=auth_headers,
+            )
+            assert take_ctrl_res.status_code == 200
+            ctrl_data = take_ctrl_res.json()
+            assert ctrl_data["controlled_by"] == "user"
+            assert session.state == SessionState.USER_CONTROLLED
+
+            # 5. Direct interaction succeeds in USER_CONTROLLED mode
+            interact_ok = await ac.post(
+                f"/api/v1/browser/session/{session_id}/interact",
+                headers=auth_headers,
+                json={"type": "mouse", "action": "click", "x": 100, "y": 100, "button": "left"},
+            )
+            assert interact_ok.status_code == 200
+            act_data = interact_ok.json()
+            assert act_data["result"]["status"] == "SUCCESS"
+            assert "frame" in act_data["viewport"]
+
+            # 6. Scroll interaction
+            scroll_ok = await ac.post(
+                f"/api/v1/browser/session/{session_id}/interact",
+                headers=auth_headers,
+                json={"type": "scroll", "delta_x": 0, "delta_y": 200},
+            )
+            assert scroll_ok.status_code == 200
+            assert scroll_ok.json()["result"]["status"] == "SUCCESS"
+
+            # 7. Return Control
+            return_ctrl_res = await ac.post(
+                f"/api/v1/browser/session/{session_id}/return-control",
+                headers=auth_headers,
+            )
+            assert return_ctrl_res.status_code == 200
+            return_data = return_ctrl_res.json()
+            assert return_data["controlled_by"] == "ai"
+            assert session.state == SessionState.IDLE
+
+        finally:
+            await browser_session_manager.terminate_session(session_id)
+
+
+# ---------------------------------------------------------
+# 4. WebSocket Live Viewport Tests (Async Event-Loop Native)
+# ---------------------------------------------------------
+
+class MockWebSocket:
+    """Async WebSocket test double for live streaming & interaction tests."""
+    def __init__(self, incoming_messages=None):
+        self.accepted = False
+        self.closed = False
+        self.close_code = None
+        self.close_reason = None
+        self.sent_messages = []
+        self._incoming = list(incoming_messages or [])
+        self.client_state = type("State", (), {"name": "CONNECTED"})()
+
+    async def accept(self):
+        self.accepted = True
+
+    async def close(self, code=1000, reason=None):
+        self.closed = True
+        self.close_code = code
+        self.close_reason = reason
+
+    async def send_json(self, data):
+        self.sent_messages.append(data)
+
+    async def receive_text(self):
+        if self._incoming:
+            return self._incoming.pop(0)
+        from fastapi import WebSocketDisconnect
+        raise WebSocketDisconnect(code=1000)
+
+
+@pytest.mark.anyio
+async def test_websocket_live_viewport_flow():
+    import json
+    import time
+
+    session_id = f"test-m3-ws-{int(time.time() * 1000)}"
+
+    session = await browser_session_manager.get_or_create_session(
+        session_id=session_id,
+        owner_id="canonical_owner_identity",
+        headless=True,
+    )
+    assert session is not None
+
+    try:
+        await session.page.goto("https://example.com", wait_until="domcontentloaded", timeout=30000)
+
+        # Sequence of client messages sent to remote browser
+        incoming = [
+            json.dumps({"type": "ping"}),
+            json.dumps({"type": "take_control"}),
+            json.dumps({"type": "mouse", "action": "click", "x": 200, "y": 150, "button": "left"}),
+            json.dumps({"type": "scroll", "delta_x": 0, "delta_y": 150}),
+            json.dumps({"type": "return_control"}),
+        ]
+
+        mock_ws = MockWebSocket(incoming_messages=incoming)
+
+        # Run connection handler on the same native event loop as Playwright
+        await live_viewport_service.handle_connection(
+            websocket=mock_ws,
+            session_id=session_id,
+            owner_id="canonical_owner_identity",
+        )
+
+        assert mock_ws.accepted is True
+
+        types = [m.get("type") for m in mock_ws.sent_messages]
+        # 1. viewport.init
+        assert "viewport.init" in types
+        init_frame = next(m for m in mock_ws.sent_messages if m.get("type") == "viewport.init")
+        assert "data:image/jpeg;base64," in init_frame["frame"]
+
+        # 2. pong
+        assert "pong" in types
+
+        # 3. control.state -> user
+        user_ctrl = [m for m in mock_ws.sent_messages if m.get("type") == "control.state" and m.get("controlled_by") == "user"]
+        assert len(user_ctrl) >= 1
+
+        # 4. action.result
+        action_results = [m for m in mock_ws.sent_messages if m.get("type") == "action.result"]
+        assert len(action_results) >= 2  # click + scroll
+        assert action_results[0]["status"] == "SUCCESS"
+
+        # 5. control.state -> ai
+        ai_ctrl = [m for m in mock_ws.sent_messages if m.get("type") == "control.state" and m.get("controlled_by") == "ai"]
+        assert len(ai_ctrl) >= 1
+        assert session.state == SessionState.IDLE
+
+    finally:
+        await browser_session_manager.terminate_session(session_id)
+
+
+@pytest.mark.anyio
+async def test_websocket_cross_user_rejection():
+    session_id = f"test-m3-ws-cross-{int(time.time() * 1000)}"
+
+    session = await browser_session_manager.get_or_create_session(
+        session_id=session_id,
+        owner_id="user_alice",
+        headless=True,
+    )
+    try:
+        mock_ws = MockWebSocket()
+        # User Bob attempts to connect to User Alice's session
+        await live_viewport_service.handle_connection(
+            websocket=mock_ws,
+            session_id=session_id,
+            owner_id="user_bob",
+        )
+        assert mock_ws.closed is True
+        assert mock_ws.close_code == 1008
+        assert mock_ws.close_reason == "FORBIDDEN_SESSION_ACCESS"
+    finally:
+        await browser_session_manager.terminate_session(session_id)

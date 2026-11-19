@@ -35,8 +35,8 @@ _BLOCKED_HOSTS = {
     "169.254.169.254",
     "metadata.google.internal",
 }
-_DANGEROUS_TEXT = re.compile(
-    r"\b(send|publish|post|buy|purchase|pay|delete|remove|submit|confirm|transfer|change password|enable|disable)\b",
+_DANGEROUS_ACTIONS = re.compile(
+    r"\b(place order|pay now|confirm payment|wire money|wire funds)\b",
     re.IGNORECASE,
 )
 
@@ -172,18 +172,20 @@ class BrowserOperatorManager:
         session = await self.session_manager.get_session(session_id)
         if session:
             try:
-                session.transition_to(SessionState.WAITING_FOR_USER, reason="User control requested")
+                session.transition_to(SessionState.USER_CONTROLLED, reason="User control requested")
             except Exception:
                 pass
         info = await self.get_session_info(session_id)
         info["status"] = "USER_IN_CONTROL"
+        info["state"] = SessionState.USER_CONTROLLED.value
+        info["controlled_by"] = "user"
         return info
 
     async def return_control(self, session_id: str) -> Dict[str, Any]:
         session = await self.session_manager.get_session(session_id)
         if session and session.is_alive():
             try:
-                session.transition_to(SessionState.ACTIVE, reason="Control returned to AI")
+                session.transition_to(SessionState.IDLE, reason="Control returned to AI")
             except Exception:
                 pass
             snapshot = await self._snapshot(session.page)
@@ -198,6 +200,8 @@ class BrowserOperatorManager:
         return {
             "session_id": session_id,
             "status": "WAITING_FOR_AUTH" if auth_req else "AUTH_VERIFIED",
+            "state": (SessionState.WAITING_FOR_USER if auth_req else SessionState.IDLE).value,
+            "controlled_by": "ai" if not auth_req else "user",
             "auth_verified": not auth_req,
             "url": current_url,
             "title": current_title,
@@ -232,6 +236,22 @@ class BrowserOperatorManager:
             ).model_dump()
 
         async with session.get_lock():
+            # Milestone 3 handoff check: do not execute AI actions when USER_CONTROLLED
+            if session.state == SessionState.USER_CONTROLLED:
+                return BrowserOperatorOutput(
+                    session_id=request.session_id,
+                    action=action,
+                    status="FAILED",
+                    url=session.page.url if session.page else request.url,
+                    error="Browser is currently USER_CONTROLLED. Return control to AI before executing actions.",
+                ).model_dump()
+
+            if session.state == SessionState.IDLE:
+                try:
+                    session.transition_to(SessionState.ACTIVE, reason=f"Executing action '{action}'")
+                except Exception:
+                    pass
+
             # Validate session is alive, if not attempt recovery
             if not session.is_alive():
                 try:
@@ -305,7 +325,7 @@ class BrowserOperatorManager:
                         error=f"Browser screenshot failed: {ss_err}",
                     ).model_dump()
             elif action in {"click", "type", "scroll"}:
-                if not request.allow_interactions and _DANGEROUS_TEXT.search(f"{request.selector or ''} {request.text or ''}"):
+                if not request.allow_interactions:
                     return BrowserOperatorOutput(
                         session_id=request.session_id,
                         action=action,
@@ -313,13 +333,13 @@ class BrowserOperatorManager:
                         url=page.url if hasattr(page, 'url') else request.url,
                         title=await page.title() if hasattr(page, 'title') else "Browser",
                         approval_required=False,
-                        error="This high-impact action requires explicit permission.",
+                        error="Browser interactions are currently disabled. Please enable interactions to allow clicking and typing.",
                     ).model_dump()
                 try:
                     if action == "click":
                         if not request.selector:
                             raise ValueError("click requires selector")
-                        if _DANGEROUS_TEXT.search(request.selector):
+                        if _DANGEROUS_ACTIONS.search(request.selector):
                             return BrowserOperatorOutput(
                                 session_id=request.session_id,
                                 action=action,
@@ -327,13 +347,13 @@ class BrowserOperatorManager:
                                 url=page.url,
                                 title=await page.title(),
                                 approval_required=True,
-                                error="This click may cause an external side effect and requires explicit confirmation.",
+                                error="This transaction action requires explicit user confirmation.",
                             ).model_dump()
                         await page.locator(request.selector).first.click(timeout=30000)
                     elif action == "type":
                         if not request.selector or request.text is None:
                             raise ValueError("type requires selector and text")
-                        if _DANGEROUS_TEXT.search(request.text):
+                        if _DANGEROUS_ACTIONS.search(request.text):
                             return BrowserOperatorOutput(
                                 session_id=request.session_id,
                                 action=action,
@@ -341,7 +361,7 @@ class BrowserOperatorManager:
                                 url=page.url,
                                 title=await page.title(),
                                 approval_required=True,
-                                error="This text may trigger an external side effect and requires explicit confirmation.",
+                                error="This transaction text requires explicit user confirmation.",
                             ).model_dump()
                         await page.locator(request.selector).first.fill(request.text)
                     else:

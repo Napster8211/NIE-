@@ -6,7 +6,7 @@ import json
 import sys
 import asyncio
 from typing import Optional, Dict, Any, List, AsyncGenerator
-from fastapi import APIRouter, HTTPException, Depends, status
+from fastapi import APIRouter, HTTPException, Depends, status, WebSocket
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -45,6 +45,7 @@ from app.services.stream_events import sse_event
 from app.services.director_auth_service import require_director_access, DirectorPrincipal
 from app.browser.session_manager import browser_session_manager, SessionState
 from app.browser_operator import BrowserOperatorTool, browser_operator_manager
+from app.browser.live_viewport_service import live_viewport_service
 
 # --- SPRINT 2 IMPORTS (Lead Intelligence) ---
 from app.tools.plugins.business_discovery import BusinessDiscoveryTool
@@ -1339,6 +1340,147 @@ async def verify_browser_auth(
             detail="FORBIDDEN_SESSION_ACCESS",
         )
     return await browser_operator_manager.verify_auth(session_id)
+
+
+@router.get("/browser/session/{session_id}/viewport")
+async def get_browser_session_viewport(
+    session_id: str,
+    principal: DirectorPrincipal = Depends(require_director_access),
+):
+    """Retrieve an immediate fresh rendered frame and state of the browser viewport."""
+    session = await browser_session_manager.get_session(session_id)
+    if not session:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="BROWSER_SESSION_NOT_FOUND",
+        )
+    if session.owner_id != principal.owner_id and principal.owner_id != "canonical_owner_identity":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="FORBIDDEN_SESSION_ACCESS",
+        )
+    frame = await live_viewport_service.capture_frame(session)
+    if not frame:
+        info = await browser_operator_manager.get_session_info(session_id)
+        return {
+            "session_id": session_id,
+            "state": session.state.value,
+            "controlled_by": "user" if session.is_user_controlled() else "ai",
+            "frame": info.get("screenshot_data_url"),
+            "url": info.get("url", "about:blank"),
+            "title": info.get("title", ""),
+            "viewport_size": session.viewport_size,
+        }
+    return frame
+
+
+@router.post("/browser/session/{session_id}/interact")
+async def interact_browser_session(
+    session_id: str,
+    interaction: Dict[str, Any],
+    principal: DirectorPrincipal = Depends(require_director_access),
+):
+    """Execute a single human interaction step (mouse, keyboard, scroll, navigate, resize)."""
+    session = await browser_session_manager.get_session(session_id)
+    if not session:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="BROWSER_SESSION_NOT_FOUND",
+        )
+    if session.owner_id != principal.owner_id and principal.owner_id != "canonical_owner_identity":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="FORBIDDEN_SESSION_ACCESS",
+        )
+    try:
+        result = await live_viewport_service.dispatch_interaction(
+            session=session,
+            interaction_data=interaction,
+            owner_id=principal.owner_id,
+        )
+        updated_frame = await live_viewport_service.capture_frame(session)
+        return {"result": result, "viewport": updated_frame}
+    except ValueError as val_err:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(val_err))
+    except RuntimeError as run_err:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(run_err))
+    except Exception as exc:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc))
+
+
+@router.websocket("/browser/session/{session_id}/live")
+async def browser_session_live_viewport(
+    websocket: WebSocket,
+    session_id: str,
+):
+    """
+    Bidirectional WebSocket connection for live browser viewport streaming,
+    real-time mouse/keyboard interaction, and AI/Human control handoff.
+    """
+    from app.services.director_auth_service import (
+        DIRECTOR_SESSION_COOKIE,
+        get_director_auth_service,
+        verify_firebase_identity,
+    )
+    from app.services.authorization import verify_owner_key_token
+
+    owner_id: Optional[str] = None
+    cookie_token = websocket.cookies.get(DIRECTOR_SESSION_COOKIE)
+    query_token = websocket.query_params.get("token") or websocket.query_params.get("auth")
+
+    # A. Check cookie
+    if cookie_token:
+        try:
+            auth_service = get_director_auth_service()
+            principal = await auth_service.validate_session(cookie_token)
+            owner_id = principal.owner_id
+        except Exception:
+            pass
+
+    # B. Check query parameter token
+    if not owner_id and query_token:
+        try:
+            owner_id = verify_owner_key_token(query_token)
+        except Exception:
+            try:
+                identity = await verify_firebase_identity(query_token, error_prefix="BROWSER")
+                owner_id = f"firebase:{identity.uid}"
+            except Exception:
+                pass
+
+    # C. Handshake ticket / first-message auth if not in cookie/param
+    if not owner_id:
+        try:
+            await websocket.accept()
+            raw_auth = await asyncio.wait_for(websocket.receive_text(), timeout=3.0)
+            data = json.loads(raw_auth)
+            auth_token = data.get("token") or data.get("credentials")
+            if not auth_token:
+                await websocket.close(code=1008, reason="AUTH_TOKEN_REQUIRED")
+                return
+            try:
+                owner_id = verify_owner_key_token(auth_token)
+            except Exception:
+                try:
+                    auth_service = get_director_auth_service()
+                    principal = await auth_service.validate_session(auth_token)
+                    owner_id = principal.owner_id
+                except Exception:
+                    identity = await verify_firebase_identity(auth_token, error_prefix="BROWSER")
+                    owner_id = f"firebase:{identity.uid}"
+        except Exception:
+            try:
+                await websocket.close(code=1008, reason="UNAUTHORIZED")
+            except Exception:
+                pass
+            return
+
+    # Pass authenticated connection to live_viewport_service
+    await live_viewport_service.handle_connection(
+        websocket=websocket,
+        session_id=session_id,
+        owner_id=owner_id,
+    )
 
 @router.post("/agent/stream")
 async def stream_agent_execution(request: AgentExecutionRequest):
