@@ -1132,6 +1132,7 @@ async def stream_browser_operator(
                 "source": "standard_chat_browser_operator",
                 "session_id": request.session_id,
                 "browser_allow_interactions": request.allow_interactions,
+                "owner_id": principal.owner_id,
             }
             agent_loop = AutonomousAgentLoop(
                 primary_llm=llm_provider,

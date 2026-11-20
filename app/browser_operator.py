@@ -121,12 +121,14 @@ class BrowserOperatorManager:
             raise ValueError("Navigation to internal or metadata hosts is blocked.")
         return url.strip()
 
-    async def _page(self, session_id: str):
-        session = await self.session_manager.get_or_create_session(
-            session_id=session_id,
-            owner_id="standard_chat",
-            headless=True,
-        )
+    async def _page(self, session_id: str, owner_id: str = "standard_chat"):
+        session = await self.session_manager.get_session(session_id)
+        if not session or not session.is_alive():
+            session = await self.session_manager.get_or_create_session(
+                session_id=session_id,
+                owner_id=owner_id,
+                headless=True,
+            )
         return session.page
 
     async def _snapshot(self, page) -> Dict[str, Any]:

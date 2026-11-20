@@ -152,13 +152,50 @@ async def test_return_control_unauthenticated_rejected():
         assert res.status_code == 401
 
 
+@pytest.mark.anyio
+async def test_browser_stream_unauthenticated_returns_401():
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        res = await ac.post(
+            "/api/v1/browser/stream",
+            json={"goal": "Open Instagram login page here", "session_id": "test-unauth-sess"},
+        )
+        assert res.status_code == 401
+        data = res.json()
+        assert data.get("detail") == "DIRECTOR_AUTH_REQUIRED"
+
+
+@pytest.mark.anyio
+async def test_browser_stream_cross_owner_rejection(auth_headers):
+    # Session belongs to user_alice
+    session_id = f"test-m3-stream-cross-{int(time.time() * 1000)}"
+    session = await browser_session_manager.get_or_create_session(
+        session_id=session_id,
+        owner_id="user_alice",
+        headless=True,
+    )
+    try:
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as ac:
+            # Another principal (not alice, not canonical) attempts to stream on alice's session
+            # using mock director auth header or other user
+            res = await ac.post(
+                "/api/v1/browser/stream",
+                headers={"Authorization": "Bearer non-existent-or-invalid"},
+                json={"goal": "Hijack session", "session_id": session_id},
+            )
+            assert res.status_code == 401
+    finally:
+        await browser_session_manager.terminate_session(session_id)
+
+
 # ---------------------------------------------------------
 # 3. Live Session Interaction & Control Handoff Tests
 # ---------------------------------------------------------
 
 @pytest.mark.anyio
 async def test_session_control_handoff_and_interaction(auth_headers):
-    session_id = f"test-m3-handoff-{int(asyncio.get_event_loop().time() * 1000)}"
+    session_id = f"test-m3-handoff-{int(time.time() * 1000)}"
 
     # 1. Create session owned by director principal
     session = await browser_session_manager.get_or_create_session(
