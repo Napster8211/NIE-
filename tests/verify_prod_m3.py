@@ -61,6 +61,16 @@ def main():
         assert "DIRECTOR_AUTH_REQUIRED" in res.text
         print("    -> Return-control endpoint deployed & protected with 401.")
 
+        # 6. Browser Stream Endpoint Auth Enforcement (BUG-M3-01 Verification)
+        res = client.post(
+            "/api/v1/browser/stream",
+            json={"goal": "Open Instagram login page here", "session_id": "test-prod-verify-stream"},
+        )
+        print(f"[6] POST /api/v1/browser/stream: HTTP {res.status_code}")
+        assert res.status_code == 401, f"Expected 401, got {res.status_code}"
+        assert "DIRECTOR_AUTH_REQUIRED" in res.text
+        print("    -> Browser stream endpoint deployed & strictly authenticated (BUG-M3-01).")
+
     print("\n" + "=" * 60)
     print("ALL MILESTONE 3 VERIFICATION CHECKS PASSED.")
     print("=" * 60)
