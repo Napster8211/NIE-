@@ -58,6 +58,7 @@ def test_validate_mouse_input():
 def test_validate_keyboard_input():
     # Valid actions
     validate_keyboard_input("type", "hello world", None)
+    validate_keyboard_input("insert_text", "hello mobile world", None)
     validate_keyboard_input("press", None, "Enter")
     validate_keyboard_input("press", None, "Backspace")
 
@@ -263,7 +264,24 @@ async def test_session_control_handoff_and_interaction(auth_headers):
             assert scroll_ok.status_code == 200
             assert scroll_ok.json()["result"]["status"] == "SUCCESS"
 
-            # 7. Return Control
+            # 7. Mobile text input (insert_text and Tab/Enter/Backspace)
+            insert_ok = await ac.post(
+                f"/api/v1/browser/session/{session_id}/interact",
+                headers=auth_headers,
+                json={"type": "keyboard", "action": "insert_text", "text": "test_username"},
+            )
+            assert insert_ok.status_code == 200
+            assert insert_ok.json()["result"]["status"] == "SUCCESS"
+
+            tab_ok = await ac.post(
+                f"/api/v1/browser/session/{session_id}/interact",
+                headers=auth_headers,
+                json={"type": "keyboard", "action": "press", "key": "Tab"},
+            )
+            assert tab_ok.status_code == 200
+            assert tab_ok.json()["result"]["status"] == "SUCCESS"
+
+            # 8. Return Control
             return_ctrl_res = await ac.post(
                 f"/api/v1/browser/session/{session_id}/return-control",
                 headers=auth_headers,

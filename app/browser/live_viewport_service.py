@@ -59,11 +59,11 @@ def validate_mouse_input(x: int, y: int, button: str, action: str) -> None:
 
 def validate_keyboard_input(action: str, text: Optional[str] = None, key: Optional[str] = None) -> None:
     """Validate keyboard input action and payload."""
-    if action not in {"type", "press", "down", "up"}:
-        raise ValueError(f"Invalid keyboard action: {action}. Must be 'type', 'press', 'down', or 'up'.")
-    if action == "type":
+    if action not in {"type", "press", "down", "up", "insert_text"}:
+        raise ValueError(f"Invalid keyboard action: {action}. Must be 'type', 'press', 'down', 'up', or 'insert_text'.")
+    if action in {"type", "insert_text"}:
         if text is None or not isinstance(text, str):
-            raise ValueError("Keyboard 'type' action requires a valid string 'text'.")
+            raise ValueError(f"Keyboard '{action}' action requires a valid string 'text'.")
         if len(text) > MAX_KEYBOARD_TEXT_LEN:
             raise ValueError(f"Keyboard text exceeds maximum length of {MAX_KEYBOARD_TEXT_LEN} characters.")
     elif action in {"press", "down", "up"}:
@@ -371,6 +371,8 @@ class LiveViewportService:
 
                 if action == "type" and text:
                     await page.keyboard.type(text)
+                elif action == "insert_text" and text:
+                    await page.keyboard.insert_text(text)
                 elif action == "press" and key:
                     await page.keyboard.press(key)
                 elif action == "down" and key:
