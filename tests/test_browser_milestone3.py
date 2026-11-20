@@ -295,6 +295,128 @@ async def test_session_control_handoff_and_interaction(auth_headers):
             await browser_session_manager.terminate_session(session_id)
 
 
+@pytest.mark.anyio
+async def test_playwright_actual_insert_text_dom_execution(auth_headers):
+    """
+    End-to-End integration test:
+    Exercises the actual Playwright keyboard insertion and DOM state changes,
+    verifying that insert_text, Tab navigation, Backspace, and focus behave
+    identically to a real user typing in remote Chromium.
+    """
+    session_id = f"test-m3-dom-insert-{int(time.time() * 1000)}"
+
+    session = await browser_session_manager.get_or_create_session(
+        session_id=session_id,
+        owner_id="canonical_owner_identity",
+        headless=True,
+    )
+    assert session is not None
+    assert session.is_alive()
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        try:
+            # 1. Load an HTML page with interactive form inputs
+            html_content = """
+            <!DOCTYPE html>
+            <html>
+            <head><title>Form Test</title></head>
+            <body style="margin: 0; padding: 20px;">
+                <input id="test-username" type="text" style="width: 200px; height: 30px;" />
+                <input id="test-password" type="password" style="width: 200px; height: 30px;" />
+                <button id="test-btn" type="button">Login</button>
+            </body>
+            </html>
+            """
+            await session.page.set_content(html_content, wait_until="domcontentloaded")
+
+            # 2. In AI_CONTROLLED mode, direct interaction is rejected (409)
+            rejected_interaction = await ac.post(
+                f"/api/v1/browser/session/{session_id}/interact",
+                headers=auth_headers,
+                json={"type": "keyboard", "action": "insert_text", "text": "should_fail"},
+            )
+            assert rejected_interaction.status_code == 409
+            assert "Take Control" in rejected_interaction.text
+
+            # 3. Take Control -> transitions to USER_CONTROLLED
+            take_res = await ac.post(
+                f"/api/v1/browser/session/{session_id}/take-control",
+                headers=auth_headers,
+            )
+            assert take_res.status_code == 200
+            assert session.state == SessionState.USER_CONTROLLED
+
+            # 4. Focus the username field via click / focus
+            await session.page.focus("#test-username")
+            active_id = await session.page.evaluate("document.activeElement.id")
+            assert active_id == "test-username"
+
+            # 5. Execute insert_text via REST API
+            insert_res = await ac.post(
+                f"/api/v1/browser/session/{session_id}/interact",
+                headers=auth_headers,
+                json={"type": "keyboard", "action": "insert_text", "text": "napster_test_user"},
+            )
+            assert insert_res.status_code == 200
+            assert insert_res.json()["result"]["status"] == "SUCCESS"
+
+            # VERIFY IN ACTUAL CHROMIUM DOM
+            username_val = await session.page.input_value("#test-username")
+            assert username_val == "napster_test_user", f"Expected 'napster_test_user', got '{username_val}'"
+
+            # 6. Press Tab via REST API -> Should shift focus to password field
+            tab_res = await ac.post(
+                f"/api/v1/browser/session/{session_id}/interact",
+                headers=auth_headers,
+                json={"type": "keyboard", "action": "press", "key": "Tab"},
+            )
+            assert tab_res.status_code == 200
+
+            # VERIFY FOCUS IN CHROMIUM DOM
+            new_active_id = await session.page.evaluate("document.activeElement.id")
+            assert new_active_id == "test-password", f"Expected focus on 'test-password', got '{new_active_id}'"
+
+            # 7. Execute insert_text into password field via REST API
+            pw_res = await ac.post(
+                f"/api/v1/browser/session/{session_id}/interact",
+                headers=auth_headers,
+                json={"type": "keyboard", "action": "insert_text", "text": "Secret123!"},
+            )
+            assert pw_res.status_code == 200
+
+            # VERIFY PASSWORD IN CHROMIUM DOM
+            pw_val = await session.page.input_value("#test-password")
+            assert pw_val == "Secret123!"
+
+            # 8. Press Backspace via REST API -> Should remove the trailing exclamation point
+            back_res = await ac.post(
+                f"/api/v1/browser/session/{session_id}/interact",
+                headers=auth_headers,
+                json={"type": "keyboard", "action": "press", "key": "Backspace"},
+            )
+            assert back_res.status_code == 200
+
+            # VERIFY MUTATED VALUE IN CHROMIUM DOM
+            pw_val_after = await session.page.input_value("#test-password")
+            assert pw_val_after == "Secret123"
+
+            # 9. Verify NO accidental duplicate insertion occurred on username
+            username_val_final = await session.page.input_value("#test-username")
+            assert username_val_final == "napster_test_user"
+
+            # 10. Return Control -> transitions to IDLE
+            return_res = await ac.post(
+                f"/api/v1/browser/session/{session_id}/return-control",
+                headers=auth_headers,
+            )
+            assert return_res.status_code == 200
+            assert session.state == SessionState.IDLE
+
+        finally:
+            await browser_session_manager.terminate_session(session_id)
+
+
 # ---------------------------------------------------------
 # 4. WebSocket Live Viewport Tests (Async Event-Loop Native)
 # ---------------------------------------------------------
